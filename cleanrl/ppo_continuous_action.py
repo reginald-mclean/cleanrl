@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+from gymnasium.wrappers.one_hot_wrapper import OneHotV0
 import metaworld
 
 def parse_args():
@@ -25,27 +26,27 @@ def parse_args():
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
+    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="HalfCheetah-v4",
+    parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=1,
+    parser.add_argument("--num-envs", type=int, default=10,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048,
+    parser.add_argument("--num-steps", type=int, default=500,
         help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
@@ -69,6 +70,8 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--eval-freq", type=int, default=250, 
+        help="how many updates to do before evaluating the agent")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -127,7 +130,10 @@ class Agent(nn.Module):
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
+        if x.size()[0] == 10:
+            action_logstd = self.actor_logstd.expand_as(action_mean)
+        else:
+            action_logstd = self.actor_logstd
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
@@ -163,16 +169,23 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    if args.env_id == 'MT10':
+        benchmark = metaworld.MT10(seed=args.seed)
+    elif args.env_id == 'MT50':
+        benchmark = metaworld.MT50(seed=args.seed)
 
-    mt10 = metaworld.MT10(seed=args.seed)
+    use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [mt10.train_classes], mt10.train_tasks, use_one_hot_wrapper=True
+        benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
+    keys = list(benchmark.train_classes.keys())
+    evaluation_envs = [OneHotV0(benchmark.train_classes[e](), keys.index(e), len(keys)) for e in keys]
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs).to(torch.float32).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -183,6 +196,11 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
+    # keep track per step/epoch/whatever (adjust accordingly) the success across each env
+    successes = torch.zeros((args.num_steps, args.num_envs))
+
+    print(obs.size(), rewards.size())
+
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
@@ -192,6 +210,32 @@ if __name__ == "__main__":
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(1, num_updates + 1):
+        if (update - 1) % args.eval_freq == 0:
+            mean_success_rate = 0.0
+            for i, env in enumerate(evaluation_envs):
+                 current_task_success_rate = 0.0
+                 print(f'Evaluating {keys[i]}')
+                 tasks = [task for task in benchmark.train_tasks if task.env_name == keys[i]]
+                 for x in range(50):
+                     env.set_task(tasks[x])
+                     obs, _ = env.reset()
+                     count = 0
+                     done = False
+                     while count < 500 and not done:
+                         # print(torch.from_numpy(obs).to(device).double().dtype)
+                         action, _, _, _ = agent.get_action_and_value(torch.from_numpy(obs).to(torch.float32).to(device))
+                         next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).cpu().numpy())
+                         done = truncated or terminated
+                         obs = next_obs
+                         if int(info['success']) == 1:
+                             current_task_success_rate += 1
+                             mean_success_rate += 1
+                             done = True
+                         if done:
+                             break
+
+                 writer.add_scalar(f"charts/{keys[i]}_success_rate", float(current_task_success_rate)/50, update-1)
+            writer.add_scalar("charts/mean_success_rate", float(mean_success_rate) / (args.num_envs * 50))
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -204,6 +248,7 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
+            print(next_obs.size())
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
@@ -216,17 +261,23 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
+            #print(infos)
+
             # Only print when at least 1 env is done
             if "final_info" not in infos:
                 continue
 
-            for info in infos["final_info"]:
+            for i, info in enumerate(infos["final_info"]):
                 # Skip the envs that are not done
                 if info is None:
                     continue
                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                #print(i, info)
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+
+        
+
 
         # bootstrap value if not done
         with torch.no_grad():
