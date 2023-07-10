@@ -1,0 +1,36 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyInterpreterInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="15">
+            <item index="0" class="java.lang.String" itemvalue="patchelf" />
+            <item index="1" class="java.lang.String" itemvalue="gymnasium" />
+            <item index="2" class="java.lang.String" itemvalue="mujoco" />
+            <item index="3" class="java.lang.String" itemvalue="triton" />
+            <item index="4" class="java.lang.String" itemvalue="nvidia-cuda-nvrtc-cu11" />
+            <item index="5" class="java.lang.String" itemvalue="nvidia-cuda-cupti-cu11" />
+            <item index="6" class="java.lang.String" itemvalue="nvidia-cublas-cu11" />
+            <item index="7" class="java.lang.String" itemvalue="nvidia-cusparse-cu11" />
+            <item index="8" class="java.lang.String" itemvalue="nvidia-cusolver-cu11" />
+            <item index="9" class="java.lang.String" itemvalue="nvidia-curand-cu11" />
+            <item index="10" class="java.lang.String" itemvalue="nvidia-nccl-cu11" />
+            <item index="11" class="java.lang.String" itemvalue="nvidia-cudnn-cu11" />
+            <item index="12" class="java.lang.String" itemvalue="nvidia-nvtx-cu11" />
+            <item index="13" class="java.lang.String" itemvalue="nvidia-cufft-cu11" />
+            <item index="14" class="java.lang.String" itemvalue="nvidia-cuda-runtime-cu11" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8Inspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="E116" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
