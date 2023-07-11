@@ -5,6 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 
+from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 import gymnasium as gym
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=5e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=10,
         help="the number of parallel game environments")
@@ -51,11 +52,11 @@ def parse_args():
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95,
+    parser.add_argument("--gae-lambda", type=float, default=0.97,
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=32,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=16,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -63,9 +64,9 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.0,
+    parser.add_argument("--ent-coef", type=float, default=5e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.5,
+    parser.add_argument("--vf-coef", type=float, default=0.0,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
@@ -111,18 +112,16 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 400)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+            layer_init(nn.Linear(512, np.prod(envs.single_action_space.shape)), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
@@ -197,11 +196,6 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    # keep track per step/epoch/whatever (adjust accordingly) the success across each env
-    successes = torch.zeros((args.num_steps, args.num_envs))
-
-    print(obs.size(), rewards.size())
-
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
@@ -210,33 +204,12 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
+
+
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
-            mean_success_rate = 0.0
-            for i, env in enumerate(evaluation_envs):
-                 current_task_success_rate = 0.0
-                 print(f'Evaluating {keys[i]}')
-                 tasks = [task for task in benchmark.train_tasks if task.env_name == keys[i]]
-                 for x in range(50):
-                     env.set_task(tasks[x])
-                     obs, _ = env.reset()
-                     count = 0
-                     done = False
-                     while count < 500 and not done:
-                         # print(torch.from_numpy(obs).to(device).double().dtype)
-                         action, _, _, _ = agent.get_action_and_value(torch.from_numpy(obs).to(torch.float32).to(device))
-                         next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).cpu().numpy())
-                         done = truncated or terminated
-                         obs = next_obs
-                         if int(info['success']) == 1:
-                             current_task_success_rate += 1
-                             mean_success_rate += 1
-                             done = True
-                         if done:
-                             break
-
-                 writer.add_scalar(f"charts/{keys[i]}_success_rate", float(current_task_success_rate)/50, update-1)
-            writer.add_scalar("charts/mean_success_rate", float(mean_success_rate) / (args.num_envs * 50))
+            evaluation_procedure(evaluation_envs=evaluation_envs, num_envs=args.num_envs, writer=writer, agent=agent,
+                                 benchmark=benchmark, update=update, keys=keys)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -249,7 +222,6 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
-            print(next_obs.size())
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
