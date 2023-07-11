@@ -13,6 +13,7 @@ import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.wrappers.one_hot_wrapper import OneHotV0
+from gymnasium.wrappers.vector_list_info import VectorListInfo
 import metaworld
 
 def parse_args():
@@ -181,7 +182,7 @@ if __name__ == "__main__":
         benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
     keys = list(benchmark.train_classes.keys())
-    evaluation_envs = [OneHotV0(benchmark.train_classes[e](), keys.index(e), len(keys)) for e in keys]
+    evaluation_envs = [VectorListInfo(OneHotV0(benchmark.train_classes[e](), keys.index(e), len(keys))) for e in keys]
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
