@@ -16,6 +16,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
+from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 
 
 class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
@@ -156,6 +157,9 @@ class Actor(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
 
+    def get_action_and_value(self, x):
+        return *self.get_action(x), None
+
 
 # from garage
 def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
@@ -238,8 +242,16 @@ if __name__ == "__main__":
     )
     envs = gym.wrappers.VectorListInfo(envs)
 
+    eval_envs = gym.vector.SyncVectorEnv(
+        [
+            make_env(env_id, name, env_cls, args.seed)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+    eavl_envs = gym.wrappers.VectorListInfo(envs)
+
     assert isinstance(
-       envs.single_action_space, gym.spaces.Box
+        envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
@@ -261,9 +273,7 @@ if __name__ == "__main__":
         target_entropy = -torch.prod(
             torch.Tensor(envs.single_action_space.shape).to(device)
         ).item()
-        log_alpha = torch.Tensor(
-            [0] * len(envs.envs), device=device
-        ).requires_grad_()
+        log_alpha = torch.Tensor([0] * len(envs.envs), device=device).requires_grad_()
         a_optimizer = optim.Adam([log_alpha] * len(envs.envs), lr=args.q_lr)
     else:
         log_alpha = torch.Tensor([0] * len(envs.envs), device=device).log()
@@ -315,7 +325,7 @@ if __name__ == "__main__":
                 #     info["final_info"]["episode"]["l"],
                 #     global_step,
                 # )
-                global_episodic_return.append(info['final_info']['episode']['r'])
+                global_episodic_return.append(info["final_info"]["episode"]["r"])
                 global_episodic_length.append(info["final_info"]["episode"]["l"])
                 break
 
@@ -328,7 +338,6 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
-
 
         if global_step % 500 == 0 and global_episodic_return:
             print(
@@ -344,6 +353,16 @@ if __name__ == "__main__":
                 np.mean(global_episodic_length),
                 global_step,
             )
+            evaluation_procedure(
+                evaluation_envs=eval_envs.envs,
+                num_envs=len(eval_envs.envs),
+                writer=writer,
+                agent=actor,
+                benchmark=benchmark,
+                update=global_step,
+                keys=list(benchmark.train_classes.keys()),
+                device=device
+            )
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
@@ -352,12 +371,8 @@ if __name__ == "__main__":
                 next_state_actions, next_state_log_pi, _ = actor.get_action(
                     data.next_observations
                 )
-                qf1_next_target = qf1_target(
-                    data.next_observations, next_state_actions
-                )
-                qf2_next_target = qf2_target(
-                    data.next_observations, next_state_actions
-                )
+                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 min_qf_next_target = (
                     torch.min(qf1_next_target, qf2_next_target)
                     - get_log_alpha(log_alpha, len(envs.envs), data).exp()
@@ -381,9 +396,7 @@ if __name__ == "__main__":
             qf_loss.backward()
             q_optimizer.step()
 
-            if (
-                global_step % args.policy_frequency == 0
-            ):  # TD 3 Delayed update support
+            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
@@ -392,10 +405,7 @@ if __name__ == "__main__":
                     qf2_pi = qf2(data.observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
                     actor_loss = (
-                        (
-                            get_log_alpha(log_alpha, len(envs.envs), data).exp()
-                            * log_pi
-                        )
+                        (get_log_alpha(log_alpha, len(envs.envs), data).exp() * log_pi)
                         - min_qf_pi
                     ).mean()
 
@@ -440,12 +450,8 @@ if __name__ == "__main__":
                 )
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar(
-                    "losses/qf_loss", qf_loss.item() / 2.0, global_step
-                )
-                writer.add_scalar(
-                    "losses/actor_loss", actor_loss.item(), global_step
-                )
+                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
+                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
