@@ -88,7 +88,6 @@ class SyncVectorEnv(VectorEnv):
 
         if (observation_space is None) or (action_space is None):
             observation_space = observation_space or self.envs[0].observation_space
-            print(observation_space)
             if use_one_hot_wrapper:
                 low = np.zeros(len(self.envs))
                 high = np.ones(len(self.envs))
