@@ -6,7 +6,7 @@ import time
 from distutils.util import strtobool
 
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
-from cleanrl_utils.evals.metaworld_wrappers import OneHotV0, SyncVectorEnv
+from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
 import gymnasium as gym
 import numpy as np
 import torch
