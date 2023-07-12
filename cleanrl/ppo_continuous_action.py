@@ -90,11 +90,9 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 400)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(512, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
@@ -120,6 +118,8 @@ class Agent(nn.Module):
 
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -159,7 +159,6 @@ if __name__ == "__main__":
         benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
     keys = list(benchmark.train_classes.keys())
-    evaluation_envs = [VectorListInfo(OneHotV0(benchmark.train_classes[e](), keys.index(e), len(keys))) for e in keys]
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -186,8 +185,9 @@ if __name__ == "__main__":
 
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
-            evaluation_procedure(evaluation_envs=evaluation_envs, num_envs=args.num_envs, writer=writer, agent=agent,
-                                 benchmark=benchmark, update=update, keys=keys)
+            ### NEED TO SET TRAIN OR TEST TASKS
+            evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
+                                 update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
