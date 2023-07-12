@@ -6,6 +6,7 @@ import time
 from distutils.util import strtobool
 
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
+from cleanrl_utils.evals.metaworld_wrappers import OneHotV0, SyncVectorEnv
 import gymnasium as gym
 import numpy as np
 import torch
@@ -13,7 +14,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-from gymnasium.wrappers.one_hot_wrapper import OneHotV0
 from gymnasium.wrappers.vector_list_info import VectorListInfo
 import metaworld
 
@@ -79,28 +79,6 @@ def parse_args():
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     # fmt: on
     return args
-
-
-def make_env(env_id, idx, capture_video, run_name, gamma):
-    def thunk():
-        if capture_video:
-            env = gym.make(env_id, render_mode="rgb_array")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video:
-            if idx == 0:
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        return env
-
-    return thunk
-
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -177,7 +155,7 @@ if __name__ == "__main__":
     use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
+    envs = SyncVectorEnv(
         benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
     keys = list(benchmark.train_classes.keys())
