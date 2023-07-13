@@ -4,6 +4,7 @@ import os
 import random
 import time
 from distutils.util import strtobool
+import torch.multiprocessing as mp
 
 import gymnasium as gym
 import metaworld
@@ -119,7 +120,7 @@ class Actor(nn.Module):
         task_idx = (
             x[:, -self.num_task_heads :].argmax(1).unsqueeze(1).detach().to(x.device)
         )
-        indices = torch.arange(400).unsqueeze(0) + task_idx * 400
+        indices = torch.arange(400).unsqueeze(0).to(x.device) + task_idx * 400
         x = x.gather(1, indices)
 
         mean = self.fc_mean(x)
@@ -169,6 +170,7 @@ def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
 
 if __name__ == "__main__":
     args = parse_args()
+    mp.set_start_method('spawn')
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -335,6 +337,7 @@ if __name__ == "__main__":
                 update=global_step,
                 tasks=benchmark.train_tasks,
                 keys=list(benchmark.train_classes.keys()),
+                device=device
             )
             print(
                 f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)} eval_success_rate={eval_success_rate}"

@@ -4,6 +4,7 @@ import os
 import random
 import time
 from distutils.util import strtobool
+import torch.multiprocessing as mp
 
 import gymnasium as gym
 import metaworld
@@ -157,6 +158,7 @@ def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn')
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -339,6 +341,7 @@ if __name__ == "__main__":
                 update=global_step,
                 tasks=benchmark.train_tasks,
                 keys=list(benchmark.train_classes.keys()),
+                device=device
             )
             print(
                 f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)} eval_success_rate={eval_success_rate}"

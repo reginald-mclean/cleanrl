@@ -3,7 +3,7 @@ import torch.multiprocessing as mp
 import numpy as np
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0
 
-def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=torch.device("cpu")):
+def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=None):
     workers = []
     manager = mp.Manager()
     shared_queue = manager.Queue(num_envs)
@@ -37,7 +37,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     writer.add_scalar("charts/mean_success_rate", success_rate, update - 1)
     return success_rate
 
-def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device=torch.device("cpu")):
+def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device):
     # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
     env = env_cls()
     if add_onehot:
