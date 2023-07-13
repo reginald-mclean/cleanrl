@@ -19,6 +19,7 @@ from collections import deque
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper
 
+
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -247,12 +248,16 @@ if __name__ == "__main__":
     # Automatic entropy tuning
     if args.autotune:
         target_entropy = -torch.prod(
-            torch.Tensor(envs.single_action_space.shape).to(device)
+            torch.tensor(envs.single_action_space.shape).to(device)
         ).item()
-        log_alpha = torch.Tensor([0] * len(envs.envs), device=device).requires_grad_()
+        log_alpha = torch.tensor(
+            [0] * len(envs.envs), device=device, dtype=torch.float32
+        ).requires_grad_()
         a_optimizer = optim.Adam([log_alpha] * len(envs.envs), lr=args.q_lr)
     else:
-        log_alpha = torch.Tensor([0] * len(envs.envs), device=device).log()
+        log_alpha = torch.tensor(
+            [0] * len(envs.envs), device=device, dtype=torch.float32
+        ).log()
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(

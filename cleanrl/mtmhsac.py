@@ -117,9 +117,7 @@ class Actor(nn.Module):
 
         # extract the task ids from the one-hot encodings of the observations
         task_idx = (
-            x[:, -self.num_task_heads:].argmax(1)
-            .unsqueeze(1).detach()
-            .to(x.device)
+            x[:, -self.num_task_heads :].argmax(1).unsqueeze(1).detach().to(x.device)
         )
         indices = torch.arange(400).unsqueeze(0) + task_idx * 400
         x = x.gather(1, indices)
@@ -261,12 +259,16 @@ if __name__ == "__main__":
     # Automatic entropy tuning
     if args.autotune:
         target_entropy = -torch.prod(
-            torch.Tensor(envs.single_action_space.shape).to(device)
+            torch.tensor(envs.single_action_space.shape).to(device)
         ).item()
-        log_alpha = torch.Tensor([0] * len(envs.envs), device=device).requires_grad_()
+        log_alpha = torch.tensor(
+            [0] * len(envs.envs), device=device, dtype=torch.float32
+        ).requires_grad_()
         a_optimizer = optim.Adam([log_alpha] * len(envs.envs), lr=args.q_lr)
     else:
-        log_alpha = torch.Tensor([0] * len(envs.envs), device=device).log()
+        log_alpha = torch.tensor(
+            [0] * len(envs.envs), device=device, dtype=torch.float32
+        ).log()
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
