@@ -1,0 +1,9 @@
+gymnasium @ git+ssh://git@github.com/reginald-mclean/Gymnasium.git
+memory-profiler
+metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git
+moviepy
+mujoco
+stable-baselines3
+tensorboard
+torch
+wandb
