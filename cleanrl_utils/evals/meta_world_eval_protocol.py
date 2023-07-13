@@ -2,6 +2,7 @@ import torch
 import torch.multiprocessing as mp
 import numpy as np
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0
+
 def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=torch.device("cpu")):
     workers = []
     manager = mp.Manager()
@@ -16,7 +17,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     for i in range(itrs):
         current_keys = keys[i*batch_size:(i+1)*batch_size]
         for key in current_keys:
-            print(f"process for {key}")
+            # print(f"process for {key}")
             env_cls = classes[key]
             env_tasks = [task for task in tasks if task.env_name == key]
             p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, add_onehot, keys.index(key), num_envs, device))
@@ -32,10 +33,12 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
                 task_results.append((worker_result['task_name'], worker_result['success_rate'], np.mean(worker_result['eval_rewards'])))
                 writer.add_scalar(f"charts/{worker_result['task_name']}_success_rate", worker_result['success_rate']/50, update - 1)
                 writer.add_scalar(f"charts/{worker_result['task_name']}_avg_eval_rewards", np.mean(worker_result['eval_rewards']), update - 1)
-    writer.add_scalar("charts/mean_success_rate", float(mean_success_rate) / (num_envs * num_evals), update - 1)
+    success_rate = float(mean_success_rate) / (num_envs * num_evals)
+    writer.add_scalar("charts/mean_success_rate", success_rate, update - 1)
+    return success_rate
 
 def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device=torch.device("cpu")):
-    print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
+    # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
     env = env_cls()
     if add_onehot:
         env = OneHotV0(env, num_envs=num_envs, task_idx=idx)
@@ -65,5 +68,3 @@ def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_eva
         'success_rate' : success,
         'task_name'    : env_name
     })
-
-

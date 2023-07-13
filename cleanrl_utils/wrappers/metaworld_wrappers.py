@@ -271,3 +271,26 @@ class SyncVectorEnv(VectorEnv):
                 )
 
         return True
+
+class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
+    def __init__(self, env, task_idx, num_tasks):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ObservationWrapper.__init__(self, env)
+        env_lb = env.observation_space.low
+        env_ub = env.observation_space.high
+        one_hot_ub = np.ones(num_tasks)
+        one_hot_lb = np.zeros(num_tasks)
+
+        self.one_hot = np.zeros(num_tasks)
+        self.one_hot[task_idx] = 1.0
+
+        self._observation_space = gym.spaces.Box(
+            np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub])
+        )
+
+    @property
+    def observation_space(self):
+        return self._observation_space
+
+    def observation(self, obs):
+        return np.concatenate([obs, self.one_hot])

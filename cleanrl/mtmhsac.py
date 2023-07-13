@@ -19,6 +19,7 @@ from collections import deque
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper
 
+
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -85,10 +86,12 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, num_task_heads):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 400)
-        self.fc2 = nn.Linear(400, 400)
+        self.num_task_heads = num_task_heads
+        self.fc2 = nn.Linear(400, 400 * self.num_task_heads)
+
         self.fc_mean = nn.Linear(400, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(400, np.prod(env.single_action_space.shape))
         # action rescaling
@@ -108,8 +111,19 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
+        x.shape[0]
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+
+        # extract the task ids from the one-hot encodings of the observations
+        task_idx = (
+            x[:, -self.num_task_heads:].argmax(1)
+            .unsqueeze(1).detach()
+            .to(x.device)
+        )
+        indices = torch.arange(400).unsqueeze(0) + task_idx * 400
+        x = x.gather(1, indices)
+
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
@@ -232,7 +246,7 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs).to(device)
+    actor = Actor(envs, num_tasks).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
@@ -286,21 +300,6 @@ if __name__ == "__main__":
         assert isinstance(infos, list)
         for info in infos:
             if "final_info" in info.keys():
-                # TODO: get current task from info dict
-                # current_task = envs.envs[0].current_task
-                # print(
-                #     f"global_step={global_step}, episodic_return_{task_names[current_task]}={info['final_info']['episode']['r']}"
-                # )
-                # writer.add_scalar(
-                #     f"charts/episodic_return_{task_names[current_task]}",
-                #     info["final_info"]["episode"]["r"],
-                #     global_step,
-                # )
-                # writer.add_scalar(
-                #     f"charts/episodic_length_{task_names[current_task]}",
-                #     info["final_info"]["episode"]["l"],
-                #     global_step,
-                # )
                 global_episodic_return.append(info["final_info"]["episode"]["r"])
                 global_episodic_length.append(info["final_info"]["episode"]["l"])
                 break
