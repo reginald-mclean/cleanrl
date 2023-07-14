@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument("--buffer-size", type=int, default=int(1e6), help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=5000, help="the batch size of sample from the replay memory")
+    parser.add_argument("--batch-size", type=int, default=128, help="the batch size of sample from the replay memory")
     parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
     parser.add_argument("--policy-lr", type=float, default=3e-4, help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
