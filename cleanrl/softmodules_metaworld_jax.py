@@ -9,8 +9,8 @@ from functools import partial
 from typing import Callable, NamedTuple, Optional, Tuple, Type, Union
 
 os.environ[
-    "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+    "XLA_PYTHON_CLIENT_PREALLOCATE"
+] = "false"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 import distrax
 import flax
@@ -80,7 +80,7 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000,
+    parser.add_argument("--total-timesteps", type=int, default=100_000_000,
         help="total timesteps of the experiments")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -90,8 +90,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=5000,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
-    parser.add_argument("--evaluation-frequency", type=int, default=250,
+    parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
         help="how many updates to before evaluating the agent")
+    parser.add_argument("--evaluation-num-workers", type=int, default=10,
+        help="the number of evaluation workers")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
+        help="the number episodes per evaluation")
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
@@ -313,7 +317,6 @@ class Agent:  # For evaluation only because we want a pickle-able object for mul
 
     @partial(jax.jit, static_argnums=(0,))
     def get_action(self, obs: jax.Array, key: jax.random.PRNGKeyArray) -> jax.Array:
-        # s_t, z_Tau = obs[:, : -self.num_tasks], obs[:, -self.num_tasks :]
         s_t, z_Tau = split_obs_task_id(obs, self.num_tasks)
         return self.apply_fn(self.actor_params, s_t, z_Tau).sample(seed=key)
 
@@ -666,6 +669,8 @@ if __name__ == "__main__":
                 eval_agent = Agent(actor, num_tasks=NUM_TASKS)
                 eval_success_rate = evaluation_procedure(
                     num_envs=len(envs.envs),
+                    num_workers=args.evaluation_num_workers,
+                    num_episodes=args.evaluation_num_episodes,
                     writer=writer,
                     agent=eval_agent,
                     update=global_step,

@@ -1,23 +1,39 @@
+# ruff: noqa: E402
 import multiprocessing as mp
-from typing import Callable, Optional, Type
+import os
+from typing import List, Type
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import gymnasium as gym
 import jax
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0
 
 
-def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True):
+def evaluation_procedure(
+    writer: SummaryWriter,
+    agent,  # Agent expected to have a get_action function that takes in batches of obs and a jax rng key
+    classes: dict[str, Type[gym.Env]],
+    tasks,
+    keys: List[str],
+    update: int,
+    num_envs: int,
+    num_workers: int = 10,
+    num_episodes: int = 50,
+    add_onehot: bool = True,
+):
     mp.set_start_method("spawn")
     workers = []
     shared_queue = mp.Queue(num_envs)
-    num_evals = 50
+    num_evals = num_episodes
     eval_rewards = []
     mean_success_rate = 0.0
     task_results = []
 
-    batch_size = 10 if num_envs >= 10 else num_envs
+    batch_size = num_workers if num_workers > num_envs else num_envs  # num_workers is upper bound
     itrs = int(num_envs / batch_size)
     for i in range(itrs):
         current_keys = keys[i * batch_size : (i + 1) * batch_size]
@@ -57,13 +73,14 @@ def multiprocess_eval(
     env_cls: Type[gym.Env],
     env_tasks: list[str],
     env_name: str,
-    agent,  # Agent expected to have a get_action function that takes in batches of obs and an rng key
+    agent,  # Agent expected to have a get_action function that takes in batches of obs and a jax rng key
     shared_queue: mp.Queue,
     num_evals: int,
     add_onehot: bool,
     idx: int,
     num_envs: int,
 ):
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     env = env_cls()
     key = jax.random.PRNGKey(0)
     if add_onehot:
