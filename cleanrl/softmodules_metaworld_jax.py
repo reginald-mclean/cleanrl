@@ -87,7 +87,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=5000,
+    parser.add_argument("--batch-size", type=int, default=1280,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
@@ -364,8 +364,7 @@ def update_alpha(
     ).sample_and_log_prob(seed=key)
 
     def alpha_loss(alpha_params: jax.Array) -> jnp.float32:
-        log_alpha = jnp.exp(alpha_params)
-        log_alpha = batch.task_ids @ jnp.expand_dims(log_alpha, 0).transpose()
+        log_alpha = batch.task_ids @ jnp.expand_dims(alpha_params, 0).transpose()
         return (-log_alpha * (action_log_probs + target_entropy)).mean()
 
     alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(alpha_state.params)
