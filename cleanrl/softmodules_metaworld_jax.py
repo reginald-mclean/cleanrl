@@ -363,9 +363,9 @@ def update_alpha(
         actor_state.params, batch.observations, batch.task_ids
     ).sample_and_log_prob(seed=key)
 
-    def alpha_loss(alpha_params: jax.Array) -> jnp.float32:
-        log_alpha = batch.task_ids @ jnp.expand_dims(alpha_params, 0).transpose()
-        return (-log_alpha * (action_log_probs + target_entropy)).mean()
+    def alpha_loss(params: jax.Array) -> jnp.float32:
+        log_alpha = batch.task_ids @ jnp.expand_dims(params, 0).transpose()
+        return (-log_alpha * (jax.lax.stop_gradient(action_log_probs) + target_entropy)).mean()
 
     alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(alpha_state.params)
     alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
@@ -412,7 +412,7 @@ def update_critic(
     def critic_mse_loss(critic: CriticTrainState, params: flax.core.FrozenDict) -> jnp.float32:
         q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
         # NOTE specific to Soft Modules: task weights
-        return (task_weights * (q_pred - next_q_value) ** 2).mean(), q_pred
+        return (task_weights * (q_pred - jax.lax.stop_gradient(next_q_value)) ** 2).mean(), q_pred
 
     (qf1_loss, qf1_a_values), qf1_grads = jax.value_and_grad(partial(critic_mse_loss, qf1), has_aux=True)(qf1.params)
     qf1 = qf1.apply_gradients(grads=qf1_grads)
@@ -448,7 +448,7 @@ def update_actor(
         qf2_values = qf2.apply_fn(qf2.params, batch.observations, action_samples, batch.task_ids)
         min_qf_values = jnp.minimum(qf1_values, qf2_values)
         # NOTE specific to Soft Modules: task weights
-        return (task_weights * (alpha * log_probs - min_qf_values)).mean()
+        return (task_weights * (alpha * log_probs - jax.lax.stop_gradient(min_qf_values))).mean()
 
     actor_loss_value, actor_grads = jax.value_and_grad(actor_loss)(actor_state.params)  # value for logging
     actor_state = actor_state.apply_gradients(grads=actor_grads)
@@ -532,7 +532,7 @@ if __name__ == "__main__":
     actor = TrainState.create(
         apply_fn=actor_network.apply,
         params=actor_network.init(actor_init_key, just_obs, task_id),
-        tx=optax.adam(learning_rate=args.policy_lr),
+        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.policy_lr)),
     )
 
     q_network = Critic(**network_args)
@@ -541,13 +541,13 @@ if __name__ == "__main__":
         apply_fn=q_network.apply,
         params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
         target_params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
-        tx=optax.adam(learning_rate=args.q_lr),
+        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.q_lr)),
     )
     qf2 = CriticTrainState.create(
         apply_fn=q_network.apply,
         params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
         target_params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
-        tx=optax.adam(learning_rate=args.q_lr),
+        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.q_lr)),
     )
 
     alpha_train_state = TrainState.create(
@@ -555,7 +555,7 @@ if __name__ == "__main__":
         params=jnp.zeros(NUM_TASKS),  # Log alpha
         tx=optax.adam(learning_rate=args.q_lr),
     )
-    target_entropy = np.prod(envs.single_action_space.shape).item()
+    target_entropy = -np.prod(envs.single_action_space.shape).item()
 
     start_time = time.time()
 
@@ -630,8 +630,8 @@ if __name__ == "__main__":
 
             # Get task weights & alpha
             log_alpha = alpha_train_state.params
-            alpha = alpha_train_state.apply_fn(log_alpha, batch.task_ids)
-            task_weights = extract_task_weights(log_alpha, batch.task_ids)
+            alpha = jax.lax.stop_gradient(alpha_train_state.apply_fn(log_alpha, batch.task_ids))
+            task_weights = jax.lax.stop_gradient(extract_task_weights(log_alpha, batch.task_ids))
 
             # Update Q networks
             key, q_update_key = jax.random.split(key)
