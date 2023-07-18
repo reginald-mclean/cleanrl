@@ -1,22 +1,64 @@
+from copy import deepcopy
+from typing import Any, List, Optional, Sequence, Tuple, Union
+
 import gymnasium as gym
 import numpy as np
-from copy import deepcopy
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
-
-from numpy.typing import NDArray
-
 from gymnasium import Env
-from gymnasium.spaces import Space, Box
+from gymnasium.spaces import Box, Space
 from gymnasium.vector.utils import concatenate, create_empty_array, iterate
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
+from numpy.typing import NDArray
 
 
+class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
+    def __init__(self, env: Env, task_idx: int, num_tasks: int):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ObservationWrapper.__init__(self, env)
+        env_lb = env.observation_space.low
+        env_ub = env.observation_space.high
+        one_hot_ub = np.ones(num_tasks)
+        one_hot_lb = np.zeros(num_tasks)
+
+        self.one_hot = np.zeros(num_tasks)
+        self.one_hot[task_idx] = 1.0
+
+        self._observation_space = gym.spaces.Box(
+            np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub])
+        )
+
+    @property
+    def observation_space(self) -> gym.spaces.Space:
+        return self._observation_space
+
+    def observation(self, obs: NDArray) -> NDArray:
+        return np.concatenate([obs, self.one_hot])
+
+
+class RandomTaskSelectWrapper(gym.Wrapper):
+    """A Gymnasium Wrapper to automatically set / reset the environment to a random
+    task."""
+
+    def _set_random_task(self):
+        self.current_task = self.np_random.choice(len(self.tasks))
+        self.env.set_task(self.tasks[self.current_task])
+
+    def __init__(self, env: Env, tasks: List[str]):
+        super().__init__(env)
+        self.tasks = tasks
+        self._set_random_task()
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        self._set_random_task()
+        return self.env.reset(seed=seed, options=options)
+
+
+# ---- Kept for compatibility ----
 class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: gym.Env, task_idx: int, num_envs: int):
         gym.utils.RecordConstructorArgs.__init__(self)
         gym.Wrapper.__init__(self, env)
-        #self.env = env
+        # self.env = env
         assert task_idx < num_envs, "The task idx of an env cannot be greater than or equal to the number of envs"
         self.one_hot = np.zeros(num_envs)
         self.one_hot[task_idx] = 1
@@ -30,6 +72,7 @@ class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
         obs, info = super().reset(seed=seed, options=options)
         obs = np.concatenate([obs, self.one_hot])
         return obs, info
+
 
 class SyncVectorEnv(VectorEnv):
     """Vectorized environment that serially runs multiple environments.
@@ -91,7 +134,11 @@ class SyncVectorEnv(VectorEnv):
             if use_one_hot_wrapper:
                 low = np.zeros(len(self.envs))
                 high = np.ones(len(self.envs))
-                observation_space = Box(low=np.hstack([observation_space.low, low]), high=np.hstack([observation_space.high, high]), dtype=np.float64)
+                observation_space = Box(
+                    low=np.hstack([observation_space.low, low]),
+                    high=np.hstack([observation_space.high, high]),
+                    dtype=np.float64,
+                )
             action_space = action_space or self.envs[0].action_space
         super().__init__(
             num_envs=len(self.envs),
@@ -100,9 +147,7 @@ class SyncVectorEnv(VectorEnv):
         )
 
         self._check_spaces()
-        self.observations = create_empty_array(
-            self.single_observation_space, n=self.num_envs, fn=np.zeros
-        )
+        self.observations = create_empty_array(self.single_observation_space, n=self.num_envs, fn=np.zeros)
         self._rewards = np.zeros((self.num_envs,), dtype=np.float64)
         self._terminateds = np.zeros((self.num_envs,), dtype=np.bool_)
         self._truncateds = np.zeros((self.num_envs,), dtype=np.bool_)
@@ -163,9 +208,7 @@ class SyncVectorEnv(VectorEnv):
             observations.append(observation)
             infos = self._add_info(infos, info, i)
 
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
-        )
+        self.observations = concatenate(self.single_observation_space, observations, self.observations)
         return (deepcopy(self.observations) if self.copy else self.observations), infos
 
     def step_async(self, actions):
@@ -200,9 +243,7 @@ class SyncVectorEnv(VectorEnv):
                 info["final_info"] = old_info
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
-        )
+        self.observations = concatenate(self.single_observation_space, observations, self.observations)
 
         return (
             deepcopy(self.observations) if self.copy else self.observations,
@@ -271,26 +312,3 @@ class SyncVectorEnv(VectorEnv):
                 )
 
         return True
-
-class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
-    def __init__(self, env, task_idx, num_tasks):
-        gym.utils.RecordConstructorArgs.__init__(self)
-        gym.ObservationWrapper.__init__(self, env)
-        env_lb = env.observation_space.low
-        env_ub = env.observation_space.high
-        one_hot_ub = np.ones(num_tasks)
-        one_hot_lb = np.zeros(num_tasks)
-
-        self.one_hot = np.zeros(num_tasks)
-        self.one_hot[task_idx] = 1.0
-
-        self._observation_space = gym.spaces.Box(
-            np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub])
-        )
-
-    @property
-    def observation_space(self):
-        return self._observation_space
-
-    def observation(self, obs):
-        return np.concatenate([obs, self.one_hot])

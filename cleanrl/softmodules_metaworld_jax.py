@@ -6,7 +6,7 @@ import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import Callable, NamedTuple, Optional, Tuple, Type, Union
+from typing import NamedTuple, Optional, Tuple, Type, Union
 
 os.environ[
     "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -26,39 +26,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
-from cleanrl_utils.wrappers.metaworld_wrappers import SyncVectorEnv
-
-
-# Gymnasium extensions
-class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
-    def __init__(self, env, task_idx, num_tasks):
-        gym.utils.RecordConstructorArgs.__init__(self)
-        gym.ObservationWrapper.__init__(self, env)
-        env_lb = env.observation_space.low
-        env_ub = env.observation_space.high
-        one_hot_ub = np.ones(num_tasks)
-        one_hot_lb = np.zeros(num_tasks)
-
-        self.one_hot = np.zeros(num_tasks)
-        self.one_hot[task_idx] = 1.0
-
-        self._observation_space = gym.spaces.Box(
-            np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub])
-        )
-
-    @property
-    def observation_space(self):
-        return self._observation_space
-
-    def observation(self, obs):
-        return np.concatenate([obs, self.one_hot])
-
-
-JaxOrNPArray: Type = Union[jnp.ndarray, np.ndarray]
-
-
-def split_obs_task_id(obs: JaxOrNPArray, num_tasks: int) -> Tuple[JaxOrNPArray, JaxOrNPArray]:
-    return obs[..., :-num_tasks], obs[..., -num_tasks:]
+from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
 
 
 # Experiment management utils
@@ -100,9 +68,11 @@ def parse_args():
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
-    parser.add_argument("--policy-frequency", type=int, default=2, help="the frequency of training policy (delayed)")
+    parser.add_argument("--policy-frequency", type=int, default=1, help="the frequency of training policy (delayed)")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
+    parser.add_argument("--clip-grad-norm", type=float, default=0.0,
+        help="the value to clip the gradient norm to. Disabled if 0 (Default). Not applied to alpha gradients.") 
     # Soft Modules
     parser.add_argument("--num-modules", "-n", type=int, default=2,
         help="the number of modules per layer in the network (n)")
@@ -117,18 +87,31 @@ def parse_args():
     return args
 
 
-def make_env(env_id: str, name: str, env_cls: Type[gym.Env], seed: int) -> Callable[[], gym.Env]:
-    def thunk() -> gym.Env:
+def make_envs(benchmark: metaworld.Benchmark, seed: int, use_one_hot: bool) -> gym.Env:
+    def init_each_env(env_cls: Type[gym.Env], name: str, env_id: int) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, env.max_path_length)
-        task = random.choice([task for task in benchmark.train_tasks if task.env_name == name])
-        env.set_task(task)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        if use_one_hot:
+            env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        env = RandomTaskSelectWrapper(env, [task for task in benchmark.train_tasks if task.env_name == name])
         env.action_space.seed(seed)
         return env
 
-    return thunk
+    return gym.vector.AsyncVectorEnv(
+        [
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+
+
+# Utils
+JaxOrNPArray: Type = Union[jnp.ndarray, np.ndarray]
+
+
+def split_obs_task_id(obs: JaxOrNPArray, num_tasks: int) -> Tuple[JaxOrNPArray, JaxOrNPArray]:
+    return obs[..., :-num_tasks], obs[..., -num_tasks:]
 
 
 # Networks
@@ -448,7 +431,7 @@ def update_actor(
         qf2_values = qf2.apply_fn(qf2.params, batch.observations, action_samples, batch.task_ids)
         min_qf_values = jnp.minimum(qf1_values, qf2_values)
         # NOTE specific to Soft Modules: task weights
-        return (task_weights * (alpha * log_probs - jax.lax.stop_gradient(min_qf_values))).mean()
+        return (task_weights * (alpha * log_probs - min_qf_values)).mean()
 
     actor_loss_value, actor_grads = jax.value_and_grad(actor_loss)(actor_state.params)  # value for logging
     actor_state = actor_state.apply_gradients(grads=actor_grads)
@@ -494,7 +477,7 @@ if __name__ == "__main__":
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    envs = SyncVectorEnv(benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper)
+    envs = make_envs(benchmark, args.seed, use_one_hot=use_one_hot_wrapper)
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -508,15 +491,13 @@ if __name__ == "__main__":
         envs.single_action_space,
         "cpu",
         handle_timeout_termination=False,
-        n_envs=len(envs.envs),
+        n_envs=envs.num_envs,
     )
 
-    global_episodic_return = deque([], maxlen=20 * len(envs.envs))
-    global_episodic_length = deque([], maxlen=20 * len(envs.envs))
+    global_episodic_return = deque([], maxlen=20 * envs.num_envs)
+    global_episodic_length = deque([], maxlen=20 * envs.num_envs)
 
     obs, _ = envs.reset()
-    # obs, info = envs.reset(seed=args.seed) # TODO
-    print(envs.single_observation_space.shape)
 
     network_args = {
         "embedding_dim": args.embedding_dim,
@@ -525,14 +506,23 @@ if __name__ == "__main__":
         "num_modules": args.num_modules,
     }
     just_obs, task_id = jax.device_put(split_obs_task_id(obs, NUM_TASKS))
-    random_action = jnp.array([envs.single_action_space.sample() for _ in range(len(envs.envs))])
+    random_action = jnp.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+
+    def _make_optimizer(lr: float, max_grad_norm: float = 0.0):
+        optim = optax.adam(learning_rate=lr)
+        if max_grad_norm != 0:
+            optim = optax.chain(
+                optax.clip_by_global_norm(max_grad_norm),
+                optim,
+            )
+        return optim
 
     actor_network = Actor(num_actions=np.prod(envs.single_action_space.shape), **network_args)
     key, actor_init_key = jax.random.split(key)
     actor = TrainState.create(
         apply_fn=actor_network.apply,
         params=actor_network.init(actor_init_key, just_obs, task_id),
-        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.policy_lr)),
+        tx=_make_optimizer(args.policy_lr, args.clip_grad_norm),
     )
 
     q_network = Critic(**network_args)
@@ -541,19 +531,19 @@ if __name__ == "__main__":
         apply_fn=q_network.apply,
         params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
         target_params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
-        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.q_lr)),
+        tx=_make_optimizer(args.q_lr, args.clip_grad_norm),
     )
     qf2 = CriticTrainState.create(
         apply_fn=q_network.apply,
         params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
         target_params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
-        tx=optax.chain(optax.clip_by_global_norm(1.0), optax.adam(learning_rate=args.q_lr)),
+        tx=_make_optimizer(args.q_lr, args.clip_grad_norm),
     )
 
     alpha_train_state = TrainState.create(
         apply_fn=get_alpha,
         params=jnp.zeros(NUM_TASKS),  # Log alpha
-        tx=optax.adam(learning_rate=args.q_lr),
+        tx=_make_optimizer(args.q_lr, max_grad_norm=0.0),
     )
     target_entropy = -np.prod(envs.single_action_space.shape).item()
 
@@ -563,7 +553,7 @@ if __name__ == "__main__":
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(len(envs.envs))])
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             key, action_key = jax.random.split(key)
             actions = jax.device_get(get_action(actor, jax.device_put(obs), NUM_TASKS, action_key))
@@ -630,8 +620,8 @@ if __name__ == "__main__":
 
             # Get task weights & alpha
             log_alpha = alpha_train_state.params
-            alpha = jax.lax.stop_gradient(alpha_train_state.apply_fn(log_alpha, batch.task_ids))
-            task_weights = jax.lax.stop_gradient(extract_task_weights(log_alpha, batch.task_ids))
+            alpha = alpha_train_state.apply_fn(log_alpha, batch.task_ids)
+            task_weights = extract_task_weights(log_alpha, batch.task_ids)
 
             # Update Q networks
             key, q_update_key = jax.random.split(key)

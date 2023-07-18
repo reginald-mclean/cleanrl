@@ -10,7 +10,7 @@ import jax
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0
+from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
 
 
 def evaluation_procedure(
@@ -84,15 +84,15 @@ def multiprocess_eval(
     env = env_cls()
     key = jax.random.PRNGKey(0)
     if add_onehot:
-        env = OneHotV0(env, num_envs=num_envs, task_idx=idx)
+        env = OneHotWrapper(env, idx, num_envs)
+    env = RandomTaskSelectWrapper(env, env_tasks)
+    env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
     rewards = []
     success = 0.0
     for _ in range(num_evals):
-        env.set_task(env_tasks[np.random.randint(0, len(env_tasks))])
         obs, info = env.reset()
-        count = 0
         done = False
-        while count < 500 and not done:
+        while not done:
             key, action_key = jax.random.split(key)
             obs = jax.device_put(np.expand_dims(obs, axis=0))  # Add batch dim + put obs on GPU
             action = np.squeeze(jax.device_get(agent.get_action(obs, action_key)), axis=0)  # Reverse
@@ -100,7 +100,6 @@ def multiprocess_eval(
             rewards.append(reward)
             done = truncated or terminated
             obs = next_obs
-            count += 1
             if int(info["success"]) == 1:
                 success += 1
                 done = True

@@ -1,7 +1,10 @@
+import gymnasium as gym
+import numpy as np
 import torch
 import torch.multiprocessing as mp
-import numpy as np
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0
+
+from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
+
 
 def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=None):
     workers = []
@@ -41,22 +44,21 @@ def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_eva
     # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
     env = env_cls()
     if add_onehot:
-        env = OneHotV0(env, num_envs=num_envs, task_idx=idx)
+        env = OneHotWrapper(env, idx, num_envs)
+    env = RandomTaskSelectWrapper(env, env_tasks)
+    env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
     rewards = []
     success = 0.0
     for _ in range(num_evals):
-        env.set_task(env_tasks[np.random.randint(0, len(env_tasks))])
         obs, info = env.reset()
-        count = 0
         done = False
-        while count < 500 and not done:
+        while not done:
             action, _, _, _ = agent.get_action_and_value(
                 torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
             next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).detach().cpu().numpy())
             rewards.append(reward)
             done = truncated or terminated
             obs = next_obs
-            count += 1
             if int(info['success']) == 1:
                 success += 1
                 done = True
