@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import gymnasium as gym
 import numpy as np
@@ -48,7 +48,7 @@ class RandomTaskSelectWrapper(gym.Wrapper):
         self.tasks = tasks
         self._set_random_task()
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
