@@ -48,8 +48,13 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=100_000_000,
+    parser.add_argument("--total-timesteps", type=int, default=15_000_000,
         help="total timesteps of the experiments")
+    parser.add_argument("--epoch-size", type=int, default=200,
+        help="""if > 1, we'll collect epoch_size * num_envs samples, and then run epoch_size gradient steps.\
+            Otherwise, a gradient step will happen once every timestep after learning starts.""")
+    parser.add_argument("--max-episode-steps", type=int, default=200,
+        help="maximum number of timesteps in one episode during training")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -57,7 +62,7 @@ def parse_args():
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=1280,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
+    parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
         help="how many updates to before evaluating the agent")
     parser.add_argument("--evaluation-num-workers", type=int, default=10,
@@ -87,10 +92,12 @@ def parse_args():
     return args
 
 
-def make_envs(benchmark: metaworld.Benchmark, seed: int, use_one_hot: bool) -> gym.Env:
+def make_envs(
+    benchmark: metaworld.Benchmark, seed: int, max_episode_steps: Optional[int] = None, use_one_hot: bool = True
+) -> gym.Env:
     def init_each_env(env_cls: Type[gym.Env], name: str, env_id: int) -> gym.Env:
         env = env_cls()
-        env = gym.wrappers.TimeLimit(env, env.max_path_length)
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -477,7 +484,7 @@ if __name__ == "__main__":
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    envs = make_envs(benchmark, args.seed, use_one_hot=use_one_hot_wrapper)
+    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -605,69 +612,77 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            # Sample a batch from replay buffer
-            data = rb.sample(args.batch_size)
-            data = jax.tree_map(lambda x: jax.device_put(x.numpy()), data)
-            observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-            next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-            batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
-            logs = {}
+            if global_step % args.epoch_size == 0:
+                for epoch_step in range(args.epoch_size):
+                    # Sample a batch from replay buffer
+                    data = rb.sample(args.batch_size)
+                    data = jax.tree_map(lambda x: jax.device_put(x.numpy()), data)
+                    observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
+                    next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
+                    batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
+                    logs = {}
 
-            # Update alpha  # NOTE Soft-modules specific: this goes first
-            key, alpha_update_key = jax.random.split(key)
-            alpha_train_state, alpha_logs = update_alpha(actor, alpha_train_state, batch, target_entropy, key)
-            logs = {**logs, **alpha_logs}
+                    # Update alpha  # NOTE Soft-modules specific: this goes first
+                    key, alpha_update_key = jax.random.split(key)
+                    alpha_train_state, alpha_logs = update_alpha(actor, alpha_train_state, batch, target_entropy, key)
+                    logs = {**logs, **alpha_logs}
 
-            # Get task weights & alpha
-            log_alpha = alpha_train_state.params
-            alpha = alpha_train_state.apply_fn(log_alpha, batch.task_ids)
-            task_weights = extract_task_weights(log_alpha, batch.task_ids)
+                    # Get task weights & alpha
+                    log_alpha = alpha_train_state.params
+                    alpha = alpha_train_state.apply_fn(log_alpha, batch.task_ids)
+                    task_weights = extract_task_weights(log_alpha, batch.task_ids)
 
-            # Update Q networks
-            key, q_update_key = jax.random.split(key)
-            (qf1, qf2), critic_logs = update_critic(
-                actor, (qf1, qf2), batch, alpha, task_weights, args.gamma, q_update_key
-            )
-            logs = {**logs, **critic_logs}
+                    # Update Q networks
+                    key, q_update_key = jax.random.split(key)
+                    (qf1, qf2), critic_logs = update_critic(
+                        actor, (qf1, qf2), batch, alpha, task_weights, args.gamma, q_update_key
+                    )
+                    logs = {**logs, **critic_logs}
 
-            # Update policy network
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    key, actor_update_key = jax.random.split(key)
-                    actor, actor_logs = update_actor(actor, (qf1, qf2), batch, alpha, task_weights, actor_update_key)
-                    logs = {**logs, **actor_logs}
+                    # Update policy network
+                    if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+                        for _ in range(
+                            args.policy_frequency
+                        ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                            key, actor_update_key = jax.random.split(key)
+                            actor, actor_logs = update_actor(
+                                actor, (qf1, qf2), batch, alpha, task_weights, actor_update_key
+                            )
+                            logs = {**logs, **actor_logs}
 
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                qf1 = qf1.replace(target_params=optax.incremental_update(qf1.params, qf1.target_params, args.tau))
-                qf2 = qf2.replace(target_params=optax.incremental_update(qf2.params, qf2.target_params, args.tau))
+                    # update the target networks
+                    if epoch_step % args.target_network_frequency == 0:
+                        qf1 = qf1.replace(
+                            target_params=optax.incremental_update(qf1.params, qf1.target_params, args.tau)
+                        )
+                        qf2 = qf2.replace(
+                            target_params=optax.incremental_update(qf2.params, qf2.target_params, args.tau)
+                        )
 
-            # Logging
-            if global_step % 100 == 0:
-                logs = jax.device_get(logs)
-                for _key, value in logs.items():
-                    writer.add_scalar(_key, value, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                    # Logging
+                    if (global_step + epoch_step) % 100 == 0:
+                        logs = jax.device_get(logs)
+                        for _key, value in logs.items():
+                            writer.add_scalar(_key, value, global_step)
+                        print("SPS:", int(global_step / (time.time() - start_time)))
+                        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-            # Evaluation
-            if global_step % args.evaluation_frequency == 0:
-                print("Evaluating...")
-                eval_agent = Agent(actor, num_tasks=NUM_TASKS)
-                eval_success_rate = evaluation_procedure(
-                    num_envs=len(envs.envs),
-                    num_workers=args.evaluation_num_workers,
-                    num_episodes=args.evaluation_num_episodes,
-                    writer=writer,
-                    agent=eval_agent,
-                    update=global_step,
-                    keys=list(benchmark.train_classes.keys()),
-                    classes=benchmark.train_classes,
-                    tasks=benchmark.train_tasks,
-                )
-                print(f"Evaluation success_rate: {eval_success_rate:.4f}")
+                    # Evaluation
+                    if global_step % args.evaluation_frequency == 0:
+                        print("Evaluating...")
+                        eval_agent = Agent(actor, num_tasks=NUM_TASKS)
+                        eval_success_rate = evaluation_procedure(
+                            num_envs=len(envs.envs),
+                            num_workers=args.evaluation_num_workers,
+                            num_episodes=args.evaluation_num_episodes,
+                            writer=writer,
+                            agent=eval_agent,
+                            update=global_step,
+                            keys=list(benchmark.train_classes.keys()),
+                            classes=benchmark.train_classes,
+                            tasks=benchmark.train_tasks,
+                        )
+                        print(f"Evaluation success_rate: {eval_success_rate:.4f}")
 
     envs.close()
     writer.close()
