@@ -1,9 +1,7 @@
-gymnasium @ git+ssh://git@github.com/reginald-mclean/Gymnasium.git
-memory-profiler
 metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git
+stable-baselines3 @ git+ssh://git@github.com/DLR-RM/stable-baselines3.git
 moviepy
 mujoco
-stable-baselines3
 tensorboard
 torch
 wandb
