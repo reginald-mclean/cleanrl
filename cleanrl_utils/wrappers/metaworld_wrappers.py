@@ -10,7 +10,7 @@ from gymnasium.spaces import Space, Box
 from gymnasium.vector.utils import concatenate, create_empty_array, iterate
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-
+from gymnasium.wrappers import normalize
 
 class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: gym.Env, task_idx: int, num_envs: int):
@@ -82,6 +82,7 @@ class SyncVectorEnv(VectorEnv):
             if use_one_hot_wrapper:
                 env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
             env = RecordEpisodeStatistics(env)
+            #env = normalize.NormalizeObservation(env)
             self.envs.append(env)
         self.copy = copy
         self.metadata = self.envs[0].metadata
