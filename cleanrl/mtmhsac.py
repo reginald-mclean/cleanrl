@@ -274,7 +274,7 @@ if __name__ == "__main__":
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        "cpu",
+        device,
         handle_timeout_termination=False,
         n_envs=envs.num_envs,
     )
