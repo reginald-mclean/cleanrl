@@ -21,6 +21,8 @@ import jax.numpy as jnp
 import metaworld
 import numpy as np
 import optax  # type: ignore
+import orbax.checkpoint
+from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
@@ -45,6 +47,8 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
+    parser.add_argument('--save-model-frequency', type=int, default=50_000,
+        help="the frequency of saving the model")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
@@ -64,7 +68,7 @@ def parse_args():
         help="the batch size of sample from the reply memory")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
-        help="how many updates to before evaluating the agent")
+        help="how many updates to do before evaluating the agent")
     parser.add_argument("--evaluation-num-workers", type=int, default=10,
         help="the number of evaluation workers")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
@@ -76,8 +80,8 @@ def parse_args():
     parser.add_argument("--policy-frequency", type=int, default=1, help="the frequency of training policy (delayed)")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
-    parser.add_argument("--clip-grad-norm", type=float, default=0.0,
-        help="the value to clip the gradient norm to. Disabled if 0 (Default). Not applied to alpha gradients.") 
+    parser.add_argument("--clip-grad-norm", type=float, default=1.0,
+        help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.") 
     # Soft Modules
     parser.add_argument("--num-modules", "-n", type=int, default=2,
         help="the number of modules per layer in the network (n)")
@@ -402,7 +406,7 @@ def update_critic(
     def critic_mse_loss(critic: CriticTrainState, params: flax.core.FrozenDict) -> jnp.float32:
         q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
         # NOTE specific to Soft Modules: task weights
-        return (task_weights * (q_pred - jax.lax.stop_gradient(next_q_value)) ** 2).mean(), q_pred
+        return 0.5 * (task_weights * (q_pred - jax.lax.stop_gradient(next_q_value)) ** 2).mean(), q_pred
 
     (qf1_loss, qf1_a_values), qf1_grads = jax.value_and_grad(partial(critic_mse_loss, qf1), has_aux=True)(qf1.params)
     qf1 = qf1.apply_gradients(grads=qf1_grads)
@@ -410,7 +414,7 @@ def update_critic(
     (qf2_loss, qf2_a_values), qf2_grads = jax.value_and_grad(partial(critic_mse_loss, qf2), has_aux=True)(qf2.params)
     qf2 = qf2.apply_gradients(grads=qf2_grads)
 
-    critic_loss = (qf1_loss + qf2_loss) / 2.0  # for logging
+    critic_loss = qf1_loss + qf2_loss  # for logging
 
     return (qf1, qf2), {
         "losses/qf1_values": qf1_a_values.mean(),
@@ -469,6 +473,13 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+
+    if args.save_model:  # Orbax checkpoints
+        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=5, create=True)
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        ckpt_manager = orbax.checkpoint.CheckpointManager(
+            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+        )
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -600,19 +611,10 @@ if __name__ == "__main__":
                 np.mean(global_episodic_length),
                 global_step,
             )
-            if args.save_model:
-                model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-                with open(model_path + "_qf1", "wb") as f:
-                    f.write(flax.serialization.to_bytes(qf1.params))
-                with open(model_path + "_qf2", "wb") as f:
-                    f.write(flax.serialization.to_bytes(qf2.params))
-                with open(model_path + "_actor", "wb") as f:
-                    f.write(flax.serialization.to_bytes(actor.params))
-                print(f"model saved to {model_path}")
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            if global_step % args.epoch_size == 0:
+            if global_step % args.epoch_size == 0:  # torchrl-style training loop
                 for epoch_step in range(args.epoch_size):
                     # Sample a batch from replay buffer
                     data = rb.sample(args.batch_size)
@@ -640,7 +642,7 @@ if __name__ == "__main__":
                     logs = {**logs, **critic_logs}
 
                     # Update policy network
-                    if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+                    if (global_step + epoch_step) % args.policy_frequency == 0:  # TD 3 Delayed update support
                         for _ in range(
                             args.policy_frequency
                         ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
@@ -651,7 +653,7 @@ if __name__ == "__main__":
                             logs = {**logs, **actor_logs}
 
                     # update the target networks
-                    if epoch_step % args.target_network_frequency == 0:
+                    if (global_step + epoch_step) % args.target_network_frequency == 0:
                         qf1 = qf1.replace(
                             target_params=optax.incremental_update(qf1.params, qf1.target_params, args.tau)
                         )
@@ -668,11 +670,11 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                     # Evaluation
-                    if global_step % args.evaluation_frequency == 0:
+                    if (global_step + epoch_step) % args.evaluation_frequency == 0:
                         print("Evaluating...")
                         eval_agent = Agent(actor, num_tasks=NUM_TASKS)
                         eval_success_rate = evaluation_procedure(
-                            num_envs=len(envs.envs),
+                            num_envs=envs.num_envs,
                             num_workers=args.evaluation_num_workers,
                             num_episodes=args.evaluation_num_episodes,
                             writer=writer,
@@ -683,6 +685,20 @@ if __name__ == "__main__":
                             tasks=benchmark.train_tasks,
                         )
                         print(f"Evaluation success_rate: {eval_success_rate:.4f}")
+
+                    # Checkpointing
+                    if args.save_model and (global_step + epoch_step) % args.save_model_frequency == 0:
+                        ckpt = {
+                            "actor": actor,
+                            "qf1": qf1,
+                            "qf2": qf2,
+                            "alpha": alpha_train_state,
+                            "target_entropy": target_entropy,
+                            "global_step": global_step,
+                        }
+                        save_args = orbax_utils.save_args_from_target(ckpt)
+                        ckpt_manager.save(global_step, ckpt, save_kwargs={"save_args": save_args})
+                        print(f"model saved to {ckpt_manager.directory}")
 
     envs.close()
     writer.close()
