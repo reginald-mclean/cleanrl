@@ -432,7 +432,8 @@ if __name__ == "__main__":
              # Evaluation
             if global_step % args.evaluation_frequency == 0:
                 print("Evaluating...")
-                eval_agent = Actor(envs, NUM_TASKS).to(device)
+                eval_device = torch.device("cpu")
+                eval_agent = Actor(envs, NUM_TASKS).to(eval_device)
                 eval_success_rate = evaluation_procedure(
                     writer=writer,
                     agent=eval_agent,
@@ -441,6 +442,7 @@ if __name__ == "__main__":
                     keys=list(benchmark.train_classes.keys()),
                     update=global_step,
                     num_envs=envs.num_envs,
+                    device=eval_device
                 )
                 print(f"Evaluation success_rate: {eval_success_rate:.4f}")
 
