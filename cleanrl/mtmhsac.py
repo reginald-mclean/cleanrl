@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
-    parser.add_argument("--evaluation-frequency", type=int, default=500_000, help="how many updates to before evaluating the agent")
+    parser.add_argument("--evaluation-frequency", type=int, default=250_000, help="how many updates to before evaluating the agent")
     parser.add_argument("--evaluation-num-workers", type=int, default=10, help="the number of evaluation workers")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50, help="the number episodes per evaluation")
 
@@ -437,18 +437,15 @@ if __name__ == "__main__":
                 print("Evaluating...")
                 eval_agent = Actor(envs, NUM_TASKS).to(device)
                 eval_success_rate = evaluation_procedure(
-                    num_envs=envs.num_envs,
-                    num_workers=args.evaluation_num_workers,
-                    num_episodes=args.evaluation_num_episodes,
                     writer=writer,
                     agent=eval_agent,
-                    update=global_step,
-                    keys=list(benchmark.train_classes.keys()),
                     classes=benchmark.train_classes,
                     tasks=benchmark.train_tasks,
+                    keys=list(benchmark.train_classes.keys()),
+                    update=global_step,
+                    num_envs=envs.num_envs,
                 )
                 print(f"Evaluation success_rate: {eval_success_rate:.4f}")
-                writer.add_scalar("charts/eval_success_rate", eval_success_rate, global_step)
 
     envs.close()
     writer.close()
