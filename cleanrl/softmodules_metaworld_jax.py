@@ -6,7 +6,7 @@ import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import Callable, NamedTuple, Optional, Tuple, Type, Union
+from typing import NamedTuple, Optional, Tuple, Type, Union
 
 os.environ[
     "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -76,7 +76,6 @@ def parse_args():
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
-    parser.add_argument("--policy-frequency", type=int, default=1, help="the frequency of training policy (delayed)")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
     parser.add_argument("--clip-grad-norm", type=float, default=1.0,
@@ -122,6 +121,17 @@ JaxOrNPArray: Type = Union[jnp.ndarray, np.ndarray]
 
 def split_obs_task_id(obs: JaxOrNPArray, num_tasks: int) -> Tuple[JaxOrNPArray, JaxOrNPArray]:
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
+
+
+def scale_action(action_space: gym.spaces.Box, action: np.ndarray) -> np.ndarray:
+    low, high = action_space.low, action_space.high
+    return 2.0 * ((action - low) / (high - low)) - 1.0
+
+
+def unscale_action(action_space: gym.spaces.Box, scaled_action: np.ndarray) -> np.ndarray:
+    low, high = action_space.low, action_space.high
+    scaled_action = np.clip(scaled_action, -1, 1)
+    return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 
 # Networks
@@ -291,37 +301,27 @@ class Actor(nn.Module):  # Policy network
         return mean, log_std
 
 
-class ActorTrainState(TrainState):
-    sample_and_log_prob: Callable
-
-
-@partial(jax.jit, static_argnums=(0,))
-def get_action(
-    num_tasks: int,
-    action_scale: jax.Array,
-    action_bias: jax.Array,
+@jax.jit
+def sample_action(
     actor: TrainState,
-    obs: jax.Array,
+    obs: JaxOrNPArray,
+    task_ids: JaxOrNPArray,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    s_t, z_Tau = split_obs_task_id(obs, num_tasks)
-    mean, log_std = actor.apply_fn(actor.params, s_t, z_Tau)
+    mean, log_std = actor.apply_fn(actor.params, obs, task_ids)
     action = jnp.tanh(
         mean + jnp.exp(log_std) * jax.random.normal(action_key, shape=mean.shape)
     )  # Reparameterization trick
-    action = action * action_scale + action_bias  # Rescale
     return action, key
 
 
 @jax.jit
 def sample_and_log_prob(
-    action_scale: jax.Array,
-    action_bias: jax.Array,
     actor: TrainState,
     actor_params: flax.core.FrozenDict,  # For actor loss
-    obs: jax.Array,
-    task_ids: jax.Array,
+    obs: JaxOrNPArray,
+    task_ids: JaxOrNPArray,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
@@ -331,9 +331,7 @@ def sample_and_log_prob(
     log_prob = -0.5 * ((gaussian_action - mean) / std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - log_std
     log_prob = log_prob.sum(axis=1)
     action = jnp.tanh(gaussian_action)
-    # Enforcing action bound
-    log_prob -= jnp.sum(jnp.log(action_scale * (1 - action**2) + 1e-6), axis=1)
-    action = action * action_scale + action_bias  # Rescale
+    log_prob -= jnp.sum(jnp.log((1 - action**2) + 1e-6), axis=1)
     return action, log_prob, key
 
 
@@ -356,13 +354,40 @@ class Critic(nn.Module):  # Q Network
         return self.net(jnp.concatenate([s_t, a_t], axis=-1), z_Tau)
 
 
+class VectorCritic(nn.Module):
+    embedding_dim: int
+    module_dim: int
+    num_layers: int
+    num_modules: int
+
+    n_critics: int = 2
+
+    @nn.compact
+    def __call__(self, s_t: jax.Array, a_t: jax.Array, z_Tau: jax.Array) -> jax.Array:
+        vmap_critic = nn.vmap(
+            Critic,
+            variable_axes={"params": 0},  # parameters not shared between the critics
+            split_rngs={"params": True},  # different initializations
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.n_critics,
+        )
+        q_values = vmap_critic(
+            embedding_dim=self.embedding_dim,
+            module_dim=self.module_dim,
+            num_layers=self.num_layers,
+            num_modules=self.num_modules,
+        )(s_t, a_t, z_Tau)
+        return q_values
+
+
 class CriticTrainState(TrainState):
     target_params: flax.core.FrozenDict
 
 
 @jax.jit
 def get_alpha(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
-    return jnp.exp(task_ids @ jnp.expand_dims(log_alpha, 0).transpose())
+    return jnp.exp(task_ids @ log_alpha.reshape(-1, 1))
 
 
 class Agent:  # MT SAC Agent
@@ -382,8 +407,6 @@ class Agent:  # MT SAC Agent
         init_key: jax.random.PRNGKeyArray,
     ):
         self._action_space = action_space
-        self._action_scale = jnp.array((action_space.high - action_space.low) / 2.0)
-        self._action_bias = jnp.array((action_space.high + action_space.low) / 2.0)
         self._num_tasks = num_tasks
         self._gamma = gamma
 
@@ -407,26 +430,18 @@ class Agent:  # MT SAC Agent
 
         actor_network = Actor(num_actions=np.prod(self._action_space.shape), **network_args)
         key, actor_init_key = jax.random.split(init_key)
-        self.actor = ActorTrainState.create(
+        self.actor = TrainState.create(
             apply_fn=actor_network.apply,
-            sample_and_log_prob=jax.tree_util.Partial(sample_and_log_prob, self._action_scale, self._action_bias),
             params=actor_network.init(actor_init_key, just_obs, task_id),
             tx=_make_optimizer(policy_lr, clip_grad_norm),
         )
-        self.get_action = jax.tree_util.Partial(get_action, self._num_tasks, self._action_scale, self._action_bias)
 
-        q_network = Critic(**network_args)
-        qf1_init_key, qf2_init_key = jax.random.split(key, 2)
-        self.qf1 = CriticTrainState.create(
-            apply_fn=q_network.apply,
-            params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
-            target_params=q_network.init(qf1_init_key, just_obs, random_action, task_id),
-            tx=_make_optimizer(q_lr, clip_grad_norm),
-        )
-        self.qf2 = CriticTrainState.create(
-            apply_fn=q_network.apply,
-            params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
-            target_params=q_network.init(qf2_init_key, just_obs, random_action, task_id),
+        _, qf_init_key = jax.random.split(key, 2)
+        vector_critic_net = VectorCritic(**network_args)
+        self.critic = CriticTrainState.create(
+            apply_fn=vector_critic_net.apply,
+            params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
+            target_params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
             tx=_make_optimizer(q_lr, clip_grad_norm),
         )
 
@@ -437,142 +452,116 @@ class Agent:  # MT SAC Agent
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
+    def get_action(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
+        s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
+        actions, key = jax.device_get(sample_action(self.actor, s_t, z_Tau, key))
+        actions = unscale_action(self._action_space, actions)
+        return actions, key
+
     @staticmethod
     @jax.jit
-    def soft_update(tau: float, qf_state: CriticTrainState) -> CriticTrainState:
-        qf_state = qf_state.replace(
-            target_params=optax.incremental_update(qf_state.params, qf_state.target_params, tau)
+    def soft_update(tau: float, critic_state: CriticTrainState) -> CriticTrainState:
+        qf_state = critic_state.replace(
+            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, tau)
         )
         return qf_state
 
     def soft_update_target_networks(self, tau: float):
-        self.qf1 = self.soft_update(tau, self.qf1)
-        self.qf2 = self.soft_update(tau, self.qf2)
+        self.critic = self.soft_update(tau, self.critic)
 
     def get_ckpt(self) -> dict:
         return {
-            "actor_params": self.actor.params,
-            "actor_opt": self.actor.opt_state,
-            "qf1": self.qf1,
-            "qf2": self.qf2,
+            "actor": self.actor,
+            "critic": self.critic,
             "alpha": self.alpha_train_state,
             "target_entropy": self.target_entropy,
         }
 
 
-@partial(jax.jit, static_argnums=(0,))
-def update_alpha(
-    target_entropy: float,
-    alpha_train_state: TrainState,
-    actor: ActorTrainState,
-    batch: Batch,
-    key: jax.random.PRNGKeyArray,
-) -> Tuple[TrainState, dict, jax.random.PRNGKeyArray]:
-    _, action_log_probs, key = actor.sample_and_log_prob(actor, actor.params, batch.observations, batch.task_ids, key)
-
-    def alpha_loss(params: jax.Array) -> jnp.float32:
-        log_alpha = batch.task_ids @ jnp.expand_dims(params, 0).transpose()
-        return (-log_alpha * (jax.lax.stop_gradient(action_log_probs) + target_entropy)).mean()
-
-    alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(alpha_train_state.params)
-    alpha_train_state = alpha_train_state.apply_gradients(grads=alpha_grads)
-
-    return (
-        alpha_train_state,
-        {
-            "losses/alpha_loss": alpha_loss_value,
-            "alpha": jnp.exp(alpha_train_state.params).sum(),
-        },
-        key,
-    )
-
-
 @jax.jit
 def extract_task_weights(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:  # NOTE specific to Soft Modules
     task_weights = jax.nn.softmax(-log_alpha)  # NOTE Soft Modules official code uses log_alpha here
-    task_weights = task_ids @ jnp.expand_dims(task_weights, 0).transpose()
+    task_weights = task_ids @ task_weights.reshape(-1, 1)
     return task_weights
 
 
-@partial(jax.jit, static_argnames=("gamma"))
-def update_critic(
-    actor: ActorTrainState,
-    critics: Tuple[CriticTrainState, CriticTrainState],
+@partial(jax.jit, static_argnames=("gamma", "target_entropy"))
+def update(
+    actor: TrainState,
+    critic: CriticTrainState,
+    alpha: TrainState,
     batch: Batch,
-    alpha: jax.Array,
-    task_weights: jax.Array,  # NOTE specific to Soft Modules
+    target_entropy: float,
     gamma: float,
     key: jax.random.PRNGKeyArray,
-) -> Tuple[Tuple[CriticTrainState, CriticTrainState], dict, jax.random.PRNGKeyArray]:
-    qf1, qf2 = critics
-
-    # Sample a'
-    next_actions, next_action_log_probs, key = actor.sample_and_log_prob(
-        actor, actor.params, batch.next_observations, batch.task_ids, key
-    )
-
-    # Compute target Q values
-    qf1_next_target = qf1.apply_fn(qf1.target_params, batch.next_observations, next_actions, batch.task_ids)
-    qf2_next_target = qf2.apply_fn(qf2.target_params, batch.next_observations, next_actions, batch.task_ids)
-    min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target) - alpha * next_action_log_probs
-    next_q_value = batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
-
-    def critic_mse_loss(critic: CriticTrainState, params: flax.core.FrozenDict) -> jnp.float32:
-        q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
-        # NOTE specific to Soft Modules: task weights
-        return 0.5 * (task_weights * (q_pred - jax.lax.stop_gradient(next_q_value)) ** 2).mean(axis=1).sum(), q_pred
-
-    (qf1_loss, qf1_a_values), qf1_grads = jax.value_and_grad(partial(critic_mse_loss, qf1), has_aux=True)(qf1.params)
-    qf1 = qf1.apply_gradients(grads=qf1_grads)
-
-    (qf2_loss, qf2_a_values), qf2_grads = jax.value_and_grad(partial(critic_mse_loss, qf2), has_aux=True)(qf2.params)
-    qf2 = qf2.apply_gradients(grads=qf2_grads)
-
-    critic_loss = qf1_loss + qf2_loss  # for logging
-
-    return (
-        (qf1, qf2),
-        {
-            "losses/qf1_values": qf1_a_values.mean(),
-            "losses/qf2_values": qf2_a_values.mean(),
-            "losses/qf_loss": critic_loss,
-        },
-        key,
-    )
-
-
-@jax.jit
-def update_actor(
-    actor: ActorTrainState,
-    critics: Tuple[CriticTrainState, CriticTrainState],
-    batch: Batch,
-    alpha: jax.Array,
-    task_weights: jax.Array,
-    key: jax.random.PRNGKeyArray,
-) -> Tuple[ActorTrainState, dict, jax.random.PRNGKeyArray]:
-    qf1, qf2 = critics
+) -> Tuple[Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray]:
     key, actor_loss_key = jax.random.split(key)
 
+    # --- Critic loss ---
+    # Sample a'
+    next_actions, next_action_log_probs, key = sample_and_log_prob(
+        actor, actor.params, batch.next_observations, batch.task_ids, key
+    )
+    # Compute target Q values
+    q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
+
+    def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array, task_weights: jax.Array) -> jnp.float32:
+        # next_action_log_probs is (B,) shaped because of the sum(axis=1), while Q values are (B, 1)
+        min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
+        next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
+
+        q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
+        # NOTE specific to Soft Modules: task weights
+        return 0.5 * (task_weights * (q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
+
+    def update_critic(
+        _critic: CriticTrainState, alpha_val: jax.Array, task_weights: jax.Array
+    ) -> Tuple[CriticTrainState, dict]:
+        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(critic_loss, has_aux=True)(
+            _critic.params, alpha_val, task_weights
+        )
+        _critic = _critic.apply_gradients(grads=critic_grads)
+        return _critic, {"losses/qf_values": qf_values, "losses/qf_loss": critic_loss_value}
+
+    # --- Alpha loss ---
+    def alpha_loss(params: jax.Array, log_probs: jax.Array) -> jnp.float32:
+        log_alpha = batch.task_ids @ params.reshape(-1, 1)
+        return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
+
+    def update_alpha(_alpha: TrainState, log_probs: jax.Array) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
+        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(_alpha.params, log_probs)
+        _alpha = _alpha.apply_gradients(grads=alpha_grads)
+        alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
+        task_weights = extract_task_weights(_alpha.params, batch.task_ids)
+        return (
+            _alpha,
+            alpha_vals,
+            task_weights,
+            {"losses/alpha_loss": alpha_loss_value, "alpha": jnp.exp(_alpha.params).sum()},
+        )
+
+    # --- Actor loss --- & calls for the other losses
     def actor_loss(params: flax.core.FrozenDict) -> jnp.float32:
-        action_samples, log_probs, _ = actor.sample_and_log_prob(
+        action_samples, log_probs, _ = sample_and_log_prob(
             actor, params, batch.observations, batch.task_ids, actor_loss_key
         )
-        qf1_values = qf1.apply_fn(qf1.params, batch.observations, action_samples, batch.task_ids)
-        qf2_values = qf2.apply_fn(qf2.params, batch.observations, action_samples, batch.task_ids)
-        min_qf_values = jnp.minimum(qf1_values, qf2_values)
-        # NOTE specific to Soft Modules: task weights
-        return (task_weights * (alpha * log_probs - min_qf_values)).mean()
 
-    actor_loss_value, actor_grads = jax.value_and_grad(actor_loss)(actor.params)  # value for logging
+        # HACK Putting the other losses / grad updates inside this function for performance,
+        # so we can reuse the action_samples / log_probs while also doing alpha loss first
+        _alpha, _alpha_val, task_weights, alpha_logs = update_alpha(alpha, log_probs)
+        _alpha_val = jax.lax.stop_gradient(_alpha_val)
+        task_weights = jax.lax.stop_gradient(task_weights)
+        _critic, critic_logs = update_critic(critic, _alpha_val, task_weights)
+        logs = {**alpha_logs, **critic_logs}
+
+        q_values = _critic.apply_fn(_critic.params, batch.observations, action_samples, batch.task_ids)
+        min_qf_values = jnp.min(q_values, axis=0)
+        return (task_weights * (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values)).mean(), (_alpha, _critic, logs)
+
+    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
     actor = actor.apply_gradients(grads=actor_grads)
 
-    return (
-        actor,
-        {
-            "losses/actor_loss": actor_loss_value,
-        },
-        key,
-    )
+    return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
 # Training loop
@@ -664,8 +653,7 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, key = agent.get_action(agent.actor, obs, key)
-            actions = jax.device_get(actions)
+            actions, key = agent.get_action(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -685,6 +673,9 @@ if __name__ == "__main__":
         for idx, d in enumerate(truncations):
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
+
+        # Store scaled actions
+        actions = scale_action(envs.single_action_space, actions)
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -715,31 +706,15 @@ if __name__ == "__main__":
                     batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
                     logs = {}
 
-                    # Update alpha  # NOTE Soft-modules specific: this goes first
-                    agent.alpha_train_state, alpha_logs, key = update_alpha(
-                        agent.target_entropy, agent.alpha_train_state, agent.actor, batch, key
+                    (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
+                        agent.actor,
+                        agent.critic,
+                        agent.alpha_train_state,
+                        batch,
+                        agent.target_entropy,
+                        args.gamma,
+                        key,
                     )
-                    logs = {**logs, **alpha_logs}
-
-                    # Get task weights & alpha
-                    alpha = get_alpha(agent.alpha_train_state.params, batch.task_ids)
-                    task_weights = extract_task_weights(agent.alpha_train_state.params, batch.task_ids)
-
-                    # Update Q networks
-                    (agent.qf1, agent.qf2), critic_logs, key = update_critic(
-                        agent.actor, (agent.qf1, agent.qf2), batch, alpha, task_weights, args.gamma, key
-                    )
-                    logs = {**logs, **critic_logs}
-
-                    # Update policy network
-                    if (global_step + epoch_step) % args.policy_frequency == 0:  # TD 3 Delayed update support
-                        for _ in range(
-                            args.policy_frequency
-                        ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                            agent.actor, actor_logs, key = update_actor(
-                                agent.actor, (agent.qf1, agent.qf2), batch, alpha, task_weights, key
-                            )
-                            logs = {**logs, **actor_logs}
 
                     # update the target networks
                     if (global_step + epoch_step) % args.target_network_frequency == 0:
