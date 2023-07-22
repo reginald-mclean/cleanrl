@@ -50,10 +50,12 @@ def parse_args():
     parser.add_argument("--max-episode-steps", type=int, default=200, help="maximum number of timesteps in one episode during training")
     parser.add_argument("--evaluation-frequency", type=int, default=250_000, help="how many updates to before evaluating the agent")
 
-    parser.add_argument("--buffer-size", type=int, default=int(1e6), help="the replay memory buffer size")
+    parser.add_argument("--utd-ratio", type=int, default=20, help="update-to-data ratio")
+
+    parser.add_argument("--buffer-size", type=int, default=int(1e6), help="the replay memory buffer size for a single task")
     parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=128, help="the batch size of sample from the replay memory")
+    parser.add_argument("--batch-size", type=int, default=128, help="the batch size of sample from the replay memory for a single task")
     parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
 
     parser.add_argument("--policy-lr", type=float, default=3e-4, help="the learning rate of the policy network optimizer")
@@ -332,7 +334,12 @@ if __name__ == "__main__":
 
     obs, info = envs.reset()
 
-    for global_step in range(args.total_timesteps):
+    total_steps_reached = False
+    global_step = 0
+    env_steps = 0
+    grad_steps = 0
+
+    while not total_steps_reached:
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
@@ -341,6 +348,8 @@ if __name__ == "__main__":
         else:
             actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
             actions = actions.detach().cpu().numpy()
+
+        env_steps += actions.shape[0]
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -376,85 +385,89 @@ if __name__ == "__main__":
                 global_step,
             )
             print(
-                f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
+                f"global_step={global_step}, env_steps={env_steps} mean_episodic_return={np.mean(global_episodic_return)}"
             )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
-                )
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
-                    * next_state_log_pi
-                )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
+        if global_step > args.learning_starts and global_step % args.utd_ratio == 0:
+            for _ in range(args.utd_ratio):
+                data = rb.sample(args.batch_size)
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(
+                        data.next_observations
+                    )
+                    qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                    qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                    min_qf_next_target = (
+                        torch.min(qf1_next_target, qf2_next_target)
+                        - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
+                        * next_state_log_pi
+                    )
+                    next_q_value = data.rewards.flatten() + (
+                        1 - data.dones.flatten()
+                    ) * args.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = qf1(
-                data.observations, data.actions.type(torch.float32)
-            ).view(-1)
-            qf2_a_values = qf2(
-                data.observations, data.actions.type(torch.float32)
-            ).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+                qf1_a_values = qf1(
+                    data.observations, data.actions.type(torch.float32)
+                ).view(-1)
+                qf2_a_values = qf2(
+                    data.observations, data.actions.type(torch.float32)
+                ).view(-1)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
 
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                    actor_loss = (
-                        (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
-                        - min_qf_pi
-                    ).mean()
-
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_optimizer.step()
-
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (
-                            -get_log_alpha(log_alpha, NUM_TASKS, data)
-                            * (log_pi + target_entropy)
+                # TD 3 Delayed update support
+                if grad_steps % args.policy_frequency == 0:
+                    for _ in range(
+                        args.policy_frequency
+                    ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                        pi, log_pi, _ = actor.get_action(data.observations)
+                        qf1_pi = qf1(data.observations, pi)
+                        qf2_pi = qf2(data.observations, pi)
+                        min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
+                        actor_loss = (
+                            (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
+                            - min_qf_pi
                         ).mean()
 
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.sum().exp().item()
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        actor_optimizer.step()
 
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
+                        if args.autotune:
+                            with torch.no_grad():
+                                _, log_pi, _ = actor.get_action(data.observations)
+                            alpha_loss = (
+                                -get_log_alpha(log_alpha, NUM_TASKS, data)
+                                * (log_pi + target_entropy)
+                            ).mean()
+
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = log_alpha.sum().exp().item()
+
+                # update the target networks
+                if grad_steps % args.target_network_frequency == 0:
+                    for param, target_param in zip(
+                        qf1.parameters(), qf1_target.parameters()
+                    ):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+                    for param, target_param in zip(
+                        qf2.parameters(), qf2_target.parameters()
+                    ):
+                        target_param.data.copy_(
+                            args.tau * param.data + (1 - args.tau) * target_param.data
+                        )
+
+                grad_steps += 1
 
             if global_step % 100 == 0:
                 writer.add_scalar(
@@ -474,26 +487,45 @@ if __name__ == "__main__":
                     int(global_step / (time.time() - start_time)),
                     global_step,
                 )
+                writer.add_scalar(
+                    "charts/SPS",
+                    int(global_step / (time.time() - start_time)),
+                    global_step,
+                )
+
+                writer.add_scalar(
+                    "charts/grad_steps",
+                    grad_steps,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "charts/env_steps",
+                    env_steps,
+                    global_step,
+                )
+
                 if args.autotune:
                     writer.add_scalar(
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
-            # Evaluation
-            if global_step % args.evaluation_frequency == 0:
-                print("Evaluating...")
-                eval_device = torch.device("cpu")
-                eval_agent = Actor(envs, NUM_TASKS).to(eval_device)
-                eval_success_rate = evaluation_procedure(
-                    writer=writer,
-                    agent=eval_agent,
-                    classes=benchmark.train_classes,
-                    tasks=benchmark.train_tasks,
-                    keys=list(benchmark.train_classes.keys()),
-                    update=global_step,
-                    num_envs=envs.num_envs,
-                    device=eval_device,
-                )
-                print(f"Evaluation success_rate: {eval_success_rate:.4f}")
+        # Evaluation
+        if global_step % args.evaluation_frequency == 0:
+            print("Evaluating...")
+            eval_device = torch.device("cpu")
+            eval_agent = Actor(envs, NUM_TASKS).to(eval_device)
+            eval_success_rate = evaluation_procedure(
+                writer=writer,
+                agent=eval_agent,
+                classes=benchmark.train_classes,
+                tasks=benchmark.train_tasks,
+                keys=list(benchmark.train_classes.keys()),
+                update=global_step,
+                num_envs=envs.num_envs,
+                device=eval_device,
+            )
+            print(f"Evaluation success_rate: {eval_success_rate:.4f}")
+
+        global_step += 1
 
     envs.close()
     writer.close()
