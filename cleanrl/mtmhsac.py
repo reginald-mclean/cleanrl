@@ -14,12 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
+from cleanrl_utils.wrappers.metaworld_wrappers import (
+    OneHotWrapper,
+    RandomTaskSelectWrapper,
+)
 
 
 def parse_args():
@@ -66,6 +68,52 @@ def parse_args():
     args = parser.parse_args()
     # fmt: on
     return args
+
+
+class MultiTaskReplayBuffer:
+    def __init__(self, capacity, num_tasks, envs, device):
+        self.capacity = capacity
+        self.num_tasks = num_tasks
+        self.device = device
+        state_shape = np.array(envs.single_observation_space.shape).prod()
+        action_shape = np.array(envs.single_action_space.shape).prod()
+        self.obs = np.zeros((capacity, num_tasks, state_shape), dtype=np.float32)
+        self.actions = np.zeros((capacity, num_tasks, action_shape), dtype=np.float32)
+        self.rewards = np.zeros((capacity, num_tasks), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, num_tasks, state_shape), dtype=np.float32)
+        self.dones = np.zeros((capacity, num_tasks), dtype=np.float32)
+        self.pos = 0
+
+    def add(self, obs, action, reward, next_obs, done):
+        task_idx = obs[:, -self.num_tasks :].argmax(1)
+
+        self.obs[self.pos, task_idx] = obs
+        self.actions[self.pos, task_idx] = action
+        self.rewards[self.pos, task_idx] = reward
+        self.next_obs[self.pos, task_idx] = next_obs
+        self.dones[self.pos, task_idx] = done
+
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, single_task_batch_size):
+        sample_idx = np.random.randint(
+            0,
+            high=max(self.pos, single_task_batch_size),
+            size=(single_task_batch_size,),
+        )
+        obs = torch.tensor(self.obs[sample_idx]).to(self.device)
+        actions = torch.tensor(self.actions[sample_idx]).to(self.device)
+        rewards = torch.tensor(self.rewards[sample_idx]).to(self.device)
+        next_obs = torch.tensor(self.next_obs[sample_idx]).to(self.device)
+        dones = torch.tensor(self.dones[sample_idx]).to(self.device)
+        mt_batch_size = single_task_batch_size * self.num_tasks
+        return ReplayBufferSamples(
+            observations=obs.reshape(mt_batch_size, -1),
+            actions=actions.reshape(mt_batch_size, -1),
+            next_observations=next_obs.reshape(mt_batch_size, -1),
+            dones=dones.reshape(mt_batch_size, -1),
+            rewards=rewards.reshape(mt_batch_size, -1),
+        )
 
 
 # ALGO LOGIC: initialize agent here:
@@ -173,8 +221,12 @@ def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
     ret = torch.mm(one_hots, log_alpha.unsqueeze(0).t()).squeeze()
     return ret.unsqueeze(-1)
 
+
 def make_envs(
-    benchmark: metaworld.Benchmark, seed: int, max_episode_steps: Optional[int] = None, use_one_hot: bool = True
+    benchmark: metaworld.Benchmark,
+    seed: int,
+    max_episode_steps: Optional[int] = None,
+    use_one_hot: bool = True,
 ) -> gym.Env:
     def init_each_env(env_cls: Type[gym.Env], name: str, env_id: int) -> gym.Env:
         env = env_cls()
@@ -182,7 +234,9 @@ def make_envs(
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
-        env = RandomTaskSelectWrapper(env, [task for task in benchmark.train_tasks if task.env_name == name])
+        env = RandomTaskSelectWrapper(
+            env, [task for task in benchmark.train_tasks if task.env_name == name]
+        )
         env.action_space.seed(seed)
         return env
 
@@ -234,8 +288,10 @@ if __name__ == "__main__":
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    use_one_hot_wrapper = ("MT10" in args.env_id or "MT50" in args.env_id)
-    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
+    use_one_hot_wrapper = "MT10" in args.env_id or "MT50" in args.env_id
+    envs = make_envs(
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+    )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -267,14 +323,7 @@ if __name__ == "__main__":
         ).log()
 
     envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        handle_timeout_termination=False,
-        n_envs=envs.num_envs,
-    )
+    rb = MultiTaskReplayBuffer(args.buffer_size, NUM_TASKS, envs, device)
 
     start_time = time.time()
 
@@ -310,7 +359,7 @@ if __name__ == "__main__":
         for idx, d in enumerate(truncations):
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, actions, rewards, real_next_obs, terminations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -332,7 +381,7 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size * NUM_TASKS)
+            data = rb.sample(args.batch_size)
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(
                     data.next_observations
@@ -429,7 +478,7 @@ if __name__ == "__main__":
                     writer.add_scalar(
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
-             # Evaluation
+            # Evaluation
             if global_step % args.evaluation_frequency == 0:
                 print("Evaluating...")
                 eval_device = torch.device("cpu")
@@ -442,7 +491,7 @@ if __name__ == "__main__":
                     keys=list(benchmark.train_classes.keys()),
                     update=global_step,
                     num_envs=envs.num_envs,
-                    device=eval_device
+                    device=eval_device,
                 )
                 print(f"Evaluation success_rate: {eval_success_rate:.4f}")
 
