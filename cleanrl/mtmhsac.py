@@ -509,8 +509,8 @@ if __name__ == "__main__":
                         "losses/alpha_loss", alpha_loss.item(), global_step
                     )
         # Evaluation
-        if global_step % args.evaluation_frequency == 0:
-            print("Evaluating...")
+        if global_step % args.evaluation_frequency == 0 and global_step > 0:
+            print(f"Evaluating... at global_step={global_step}")
             eval_device = torch.device("cpu")
             eval_agent = Actor(envs, NUM_TASKS).to(eval_device)
             eval_success_rate = evaluation_procedure(
@@ -526,6 +526,7 @@ if __name__ == "__main__":
             print(f"Evaluation success_rate: {eval_success_rate:.4f}")
 
         global_step += 1
+        total_steps_reached = global_step >= args.total_timesteps
 
     envs.close()
     writer.close()
