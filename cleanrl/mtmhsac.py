@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
+from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
@@ -70,52 +71,6 @@ def parse_args():
     args = parser.parse_args()
     # fmt: on
     return args
-
-
-class MultiTaskReplayBuffer:
-    def __init__(self, capacity, num_tasks, envs, device):
-        self.capacity = capacity
-        self.num_tasks = num_tasks
-        self.device = device
-        state_shape = np.array(envs.single_observation_space.shape).prod()
-        action_shape = np.array(envs.single_action_space.shape).prod()
-        self.obs = np.zeros((capacity, num_tasks, state_shape), dtype=np.float32)
-        self.actions = np.zeros((capacity, num_tasks, action_shape), dtype=np.float32)
-        self.rewards = np.zeros((capacity, num_tasks), dtype=np.float32)
-        self.next_obs = np.zeros((capacity, num_tasks, state_shape), dtype=np.float32)
-        self.dones = np.zeros((capacity, num_tasks), dtype=np.float32)
-        self.pos = 0
-
-    def add(self, obs, action, reward, next_obs, done):
-        task_idx = obs[:, -self.num_tasks :].argmax(1)
-
-        self.obs[self.pos, task_idx] = obs
-        self.actions[self.pos, task_idx] = action
-        self.rewards[self.pos, task_idx] = reward
-        self.next_obs[self.pos, task_idx] = next_obs
-        self.dones[self.pos, task_idx] = done
-
-        self.pos = (self.pos + 1) % self.capacity
-
-    def sample(self, single_task_batch_size):
-        sample_idx = np.random.randint(
-            0,
-            high=max(self.pos, single_task_batch_size),
-            size=(single_task_batch_size,),
-        )
-        obs = torch.tensor(self.obs[sample_idx]).to(self.device)
-        actions = torch.tensor(self.actions[sample_idx]).to(self.device)
-        rewards = torch.tensor(self.rewards[sample_idx]).to(self.device)
-        next_obs = torch.tensor(self.next_obs[sample_idx]).to(self.device)
-        dones = torch.tensor(self.dones[sample_idx]).to(self.device)
-        mt_batch_size = single_task_batch_size * self.num_tasks
-        return ReplayBufferSamples(
-            observations=obs.reshape(mt_batch_size, -1),
-            actions=actions.reshape(mt_batch_size, -1),
-            next_observations=next_obs.reshape(mt_batch_size, -1),
-            dones=dones.reshape(mt_batch_size, -1),
-            rewards=rewards.reshape(mt_batch_size, -1),
-        )
 
 
 # ALGO LOGIC: initialize agent here:
@@ -325,7 +280,15 @@ if __name__ == "__main__":
         ).log()
 
     envs.single_observation_space.dtype = np.float32
-    rb = MultiTaskReplayBuffer(args.buffer_size, NUM_TASKS, envs, device)
+    rb = MultiTaskReplayBuffer(
+        capacity=args.buffer_size,
+        num_tasks=NUM_TASKS,
+        envs=envs,
+        use_torch=True,
+        seed=args.seed,
+        device=device
+    )
+
 
     start_time = time.time()
 
@@ -368,7 +331,7 @@ if __name__ == "__main__":
         for idx, d in enumerate(truncations):
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
-        rb.add(obs, actions, rewards, real_next_obs, terminations)
+        rb.add(obs, real_next_obs, actions, rewards, terminations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
