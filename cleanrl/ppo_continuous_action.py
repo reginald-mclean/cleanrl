@@ -79,7 +79,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=250, 
+    parser.add_argument("--eval-freq", type=int, default=25, 
         help="how many updates to do before evaluating the agent")
     args = parser.parse_args()
     args.batch_size = 100000 # int(args.num_envs * args.num_steps)

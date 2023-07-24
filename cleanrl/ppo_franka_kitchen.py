@@ -11,18 +11,18 @@ from distutils.util import strtobool
 import sys
 sys.path.append('/data/cleanrl')
 
-from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
-import gym
+from cleanrl_utils.evals.franka_kitchen_eval_protocol import evaluation_procedure
+from cleanrl_utils.wrappers.franka_kitchen_wrappers import OneHotV0, SyncVectorEnv
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-from gym.wrappers.vector_list_info import VectorListInfo
+from gymnasium.wrappers.vector_list_info import VectorListInfo
 
-import metaworld
+#import metaworld
 
 def parse_args():
     # fmt: off
@@ -45,7 +45,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="MT10",
+    parser.add_argument("--env-id", type=str, default="Franka-Kitchen",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1e8,
         help="total timesteps of the experiments")
@@ -79,7 +79,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=250, 
+    parser.add_argument("--eval-freq", type=int, default=25,
         help="how many updates to do before evaluating the agent")
     args = parser.parse_args()
     args.batch_size = 100000 # int(args.num_envs * args.num_steps)
@@ -136,7 +136,6 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -159,20 +158,15 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    if args.env_id == 'MT10':
-        benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == 'MT50':
-        benchmark = metaworld.MT50(seed=args.seed)
 
-    use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
-
+    use_one_hot_wrapper = True
+    fk_tasks = ['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']
     # env setup
     envs = SyncVectorEnv(
-        benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
+        [gym.make for _ in range(len(fk_tasks))], fk_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
-    keys = list(benchmark.train_classes.keys())
 
-    #assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(torch.float32).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -193,17 +187,19 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = int(args.total_timesteps // args.batch_size)
 
-
-    
+    print(num_updates)
+    # writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=torch.device("cpu")):
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
             ### NEED TO SET TRAIN OR TEST TASKS
+            print('Evaluating...')
             agent = agent.to('cpu')
             agent.eval()
             evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
-                                 update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks, device=device)
+                                 update=update, tasks=fk_tasks, device=device)
             agent = agent.to(device)
             agent.train()
+            print('exiting evalution')
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
