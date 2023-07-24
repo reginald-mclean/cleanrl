@@ -23,9 +23,9 @@ import optax  # type: ignore
 import orbax.checkpoint
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
-from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
 
@@ -63,8 +63,8 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=1280,
-        help="the batch size of sample from the reply memory")
+    parser.add_argument("--batch-size", type=int, default=128,
+        help="the batch size of sample from the reply memory for each task")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
         help="how many updates to do before evaluating the agent")
@@ -495,8 +495,6 @@ def update(
     gamma: float,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray]:
-    key, actor_loss_key = jax.random.split(key)
-
     # --- Critic loss ---
     # Sample a'
     next_actions, next_action_log_probs, key = sample_and_log_prob(
@@ -541,6 +539,8 @@ def update(
         )
 
     # --- Actor loss --- & calls for the other losses
+    key, actor_loss_key = jax.random.split(key)
+
     def actor_loss(params: flax.core.FrozenDict) -> jnp.float32:
         action_samples, log_probs, _ = sample_and_log_prob(
             actor, params, batch.observations, batch.task_ids, actor_loss_key
@@ -615,13 +615,12 @@ if __name__ == "__main__":
 
     # agent setup
     envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        "cpu",
-        handle_timeout_termination=False,
-        n_envs=envs.num_envs,
+    rb = MultiTaskReplayBuffer(
+        capacity=args.buffer_size,
+        num_tasks=NUM_TASKS,
+        envs=envs,
+        use_torch=False,
+        seed=args.seed,
     )
 
     global_episodic_return = deque([], maxlen=20 * envs.num_envs)
@@ -676,7 +675,7 @@ if __name__ == "__main__":
 
         # Store scaled actions
         actions = scale_action(envs.single_action_space, actions)
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        rb.add(obs, real_next_obs, actions, rewards, terminations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -700,7 +699,6 @@ if __name__ == "__main__":
                 for epoch_step in range(args.epoch_size):
                     # Sample a batch from replay buffer
                     data = rb.sample(args.batch_size)
-                    data = jax.tree_map(lambda x: x.numpy(), data)
                     observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
                     next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
                     batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
