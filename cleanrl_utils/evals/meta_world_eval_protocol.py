@@ -25,7 +25,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
             print(f"process for {key}")
             env_cls = classes[key]
             env_tasks = [task for task in tasks if task.env_name == key]
-            p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, add_onehot, keys.index(key), num_envs, device, update))
+            p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, add_onehot, keys.index(key), num_envs, torch.device("cpu"), update))
             p.start()
             workers.append(p)
         for process in workers:
@@ -67,8 +67,8 @@ def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_eva
         done = False
         while count < 500 and not done:
             obs = np.concatenate([obs, one_hot])
-            action, _, _, _ = agent.get_action_and_value(
-                torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
             next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).detach().cpu().numpy())
             rewards.append(reward)
             done = truncated or terminated

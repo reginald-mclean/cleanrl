@@ -1,20 +1,20 @@
-import gymnasium as gym
+import gym
 import numpy as np
 from copy import deepcopy
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, Union
 
 from numpy.typing import NDArray
 
-from gymnasium import Env
-from gymnasium.spaces import Space, Box
-from gymnasium.vector.utils import concatenate, create_empty_array, iterate
-from gymnasium.vector.vector_env import VectorEnv
-from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-from gymnasium.wrappers import normalize
+from gym import Env
+from gym.spaces import Space, Box
+from gym.vector.utils import concatenate, create_empty_array, iterate
+from gym.vector.vector_env import VectorEnv
+from gym.wrappers.time_limit import TimeLimit
+from gym.wrappers.record_episode_statistics import RecordEpisodeStatistics
+from gym.wrappers import normalize
 
-class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
+class OneHotV0(gym.Wrapper):
     def __init__(self, env: gym.Env, task_idx: int, num_envs: int):
-        gym.utils.RecordConstructorArgs.__init__(self)
         gym.Wrapper.__init__(self, env)
         #self.env = env
         assert task_idx < num_envs, "The task idx of an env cannot be greater than or equal to the number of envs"
@@ -81,8 +81,10 @@ class SyncVectorEnv(VectorEnv):
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             if use_one_hot_wrapper:
                 env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
-            env = RecordEpisodeStatistics(env)
+            #env = RecordEpisodeStatistics(env)
             #env = normalize.NormalizeObservation(env)
+            env = TimeLimit(env, max_episode_steps=500)
+            env = RecordEpisodeStatistics(env)
             self.envs.append(env)
         self.copy = copy
         self.metadata = self.envs[0].metadata
