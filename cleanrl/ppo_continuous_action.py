@@ -200,8 +200,8 @@ if __name__ == "__main__":
             ### NEED TO SET TRAIN OR TEST TASKS
             agent = agent.to('cpu')
             agent.eval()
-            evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
-                                 update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks, device=device)
+            #evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
+            #                     update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks, device=device)
             agent = agent.to(device)
             agent.train()
         # Annealing the rate if instructed to do so.

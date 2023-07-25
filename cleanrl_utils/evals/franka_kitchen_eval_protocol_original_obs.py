@@ -18,8 +18,10 @@ def evaluation_procedure(writer, agent, tasks, update, num_envs, add_onehot=True
     mean_success_rate = 0.0
     task_results = []
 
+    batch_size = 10 if num_envs >= 10 else num_envs
+    itrs = int(num_envs/batch_size)
     for i, task in enumerate(tasks):
-        print(f"process for {task} {device}")
+        print(f"process for {task}")
         p = mp.Process(target=multiprocess_eval, args=(task, agent, shared_queue, num_evals, add_onehot, i, num_envs, device, update))
         p.start()
         workers.append(p)
@@ -37,7 +39,7 @@ def evaluation_procedure(writer, agent, tasks, update, num_envs, add_onehot=True
 
 def multiprocess_eval(env_tasks, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device=torch.device("cpu"), update=None):
     print(f"Agent Device for {env_tasks} {next(agent.parameters()).device}")
-    env = gym.make('FrankaKitchen-v1', tasks_to_complete=[env_tasks], render_mode='rgb_array')
+    env = gym.make('FrankaKitchen-v1', tasks_to_complete=[env_tasks], render_mode='rgb_array', obs_space='original')
     #if add_onehot:
     #    env = OneHotV0(env, num_envs=num_envs, task_idx=idx)
     rewards = []
@@ -50,9 +52,11 @@ def multiprocess_eval(env_tasks, agent, shared_queue, num_evals, add_onehot, idx
         if x in record_episodes:
             now = datetime.now()
             current_time = now.strftime("%H:%M:%S")
-            if not os.path.isdir(f'/data/recorded_videos/PPO/franka_kitchen_{env_tasks}_{update}_{current_time}'):
-                os.mkdir(f'/data/recorded_videos/PPO/franka_kitchen_{env_tasks}_{update}_{current_time}')
-            env = RecordVideo(env, f'/data/recorded_videos/PPO/franka_kitchen_{env_tasks}_{update}_{current_time}')
+            if not os.path.isdir(f'/data/recorded_videos/PPO/franka_kitchen_original_obs_{env_tasks}_{update}_{current_time}'):
+                os.mkdir(f'/data/recorded_videos/PPO/franka_kitchen_original_obs_{env_tasks}_{update}_{current_time}')
+            env = RecordVideo(env, f'/data/recorded_videos/PPO/franka_kitchen_original_obs_{env_tasks}_{update}_{current_time}')
+            print(current_time)
+            #env.start_video_recorder()
         sys.stdout.flush()
         obs, info = env.reset()
         if x in record_episodes:
@@ -62,7 +66,7 @@ def multiprocess_eval(env_tasks, agent, shared_queue, num_evals, add_onehot, idx
         while count < 500 and not done:
             obs = np.concatenate([obs['observation'], one_hot])
             with torch.no_grad():
-                action, _, _, _ = agent.get_action_and_value(torch.from_numpy(obs).to(torch.float32).to('cuda:0').unsqueeze(0))
+                action, _, _, _ = agent.get_action_and_value(torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
             next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).detach().cpu().numpy(), env_tasks)
             rewards.append(reward)
             done = truncated or terminated
@@ -75,7 +79,7 @@ def multiprocess_eval(env_tasks, agent, shared_queue, num_evals, add_onehot, idx
                 break
         if x in record_episodes:
             env.close()
-            env = gym.make('FrankaKitchen-v1', tasks_to_complete=[env_tasks], render_mode='rgb_array')
+            env = gym.make('FrankaKitchen-v1', tasks_to_complete=[env_tasks], render_mode='rgb_array', obs_space='original')
 
     shared_queue.put({
         'eval_rewards' : rewards,

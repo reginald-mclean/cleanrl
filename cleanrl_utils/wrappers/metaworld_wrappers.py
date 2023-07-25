@@ -206,7 +206,7 @@ class SyncVectorEnv(VectorEnv):
         self.observations = concatenate(
             self.single_observation_space, observations, self.observations
         )
-
+        print(self.observations.shape, len(observations), len(observations[0]))
         return (
             deepcopy(self.observations) if self.copy else self.observations,
             np.copy(self._rewards),

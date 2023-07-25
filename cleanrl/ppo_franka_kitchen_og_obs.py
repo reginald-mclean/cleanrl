@@ -11,8 +11,8 @@ from distutils.util import strtobool
 import sys
 sys.path.append('/data/cleanrl')
 
-from cleanrl_utils.evals.franka_kitchen_eval_protocol import evaluation_procedure
-from cleanrl_utils.wrappers.franka_kitchen_wrappers import OneHotV0, SyncVectorEnv
+from cleanrl_utils.evals.franka_kitchen_eval_protocol_original_obs import evaluation_procedure
+from cleanrl_utils.wrappers.franka_kitchen_wrappers_original_obs import OneHotV0, SyncVectorEnv
 import gymnasium as gym
 import numpy as np
 import torch

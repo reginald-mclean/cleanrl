@@ -31,7 +31,7 @@ class OneHotV0(gym.Wrapper):
         obs, info = super().reset(seed=seed, options=options)
         new_obs = np.concatenate([obs['observation'], self.one_hot])
         obs['observation'] = new_obs
-        return obs, info
+        return new_obs, info
 
 class SyncVectorEnv(VectorEnv):
     """Vectorized environment that serially runs multiple environments.
@@ -76,7 +76,7 @@ class SyncVectorEnv(VectorEnv):
         self.env_names = []
         self.current_tasks = dict()
         for i, env_fn in enumerate(env_fns):
-            env = env_fn('FrankaKitchen-v1', tasks_to_complete=[tasks[i]])
+            env = env_fn('FrankaKitchen-v1', tasks_to_complete=[tasks[i]], obs_space='original')
             self.env_names.append(tasks[i])
             if use_one_hot_wrapper:
                 env = OneHotV0(env, self.env_names.index(tasks[i]), len(tasks))
@@ -86,6 +86,11 @@ class SyncVectorEnv(VectorEnv):
         self.copy = copy
         self.metadata = self.envs[0].metadata
 
+        #temp_e = env_fns[0]('FrankaKitchen-v1', tasks_to_complete=[tasks[0]], obs_space='original')
+        #print(temp_e.reset())
+        #print(observation_space)
+        #print(self.envs[0].observation_space)
+        
         if (observation_space is None) or (action_space is None):
             observation_space = observation_space or self.envs[0].observation_space
             if use_one_hot_wrapper:
@@ -103,6 +108,7 @@ class SyncVectorEnv(VectorEnv):
         self.observations = create_empty_array(
             self.single_observation_space, n=self.num_envs, fn=np.zeros
         )
+        print(self.single_observation_space)
         self._rewards = np.zeros((self.num_envs,), dtype=np.float64)
         self._terminateds = np.zeros((self.num_envs,), dtype=np.bool_)
         self._truncateds = np.zeros((self.num_envs,), dtype=np.bool_)
@@ -155,15 +161,18 @@ class SyncVectorEnv(VectorEnv):
             if options is not None:
                 kwargs["options"] = options
             observation, info = env.reset(**kwargs)
-            observations.append(observation['observation'])
+            #print(observation.shape)
+            observations.append(observation)
             infos = self._add_info(infos, info, i)
 
-        print(self.observations.shape)
-        print(len(observations))
+        #print(self.observations.shape, len(observations), len(observations[0]))
 
         self.observations = concatenate(
             self.single_observation_space, observations, self.observations
         )
+        #print(self.observations.shape, len(observations), len(observations[0]))
+        #print("done")
+        #exit(0)
         return (deepcopy(self.observations) if self.copy else self.observations), infos
 
     def step_async(self, actions):
@@ -192,11 +201,15 @@ class SyncVectorEnv(VectorEnv):
                 info["final_observation"] = old_observation
                 info["final_info"] = old_info
             observations.append(observation)
+            #print(type(observation))
+            #print(f"{env} {observation.shape}")
             infos = self._add_info(infos, info, i)
+        #print(self.observations.shape, len(observations), len(observations[0]))
+        
         self.observations = concatenate(
             self.single_observation_space, observations, self.observations
         )
-
+        #print(self.observations.shape, len(observations), len(observations[0]))
         return (
             deepcopy(self.observations) if self.copy else self.observations,
             np.copy(self._rewards),
