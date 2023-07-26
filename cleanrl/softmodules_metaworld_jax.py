@@ -9,8 +9,8 @@ from functools import partial
 from typing import NamedTuple, Optional, Tuple, Type, Union
 
 os.environ[
-    "XLA_PYTHON_CLIENT_PREALLOCATE"
-] = "false"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+    "XLA_PYTHON_CLIENT_MEM_FRACTION"
+] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 import flax
 import flax.linen as nn
@@ -66,12 +66,10 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=128,
         help="the batch size of sample from the reply memory for each task")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
-    parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
-        help="how many updates to do before evaluating the agent")
-    parser.add_argument("--evaluation-num-workers", type=int, default=10,
-        help="the number of evaluation workers")
-    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
-        help="the number episodes per evaluation")
+    parser.add_argument("--evaluation-frequency", type=int, default=250_000,
+        help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=10,
+        help="the number episodes to run per evaluation")
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
@@ -139,10 +137,13 @@ def unscale_action(action_space: gym.spaces.Box, scaled_action: np.ndarray) -> n
 # NOTE the paper is missing quite a lot of details that are in the official code
 #
 # 1) there is an extra embedding layer for the task embedding after z and f have been combined
+#    that downsizes the embedding from D to 256 (in both the deep and shallow versions of the network)
 # 2) the obs embedding is activated before it's passed into the layers
 # 3) p_l+1 is not dependent on just p_l but on all p_<l with skip connections
 # 4) ReLU is applied after the weighted sum in forward computation, not before as in Eq. 8 in the paper
 # 5) there is an extra p_L+1 that is applied as a dot product over the final module outputs
+# 6) the task weights take the softmax over log alpha, not actual alpha.
+#    And they're also multiplied by the number of tasks
 #
 # These are marked with "NOTE <number>"
 
@@ -199,7 +200,7 @@ class RoutingNetworkLayer(nn.Module):
             task_embedding *= self.prob_embedding_fc(prev_probs)
         x = self.prob_output_fc(nn.relu(task_embedding))
         if not self.last:  # NOTE 5
-            x = x.reshape((-1, self.num_modules, self.num_modules))
+            x = x.reshape(-1, self.num_modules, self.num_modules)
         x = nn.softmax(x, axis=-1)  # Eq. 7
         return x
 
@@ -225,9 +226,9 @@ class SoftModularizationNetwork(nn.Module):
 
         # Routing network layers
         self.z = MLPTorso(num_hidden_layers=0, output_dim=self.embedding_dim)
-        self.task_embedding_fc = MLPTorso(num_hidden_layers=1, hidden_dim=256, output_dim=self.embedding_dim)  # NOTE 1
+        self.task_embedding_fc = MLPTorso(num_hidden_layers=1, hidden_dim=256, output_dim=256)  # NOTE 1
         self.prob_fcs = [
-            RoutingNetworkLayer(self.embedding_dim, self.num_modules, last=i == self.num_layers - 1)
+            RoutingNetworkLayer(embedding_dim=256, num_modules=self.num_modules, last=i == self.num_layers - 1)
             for i in range(self.num_layers)  # NOTE 5
         ]
 
@@ -247,11 +248,12 @@ class SoftModularizationNetwork(nn.Module):
 
         for i in range(self.num_layers - 1):  # Equation 8, holds for all layers except L
             probs = self.prob_fcs[i](task_embedding, prev_probs)
-            module_outs = nn.relu(jnp.squeeze(probs @ self.layers[i](module_ins)))  # NOTE 4
+            module_outs = nn.relu(probs @ self.layers[i](module_ins))  # NOTE 4
 
             # Post processing
+            probs = probs.reshape(-1, self.num_modules * self.num_modules)
             if self.routing_skip_connections:  # NOTE 3
-                weights.append(probs.reshape(-1, self.num_modules * self.num_modules))
+                weights.append(probs)
                 prev_probs = jnp.concatenate(weights, axis=-1)
             else:
                 prev_probs = probs
@@ -454,7 +456,8 @@ class Agent:  # MT SAC Agent
 
     def get_action(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
-        actions, key = jax.device_get(sample_action(self.actor, s_t, z_Tau, key))
+        actions, key = sample_action(self.actor, s_t, z_Tau, key)
+        actions = jax.device_get(actions)
         actions = unscale_action(self._action_space, actions)
         return actions, key
 
@@ -478,10 +481,11 @@ class Agent:  # MT SAC Agent
         }
 
 
-@jax.jit
-def extract_task_weights(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:  # NOTE specific to Soft Modules
-    task_weights = jax.nn.softmax(-log_alpha)  # NOTE Soft Modules official code uses log_alpha here
+@jax.jit  # NOTE specific to Soft Modules
+def extract_task_weights(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
+    task_weights = jax.nn.softmax(-log_alpha)  # NOTE 6
     task_weights = task_ids @ task_weights.reshape(-1, 1)
+    task_weights *= log_alpha.shape[0]  # NOTE 6
     return task_weights
 
 
@@ -630,18 +634,18 @@ if __name__ == "__main__":
 
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
-        obs,
-        NUM_TASKS,
-        args.embedding_dim,
-        args.module_dim,
-        args.num_layers,
-        args.num_modules,
-        envs.single_action_space,
-        args.policy_lr,
-        args.q_lr,
-        args.gamma,
-        args.clip_grad_norm,
-        key,
+        init_obs=obs,
+        num_tasks=NUM_TASKS,
+        embedding_dim=args.embedding_dim,
+        module_dim=args.module_dim,
+        num_layers=args.num_layers,
+        num_modules=args.num_modules,
+        action_space=envs.single_action_space,
+        policy_lr=args.policy_lr,
+        q_lr=args.q_lr,
+        gamma=args.gamma,
+        clip_grad_norm=args.clip_grad_norm,
+        init_key=key,
     )
 
     start_time = time.time()
@@ -665,7 +669,6 @@ if __name__ == "__main__":
                     continue
                 global_episodic_return.append(info["episode"]["r"])
                 global_episodic_length.append(info["episode"]["l"])
-                break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -697,6 +700,8 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             if global_step % args.epoch_size == 0:  # torchrl-style training loop
                 for epoch_step in range(args.epoch_size):
+                    current_step = global_step + epoch_step
+
                     # Sample a batch from replay buffer
                     data = rb.sample(args.batch_size)
                     observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
@@ -704,6 +709,7 @@ if __name__ == "__main__":
                     batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
                     logs = {}
 
+                    # Update agent
                     (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
                         agent.actor,
                         agent.critic,
@@ -715,11 +721,11 @@ if __name__ == "__main__":
                     )
 
                     # update the target networks
-                    if (global_step + epoch_step) % args.target_network_frequency == 0:
+                    if current_step % args.target_network_frequency == 0:
                         agent.soft_update_target_networks(args.tau)
 
                     # Logging
-                    if (global_step + epoch_step) % 100 == 0:
+                    if current_step % 100 == 0:
                         logs = jax.device_get(logs)
                         for _key, value in logs.items():
                             writer.add_scalar(_key, value, global_step)
@@ -727,23 +733,23 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                     # Evaluation
-                    if (global_step + epoch_step) % args.evaluation_frequency == 0:
-                        print("Evaluating...")
-                        eval_success_rate = evaluation_procedure(
-                            num_envs=envs.num_envs,
-                            num_workers=args.evaluation_num_workers,
-                            num_episodes=args.evaluation_num_episodes,
-                            writer=writer,
-                            agent=agent,
-                            update=global_step,
-                            keys=list(benchmark.train_classes.keys()),
-                            classes=benchmark.train_classes,
-                            tasks=benchmark.train_tasks,
+                    if (current_step + 1) % args.evaluation_frequency == 0:
+                        eval_envs = make_envs(
+                            benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
                         )
-                        print(f"Evaluation success_rate: {eval_success_rate:.4f}")
+                        print("evaluating...")
+                        eval_success_rate, eval_returns, key = evaluation_procedure(
+                            agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
+                        )
+                        writer.add_scalar("charts/mean_success_rate", eval_success_rate, global_step)
+                        writer.add_scalar("charts/mean_evaluation_return", eval_returns, global_step)
+                        print(
+                            f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                            + f" return: {eval_returns:.4f}"
+                        )
 
                     # Checkpointing
-                    if args.save_model and (global_step + epoch_step) % args.save_model_frequency == 0:
+                    if args.save_model and current_step % args.save_model_frequency == 0:
                         ckpt = agent.get_ckpt()
                         ckpt["rng_key"] = key
                         ckpt["global_step"] = global_step
