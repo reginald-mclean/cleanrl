@@ -39,11 +39,14 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     """A Gymnasium Wrapper to automatically set / reset the environment to a random
     task."""
 
+    tasks: List[object]
+    current_task: object
+
     def _set_random_task(self):
         self.current_task = self.np_random.choice(len(self.tasks))
         self.env.set_task(self.tasks[self.current_task])
 
-    def __init__(self, env: Env, tasks: List[str]):
+    def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
         self.tasks = tasks
         self._set_random_task()
@@ -51,6 +54,12 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if terminated or truncated:
+            self._set_random_task()
+        return obs, reward, terminated, truncated, info
 
 
 # ---- Kept for compatibility ----
