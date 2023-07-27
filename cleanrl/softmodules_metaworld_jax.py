@@ -27,7 +27,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -66,9 +66,9 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=128,
         help="the batch size of sample from the reply memory for each task")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
-    parser.add_argument("--evaluation-frequency", type=int, default=250_000,
+    parser.add_argument("--evaluation-frequency", type=int, default=150_000,
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
-    parser.add_argument("--evaluation-num-episodes", type=int, default=10,
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
@@ -100,8 +100,9 @@ def make_envs(
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
-            env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
-        env = RandomTaskSelectWrapper(env, [task for task in benchmark.train_tasks if task.env_name == name])
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
 
