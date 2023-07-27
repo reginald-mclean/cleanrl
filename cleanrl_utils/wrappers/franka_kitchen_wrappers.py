@@ -30,8 +30,8 @@ class OneHotV0(gym.Wrapper):
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
         new_obs = np.concatenate([obs['observation'], self.one_hot])
-        obs['observation'] = new_obs
-        return obs, info
+        #obs['observation'] = new_obs
+        return new_obs, info
 
 class SyncVectorEnv(VectorEnv):
     """Vectorized environment that serially runs multiple environments.
@@ -155,12 +155,12 @@ class SyncVectorEnv(VectorEnv):
             if options is not None:
                 kwargs["options"] = options
             observation, info = env.reset(**kwargs)
-            observations.append(observation['observation'])
+            observations.append(observation)
             infos = self._add_info(infos, info, i)
 
-        print(self.observations.shape)
-        print(len(observations))
-
+        #print(self.observations.shape)
+        #print(len(observations))
+        #print(len(observations[0]))
         self.observations = concatenate(
             self.single_observation_space, observations, self.observations
         )
@@ -193,6 +193,8 @@ class SyncVectorEnv(VectorEnv):
                 info["final_info"] = old_info
             observations.append(observation)
             infos = self._add_info(infos, info, i)
+            #print(self.env_names[i])
+        #print(self.single_observation_space, len(observations), len(observations[0]), self.observations.shape)
         self.observations = concatenate(
             self.single_observation_space, observations, self.observations
         )
