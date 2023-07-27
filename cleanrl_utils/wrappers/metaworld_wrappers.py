@@ -49,17 +49,36 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
         self.tasks = tasks
-        self._set_random_task()
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        if terminated or truncated:
-            self._set_random_task()
-        return obs, reward, terminated, truncated, info
+
+class PseudoRandomTaskSelectWrapper(gym.Wrapper):
+    """A Gymnasium Wrapper to automatically reset the environment to a *pseudo*random task when explicitly called.
+
+    Pseudorandom implies no collisions therefore the next task in the list will be used cyclically.
+
+    Note that the task initialization is not every environment reset, but only when sample_tasks() is explicitly called.
+
+    For use in MetaRL algorithms with the Metaworld ML benchmark classes.
+    """
+
+    tasks: List[object]
+    current_task: object
+
+    def _set_pseudo_random_task(self):
+        self.current_task = (self.current_task + 1) % len(self.tasks)
+        self.env.set_task(self.tasks[self.current_task])
+
+    def __init__(self, env: Env, tasks: List[object]):
+        super().__init__(env)
+        self.tasks = tasks
+
+    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        self._set_pseudo_random_task()
+        return self.env.reset(seed=seed, options=options)
 
 
 # ---- Kept for compatibility ----
