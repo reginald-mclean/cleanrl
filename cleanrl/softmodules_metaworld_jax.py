@@ -6,7 +6,7 @@ import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import NamedTuple, Optional, Tuple, Type, Union
+from typing import Deque, NamedTuple, Optional, Tuple, Type, Union
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -17,12 +17,14 @@ import flax.linen as nn
 import gymnasium as gym  # type: ignore
 import jax
 import jax.numpy as jnp
-import metaworld
+import metaworld  # type: ignore
 import numpy as np
 import optax  # type: ignore
-import orbax.checkpoint
+import orbax.checkpoint  # type: ignore
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
+from jax.typing import ArrayLike
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
@@ -94,8 +96,8 @@ def parse_args():
 
 def make_envs(
     benchmark: metaworld.Benchmark, seed: int, max_episode_steps: Optional[int] = None, use_one_hot: bool = True
-) -> gym.Env:
-    def init_each_env(env_cls: Type[gym.Env], name: str, env_id: int) -> gym.Env:
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -115,22 +117,8 @@ def make_envs(
 
 
 # Utils
-JaxOrNPArray: Type = Union[jnp.ndarray, np.ndarray]
-
-
-def split_obs_task_id(obs: JaxOrNPArray, num_tasks: int) -> Tuple[JaxOrNPArray, JaxOrNPArray]:
+def split_obs_task_id(obs: Union[jax.Array, np.ndarray], num_tasks: int) -> Tuple[ArrayLike, ArrayLike]:
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
-
-
-def scale_action(action_space: gym.spaces.Box, action: np.ndarray) -> np.ndarray:
-    low, high = action_space.low, action_space.high
-    return 2.0 * ((action - low) / (high - low)) - 1.0
-
-
-def unscale_action(action_space: gym.spaces.Box, scaled_action: np.ndarray) -> np.ndarray:
-    low, high = action_space.low, action_space.high
-    scaled_action = np.clip(scaled_action, -1, 1)
-    return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 
 # Networks
@@ -164,6 +152,8 @@ class MLPTorso(nn.Module):
             x = nn.Dense(self.hidden_dim, name=f"layer_{i}")(x)  # type: ignore
             x = nn.relu(x)
         x = nn.Dense(self.output_dim, name=f"layer_{self.num_hidden_layers}")(x)  # type: ignore
+        if self.activate_last:
+            x = nn.relu(x)
         return x
 
 
@@ -269,12 +259,12 @@ class SoftModularizationNetwork(nn.Module):
 
 # RL Algorithm: MT-SAC
 class Batch(NamedTuple):
-    observations: jax.Array
-    actions: jax.Array
-    rewards: jax.Array
-    next_observations: jax.Array
-    dones: jax.Array
-    task_ids: jax.Array
+    observations: ArrayLike
+    actions: ArrayLike
+    rewards: ArrayLike
+    next_observations: ArrayLike
+    dones: ArrayLike
+    task_ids: ArrayLike
 
 
 class Actor(nn.Module):  # Policy network
@@ -307,8 +297,8 @@ class Actor(nn.Module):  # Policy network
 @jax.jit
 def sample_action(
     actor: TrainState,
-    obs: JaxOrNPArray,
-    task_ids: JaxOrNPArray,
+    obs: ArrayLike,
+    task_ids: ArrayLike,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
@@ -323,8 +313,8 @@ def sample_action(
 def sample_and_log_prob(
     actor: TrainState,
     actor_params: flax.core.FrozenDict,  # For actor loss
-    obs: JaxOrNPArray,
-    task_ids: JaxOrNPArray,
+    obs: ArrayLike,
+    task_ids: ArrayLike,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
@@ -385,7 +375,7 @@ class VectorCritic(nn.Module):
 
 
 class CriticTrainState(TrainState):
-    target_params: flax.core.FrozenDict
+    target_params: Optional[flax.core.FrozenDict] = None
 
 
 @jax.jit
@@ -394,6 +384,11 @@ def get_alpha(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
 
 
 class Agent:  # MT SAC Agent
+    actor: TrainState
+    critic: CriticTrainState
+    alpha_train_state: TrainState
+    target_entropy: float
+
     def __init__(
         self,
         init_obs: jax.Array,
@@ -431,7 +426,7 @@ class Agent:  # MT SAC Agent
                 )
             return optim
 
-        actor_network = Actor(num_actions=np.prod(self._action_space.shape), **network_args)
+        actor_network = Actor(num_actions=int(np.prod(self._action_space.shape)), **network_args)
         key, actor_init_key = jax.random.split(init_key)
         self.actor = TrainState.create(
             apply_fn=actor_network.apply,
@@ -459,7 +454,6 @@ class Agent:  # MT SAC Agent
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, s_t, z_Tau, key)
         actions = jax.device_get(actions)
-        actions = unscale_action(self._action_space, actions)
         return actions, key
 
     @staticmethod
@@ -508,7 +502,7 @@ def update(
     # Compute target Q values
     q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
 
-    def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array, task_weights: jax.Array) -> jnp.float32:
+    def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array, task_weights: jax.Array):
         # next_action_log_probs is (B,) shaped because of the sum(axis=1), while Q values are (B, 1)
         min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
         next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
@@ -527,7 +521,7 @@ def update(
         return _critic, {"losses/qf_values": qf_values, "losses/qf_loss": critic_loss_value}
 
     # --- Alpha loss ---
-    def alpha_loss(params: jax.Array, log_probs: jax.Array) -> jnp.float32:
+    def alpha_loss(params: jax.Array, log_probs: jax.Array):
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
         return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
@@ -536,17 +530,18 @@ def update(
         _alpha = _alpha.apply_gradients(grads=alpha_grads)
         alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
         task_weights = extract_task_weights(_alpha.params, batch.task_ids)
+
         return (
             _alpha,
             alpha_vals,
             task_weights,
-            {"losses/alpha_loss": alpha_loss_value, "alpha": jnp.exp(_alpha.params).sum()},
+            {"losses/alpha_loss": alpha_loss_value, "alpha": jnp.exp(_alpha.params).sum()},  # type: ignore
         )
 
     # --- Actor loss --- & calls for the other losses
     key, actor_loss_key = jax.random.split(key)
 
-    def actor_loss(params: flax.core.FrozenDict) -> jnp.float32:
+    def actor_loss(params: flax.core.FrozenDict):
         action_samples, log_probs, _ = sample_and_log_prob(
             actor, params, batch.observations, batch.task_ids, actor_loss_key
         )
@@ -619,7 +614,6 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # agent setup
-    envs.single_observation_space.dtype = np.float32
     rb = MultiTaskReplayBuffer(
         capacity=args.buffer_size,
         num_tasks=NUM_TASKS,
@@ -628,8 +622,8 @@ if __name__ == "__main__":
         seed=args.seed,
     )
 
-    global_episodic_return = deque([], maxlen=20 * envs.num_envs)
-    global_episodic_length = deque([], maxlen=20 * envs.num_envs)
+    global_episodic_return: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
+    global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
 
     obs, _ = envs.reset()
 
@@ -655,7 +649,7 @@ if __name__ == "__main__":
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
         else:
             actions, key = agent.get_action(obs, key)
 
@@ -678,22 +672,21 @@ if __name__ == "__main__":
                 real_next_obs[idx] = infos["final_observation"][idx]
 
         # Store scaled actions
-        actions = scale_action(envs.single_action_space, actions)
         rb.add(obs, real_next_obs, actions, rewards, terminations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}")
+            print(f"global_step={global_step}, mean_episodic_return={np.mean(list(global_episodic_return))}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
-                np.mean(global_episodic_return),
+                np.mean(list(global_episodic_return)),
                 global_step,
             )
             writer.add_scalar(
                 "charts/mean_episodic_length",
-                np.mean(global_episodic_length),
+                np.mean(list(global_episodic_length)),
                 global_step,
             )
 

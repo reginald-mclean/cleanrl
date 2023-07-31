@@ -9,7 +9,7 @@ import numpy as np
 
 def evaluation_procedure(
     agent,
-    eval_envs: gym.vector.AsyncVectorEnv,
+    eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     key: jax.random.PRNGKey,
 ) -> Tuple[float, List[List[float]], jax.random.PRNGKey]:
