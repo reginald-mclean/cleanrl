@@ -18,11 +18,10 @@ from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
-from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
-from cleanrl_utils.wrappers.metaworld_wrappers import (
-    OneHotWrapper,
-    RandomTaskSelectWrapper,
-)
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
+
+from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedure
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 def parse_args():
@@ -38,26 +37,25 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="test",
+    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default="meta-world-benchmark",
+    parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=10_000_000, help="total timesteps of the experiments")
+    parser.add_argument("--total-timesteps", type=int, default=15_000_000, help="total timesteps of the experiments")
     parser.add_argument("--max-episode-steps", type=int, default=200, help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--evaluation-frequency", type=int, default=250_000, help="how many updates to before evaluating the agent")
-
-    parser.add_argument("--utd-ratio", type=int, default=20, help="update-to-data ratio")
+    parser.add_argument("--evaluation-frequency", type=int, default=150_000, help="how many updates to before evaluating the agent")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50, help="the number episodes to run per evaluation")
 
     parser.add_argument("--buffer-size", type=int, default=int(1e6), help="the replay memory buffer size for a single task")
     parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=128, help="the batch size of sample from the replay memory for a single task")
-    parser.add_argument("--learning-starts", type=int, default=5e3, help="timestep to start learning")
+    parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
 
     parser.add_argument("--policy-lr", type=float, default=3e-4, help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
@@ -184,16 +182,17 @@ def make_envs(
     seed: int,
     max_episode_steps: Optional[int] = None,
     use_one_hot: bool = True,
-) -> gym.Env:
-    def init_each_env(env_cls: Type[gym.Env], name: str, env_id: int) -> gym.Env:
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
-            env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
-        env = RandomTaskSelectWrapper(
-            env, [task for task in benchmark.train_tasks if task.env_name == name]
-        )
+            env = metaworld_wrappers.OneHotWrapper(
+                env, env_id, len(benchmark.train_classes)
+            )
+        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
 
@@ -286,9 +285,8 @@ if __name__ == "__main__":
         envs=envs,
         use_torch=True,
         seed=args.seed,
-        device=device
+        device=device,
     )
-
 
     start_time = time.time()
 
@@ -297,12 +295,11 @@ if __name__ == "__main__":
 
     obs, info = envs.reset()
 
-    total_steps_reached = False
     global_step = 0
     env_steps = 0
     grad_steps = 0
 
-    while not total_steps_reached:
+    for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
@@ -324,7 +321,6 @@ if __name__ == "__main__":
                     continue
                 global_episodic_return.append(info["episode"]["r"])
                 global_episodic_length.append(info["episode"]["l"])
-                break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
@@ -352,85 +348,84 @@ if __name__ == "__main__":
             )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts and global_step % args.utd_ratio == 0:
-            for _ in range(args.utd_ratio):
-                data = rb.sample(args.batch_size)
-                with torch.no_grad():
-                    next_state_actions, next_state_log_pi, _ = actor.get_action(
-                        data.next_observations
-                    )
-                    qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                    qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                    min_qf_next_target = (
-                        torch.min(qf1_next_target, qf2_next_target)
-                        - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
-                        * next_state_log_pi
-                    )
-                    next_q_value = data.rewards.flatten() + (
-                        1 - data.dones.flatten()
-                    ) * args.gamma * (min_qf_next_target).view(-1)
+        if global_step > args.learning_starts:
+            data = rb.sample(args.batch_size)
+            with torch.no_grad():
+                next_state_actions, next_state_log_pi, _ = actor.get_action(
+                    data.next_observations
+                )
+                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                min_qf_next_target = (
+                    torch.min(qf1_next_target, qf2_next_target)
+                    - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
+                    * next_state_log_pi
+                )
+                next_q_value = data.rewards.flatten() + (
+                    1 - data.dones.flatten()
+                ) * args.gamma * (min_qf_next_target).view(-1)
 
-                qf1_a_values = qf1(
-                    data.observations, data.actions.type(torch.float32)
-                ).view(-1)
-                qf2_a_values = qf2(
-                    data.observations, data.actions.type(torch.float32)
-                ).view(-1)
-                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-                qf_loss = qf1_loss + qf2_loss
+            qf1_a_values = qf1(
+                data.observations, data.actions.type(torch.float32)
+            ).view(-1)
+            qf2_a_values = qf2(
+                data.observations, data.actions.type(torch.float32)
+            ).view(-1)
+            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
 
-                q_optimizer.zero_grad()
-                qf_loss.backward()
-                q_optimizer.step()
+            q_optimizer.zero_grad()
+            qf_loss.backward()
+            q_optimizer.step()
 
-                # TD 3 Delayed update support
-                if grad_steps % args.policy_frequency == 0:
-                    for _ in range(
-                        args.policy_frequency
-                    ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                        pi, log_pi, _ = actor.get_action(data.observations)
-                        qf1_pi = qf1(data.observations, pi)
-                        qf2_pi = qf2(data.observations, pi)
-                        min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                        actor_loss = (
-                            (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
-                            - min_qf_pi
+            # TD 3 Delayed update support
+            if grad_steps % args.policy_frequency == 0:
+                for _ in range(
+                    args.policy_frequency
+                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                    pi, log_pi, _ = actor.get_action(data.observations)
+                    qf1_pi = qf1(data.observations, pi)
+                    qf2_pi = qf2(data.observations, pi)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
+                    actor_loss = (
+                        (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
+                        - min_qf_pi
+                    ).mean()
+
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    actor_optimizer.step()
+
+                    if args.autotune:
+                        with torch.no_grad():
+                            _, log_pi, _ = actor.get_action(data.observations)
+                        alpha_loss = (
+                            -get_log_alpha(log_alpha, NUM_TASKS, data)
+                            * (log_pi + target_entropy)
                         ).mean()
 
-                        actor_optimizer.zero_grad()
-                        actor_loss.backward()
-                        actor_optimizer.step()
+                        a_optimizer.zero_grad()
+                        alpha_loss.backward()
+                        a_optimizer.step()
+                        alpha = log_alpha.sum().exp().item()
 
-                        if args.autotune:
-                            with torch.no_grad():
-                                _, log_pi, _ = actor.get_action(data.observations)
-                            alpha_loss = (
-                                -get_log_alpha(log_alpha, NUM_TASKS, data)
-                                * (log_pi + target_entropy)
-                            ).mean()
+            # update the target networks
+            if grad_steps % args.target_network_frequency == 0:
+                for param, target_param in zip(
+                    qf1.parameters(), qf1_target.parameters()
+                ):
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
+                for param, target_param in zip(
+                    qf2.parameters(), qf2_target.parameters()
+                ):
+                    target_param.data.copy_(
+                        args.tau * param.data + (1 - args.tau) * target_param.data
+                    )
 
-                            a_optimizer.zero_grad()
-                            alpha_loss.backward()
-                            a_optimizer.step()
-                            alpha = log_alpha.sum().exp().item()
-
-                # update the target networks
-                if grad_steps % args.target_network_frequency == 0:
-                    for param, target_param in zip(
-                        qf1.parameters(), qf1_target.parameters()
-                    ):
-                        target_param.data.copy_(
-                            args.tau * param.data + (1 - args.tau) * target_param.data
-                        )
-                    for param, target_param in zip(
-                        qf2.parameters(), qf2_target.parameters()
-                    ):
-                        target_param.data.copy_(
-                            args.tau * param.data + (1 - args.tau) * target_param.data
-                        )
-
-                grad_steps += 1
+            grad_steps += 1
 
             if global_step % 100 == 0:
                 writer.add_scalar(
@@ -474,22 +469,25 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
-            eval_device = torch.device("cpu")
-            eval_agent = Actor(envs, NUM_TASKS).to(eval_device)
-            eval_success_rate = evaluation_procedure(
-                writer=writer,
-                agent=eval_agent,
-                classes=benchmark.train_classes,
-                tasks=benchmark.train_tasks,
-                keys=list(benchmark.train_classes.keys()),
-                update=global_step,
-                num_envs=envs.num_envs,
-                device=eval_device,
+            eval_envs = make_envs(
+                benchmark,
+                args.seed,
+                args.max_episode_steps,
+                use_one_hot=use_one_hot_wrapper,
             )
-            print(f"Evaluation success_rate: {eval_success_rate:.4f}")
-
-        global_step += 1
-        total_steps_reached = global_step >= args.total_timesteps
+            eval_success_rate, eval_returns = new_evaluation_procedure(
+                actor, eval_envs, args.evaluation_num_episodes, device
+            )
+            writer.add_scalar(
+                "charts/mean_success_rate", eval_success_rate, global_step
+            )
+            writer.add_scalar(
+                "charts/mean_evaluation_return", eval_returns, global_step
+            )
+            print(
+                f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                + f" return: {eval_returns:.4f}"
+            )
 
     envs.close()
     writer.close()

@@ -2,8 +2,40 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+import time
 
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
+
+def new_evaluation_procedure(
+    agent,
+    eval_envs: gym.vector.VectorEnv,
+    num_episodes: int,
+    device = torch.device("cpu")
+):
+    obs, _ = eval_envs.reset()
+    successes = np.zeros(eval_envs.num_envs)
+    episodic_returns = [[] for _ in range(eval_envs.num_envs)]
+
+    start_time = time.time()
+
+    while not all(len(returns) >= num_episodes for returns in episodic_returns):
+        actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
+        obs, _, _, _, infos = eval_envs.step(actions.detach().cpu().numpy())
+        if "final_info" in infos:
+            for i, info in enumerate(infos["final_info"]):
+                # Skip the envs that are not done
+                if info is None:
+                    continue
+                episodic_returns[i].append(info["episode"]["r"])
+                # Discard any extra episodes from envs that ran ahead
+                if len(episodic_returns[i]) <= num_episodes:
+                    successes[i] += int(info["success"])
+
+    episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
+
+    print(f"Evaluation time: {time.time() - start_time:.2f}s")
+
+    return (successes / num_episodes).mean(), np.mean(episodic_returns)
 
 
 def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, add_onehot=True, device=None):
