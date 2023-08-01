@@ -8,9 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Type, Union
 
-os.environ[
-    "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import flax
 import flax.linen as nn
@@ -100,6 +98,29 @@ def make_envs(
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if use_one_hot:
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env.action_space.seed(seed)
+        return env
+
+    return gym.vector.AsyncVectorEnv(
+        [
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+
+
+def make_eval_envs(
+    benchmark: metaworld.Benchmark, seed: int, max_episode_steps: Optional[int] = None, use_one_hot: bool = True
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+        env = env_cls()
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -728,7 +749,7 @@ if __name__ == "__main__":
 
                     # Evaluation
                     if (current_step + 1) % args.evaluation_frequency == 0:
-                        eval_envs = make_envs(
+                        eval_envs = make_eval_envs(
                             benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
                         )
                         print("evaluating...")

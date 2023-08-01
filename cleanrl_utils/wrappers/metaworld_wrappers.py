@@ -81,6 +81,24 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
         return self.env.reset(seed=seed, options=options)
 
 
+class AutoTerminateOnSuccessWrapper(gym.Wrapper):
+    """A Gymnasium Wrapper to automatically output a termination signal when the environment's task is solved.
+    That is, when the 'success' key in the info dict is True.
+
+    This is not the case by default in SawyerXYZEnv, because terminating on success during training leads to
+    instability and poor evaluation performance. However, this behaviour is desired during said evaluation.
+    Hence the existence of this wrapper.
+
+    Best used *under* an AutoResetWrapper and RecordEpisodeStatistics and the like."""
+
+    def __init__(self, env: Env):
+        super().__init__(env)
+
+    def step(self, action):
+        obs, reward, _, truncated, info = self.env.step(action)
+        return obs, reward, info["success"] == 1.0, truncated, info
+
+
 # ---- Kept for compatibility ----
 class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: gym.Env, task_idx: int, num_envs: int):
