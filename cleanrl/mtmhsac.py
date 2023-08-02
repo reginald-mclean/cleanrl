@@ -22,6 +22,7 @@ from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
 
 from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedure
 from cleanrl_utils.wrappers import metaworld_wrappers
+from cleanrl.softmodules_metaworld_jax import make_eval_envs
 
 
 def parse_args():
@@ -469,7 +470,7 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
-            eval_envs = make_envs(
+            eval_envs = make_eval_envs(
                 benchmark,
                 args.seed,
                 args.max_episode_steps,
