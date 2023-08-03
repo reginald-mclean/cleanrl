@@ -57,11 +57,10 @@ def parse_args():
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=1280, help="the batch size of sample from the replay memory for a single task")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
-    parser.add_argument("--gradient-steps", type=int, default=150)
+    parser.add_argument("--gradient-steps", type=int, default=5)
 
     parser.add_argument("--policy-lr", type=float, default=3e-4, help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
-    parser.add_argument("--policy-frequency", type=int, default=2, help="the frequency of training policy (delayed)")
     parser.add_argument("--target-network-frequency", type=int, default=1, help="the frequency of updates for the target nerworks")
     parser.add_argument("--noise-clip", type=float, default=0.5, help="noise clip parameter of the Target Policy Smoothing Regularization")
 
@@ -382,36 +381,31 @@ if __name__ == "__main__":
                 qf_loss.backward()
                 q_optimizer.step()
 
-                # TD 3 Delayed update support
-                if grad_steps % args.policy_frequency == 0:
-                    for _ in range(
-                        args.policy_frequency
-                    ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                        pi, log_pi, _ = actor.get_action(data.observations)
-                        qf1_pi = qf1(data.observations, pi)
-                        qf2_pi = qf2(data.observations, pi)
-                        min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                        actor_loss = (
-                            (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
-                            - min_qf_pi
-                        ).mean()
+                pi, log_pi, _ = actor.get_action(data.observations)
+                qf1_pi = qf1(data.observations, pi)
+                qf2_pi = qf2(data.observations, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
+                actor_loss = (
+                    (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
+                    - min_qf_pi
+                ).mean()
 
-                        actor_optimizer.zero_grad()
-                        actor_loss.backward()
-                        actor_optimizer.step()
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
 
-                        if args.autotune:
-                            with torch.no_grad():
-                                _, log_pi, _ = actor.get_action(data.observations)
-                            alpha_loss = (
-                                -get_log_alpha(log_alpha, NUM_TASKS, data)
-                                * (log_pi + target_entropy)
-                            ).mean()
+                if args.autotune:
+                    with torch.no_grad():
+                        _, log_pi, _ = actor.get_action(data.observations)
+                    alpha_loss = (
+                        -get_log_alpha(log_alpha, NUM_TASKS, data)
+                        * (log_pi + target_entropy)
+                    ).mean()
 
-                            a_optimizer.zero_grad()
-                            alpha_loss.backward()
-                            a_optimizer.step()
-                            alpha = log_alpha.sum().exp().item()
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.sum().exp().item()
 
                 # update the target networks
                 if grad_steps % args.target_network_frequency == 0:
