@@ -41,11 +41,9 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     task."""
 
     tasks: List[object]
-    current_task: object
 
     def _set_random_task(self):
-        self.current_task = self.np_random.choice(len(self.tasks))
-        self.unwrapped.set_task(self.tasks[self.current_task])
+        self.unwrapped.set_task(self.tasks[self.np_random.choice(len(self.tasks))])
 
     def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
@@ -67,15 +65,16 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
     """
 
     tasks: List[object]
-    current_task: object
+    current_task_idx: int
 
     def _set_pseudo_random_task(self):
-        self.current_task = (self.current_task + 1) % len(self.tasks)
-        self.unwrapped.set_task(self.tasks[self.current_task])
+        self.current_task_idx = (self.current_task_idx + 1) % len(self.tasks)
+        self.unwrapped.set_task(self.tasks[self.current_task_idx])
 
     def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
         self.tasks = tasks
+        self.current_task_idx = -1
 
     def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_pseudo_random_task()

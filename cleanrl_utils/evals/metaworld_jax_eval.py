@@ -6,6 +6,8 @@ import gymnasium as gym
 import jax
 import numpy as np
 
+from cleanrl_utils.buffers_metaworld import MetaLearningReplayBuffer
+
 
 def evaluation_procedure(
     agent,
@@ -37,3 +39,57 @@ def evaluation_procedure(
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
 
     return (successes / num_episodes).mean(), np.mean(episodic_returns), key
+
+
+def metalearning_evaluation(
+    agent,
+    train_envs: gym.vector.VectorEnv,
+    eval_envs: gym.vector.VectorEnv,
+    adaptation_steps: int,
+    adaptation_episodes: int,
+    eval_episodes: int,
+    buffer_kwargs: dict,
+    key: jax.random.PRNGKey,
+):
+    agent.reset_inner()
+
+    # Adaptation
+    obs, _ = zip(*train_envs.call("sample_tasks"))
+    obs = np.stack(obs)
+    eval_buffer = MetaLearningReplayBuffer(train_envs.num_envs, adaptation_episodes, 500)
+
+    for _ in range(adaptation_steps):
+        while not eval_buffer.ready():
+            action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
+            next_obs, reward, terminated, _, _ = train_envs.step(action)
+            eval_buffer.push(obs, action, reward, terminated, log_probs, means, stds)
+            obs = next_obs
+
+        trajectories = eval_buffer.get(**buffer_kwargs)
+        agent.adapt(trajectories)
+
+    # Evaluation
+    obs, _ = eval_envs.reset()
+    eval_buffer = MetaLearningReplayBuffer(eval_envs.num_envs, eval_episodes, 500)
+
+    task_eps = np.zeros(eval_envs.num_envs)
+    successes = np.zeros(eval_envs.num_envs)
+    while not eval_buffer.ready():
+        action, key = agent.get_actions_eval(obs, key)
+        next_obs, reward, done, infos = eval_envs.step(action)
+
+        if "final_info" in infos:
+            for i, info in enumerate(infos["final_info"]):
+                # Skip the envs that are not done
+                if info is None:
+                    continue
+                task_eps[i] += 1
+                # Discard any extra episodes from envs that ran ahead
+                if task_eps <= eval_episodes:
+                    successes[i] += int(info["success"])
+
+        eval_buffer.push(obs, action, reward, done)
+        obs = next_obs
+
+    trajectories = eval_buffer.get(**buffer_kwargs)
+    return (successes / eval_episodes).mean(), np.mean(trajectories.returns), key
