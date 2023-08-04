@@ -756,8 +756,8 @@ if __name__ == "__main__":
                             agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
                         )
                         metrics = {
-                            "charts/mean_success_rate": eval_success_rate,
-                            "charts/mean_evaluation_return": eval_returns,
+                            "charts/mean_success_rate": float(eval_success_rate),
+                            "charts/mean_evaluation_return": float(eval_returns),
                         }
                         for k, v in metrics.items():
                             writer.add_scalar(k, v, global_step)
