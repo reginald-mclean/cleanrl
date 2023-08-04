@@ -466,7 +466,9 @@ if __name__ == "__main__":
     )
 
     if args.save_model:  # Orbax checkpoints
-        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=5, create=True)
+        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
+            max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
+        )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
             f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
@@ -554,11 +556,7 @@ if __name__ == "__main__":
 
     # Outer policy update
     logs = agent.step(all_trajectories)
-    print(f"Step {global_step}: ", logs)
-
-    # Logging
-    for k, v in logs.items():
-        writer.add_scalar(k, v, global_step)
+    print(f"Step {global_step}")
 
     # Evaluation
     _make_eval_envs_common = partial(make_eval_envs, benchmark, args.meta_batch_size, args.seed, args.max_episode_steps)
@@ -572,8 +570,14 @@ if __name__ == "__main__":
         buffer_kwargs=buffer_processing_kwargs,
         key=key,
     )
-    writer.add_scalar("charts/mean_success_rate", eval_success_rate, global_step)
-    writer.add_scalar("charts/mean_evaluation_return", eval_mean_return, global_step)
+
+    logs["charts/mean_success_rate"] = eval_success_rate
+    logs["charts/mean_evaluation_return"] = eval_mean_return
+
+    # Logging
+    for k, v in logs.items():
+        writer.add_scalar(k, v, global_step)
+    print(logs)
 
     seconds_per_step = (time.time() - start_time) / (global_step + 1)
     writer.add_scalar("charts/time_per_step", seconds_per_step, global_step)
@@ -585,7 +589,7 @@ if __name__ == "__main__":
 
     # Checkpoint
     if args.save_model:
-        ckpt_manager.save(global_step, agent.make_checkpoint() + {"key": key})
+        ckpt_manager.save(step=global_step, items=agent.make_checkpoint() + {"key": key}, metrics=logs)
         print("model saved")
 
     envs.close()

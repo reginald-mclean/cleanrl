@@ -19,15 +19,14 @@ import metaworld  # type: ignore
 import numpy as np
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
+from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
+from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
-
-from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
-from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
-from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -46,8 +45,6 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
-    parser.add_argument('--save-model-frequency', type=int, default=50_000,
-        help="the frequency of saving the model")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
@@ -608,7 +605,9 @@ if __name__ == "__main__":
     )
 
     if args.save_model:  # Orbax checkpoints
-        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=5, create=True)
+        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
+            max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
+        )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
             f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
@@ -756,21 +755,27 @@ if __name__ == "__main__":
                         eval_success_rate, eval_returns, key = evaluation_procedure(
                             agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
                         )
-                        writer.add_scalar("charts/mean_success_rate", eval_success_rate, global_step)
-                        writer.add_scalar("charts/mean_evaluation_return", eval_returns, global_step)
+                        metrics = {
+                            "charts/mean_success_rate": eval_success_rate,
+                            "charts/mean_evaluation_return": eval_returns,
+                        }
+                        for k, v in metrics.items():
+                            writer.add_scalar(k, v, global_step)
                         print(
                             f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
                             + f" return: {eval_returns:.4f}"
                         )
 
-                    # Checkpointing
-                    if args.save_model and current_step % args.save_model_frequency == 0:
-                        ckpt = agent.get_ckpt()
-                        ckpt["rng_key"] = key
-                        ckpt["global_step"] = global_step
-                        save_args = orbax_utils.save_args_from_target(ckpt)
-                        ckpt_manager.save(global_step, ckpt, save_kwargs={"save_args": save_args})
-                        print(f"model saved to {ckpt_manager.directory}")
+                        # Checkpointing
+                        if args.save_model:
+                            ckpt = agent.get_ckpt()
+                            ckpt["rng_key"] = key
+                            ckpt["global_step"] = global_step
+                            save_args = orbax_utils.save_args_from_target(ckpt)
+                            ckpt_manager.save(
+                                step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=metrics
+                            )
+                            print(f"model saved to {ckpt_manager.directory}")
 
     envs.close()
     writer.close()
