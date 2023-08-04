@@ -1,11 +1,9 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import argparse
-from functools import partial
 import os
 import random
 import time
 from distutils.util import strtobool
-from typing import Optional, Type
 
 import gymnasium as gym
 import metaworld
@@ -18,11 +16,9 @@ from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
 
 from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedure
-from cleanrl_utils.wrappers import metaworld_wrappers
-from cleanrl.softmodules_metaworld_jax import make_eval_envs
+from cleanrl.softmodules_metaworld_jax import make_eval_envs, make_envs
 
 
 def parse_args():
@@ -177,33 +173,6 @@ def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
     return torch.mm(one_hots, log_alpha.unsqueeze(0).t())
 
 
-def make_envs(
-    benchmark: metaworld.Benchmark,
-    seed: int,
-    max_episode_steps: Optional[int] = None,
-    use_one_hot: bool = True,
-) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        env = env_cls()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if use_one_hot:
-            env = metaworld_wrappers.OneHotWrapper(
-                env, env_id, len(benchmark.train_classes)
-            )
-        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
-        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
-        env.action_space.seed(seed)
-        return env
-
-    return gym.vector.AsyncVectorEnv(
-        [
-            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
-            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
-        ]
-    )
-
-
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -290,12 +259,11 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    global_episodic_return = deque([], maxlen=20 * envs.num_envs)
-    global_episodic_length = deque([], maxlen=20 * envs.num_envs)
+    global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
+    global_episodic_length = deque([], maxlen=20 * NUM_TASKS)
 
     obs, info = envs.reset()
 
-    global_step = 0
     env_steps = 0
     grad_steps = 0
 
@@ -303,7 +271,7 @@ if __name__ == "__main__":
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
+                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
             )
         else:
             actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
@@ -322,10 +290,10 @@ if __name__ == "__main__":
                 global_episodic_return.append(info["episode"]["r"])
                 global_episodic_length.append(info["episode"]["l"])
 
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
+        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, d in enumerate(truncations):
-            if d:
+        for idx, t in enumerate(truncations):
+            if t:
                 real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations)
 
@@ -348,10 +316,14 @@ if __name__ == "__main__":
             )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts and global_step % args.gradient_steps == 0:  # torchrl-style training loop
+        if (
+            global_step > args.learning_starts
+            and global_step % args.gradient_steps == 0
+        ):  # torchrl-style training loop
             for _ in range(args.gradient_steps):
-                data = rb.sample(args.batch_size)
+                current_step = global_step + grad_steps
 
+                data = rb.sample(args.batch_size)
                 with torch.no_grad():
                     next_state_actions, next_state_log_pi, _ = actor.get_action(
                         data.next_observations
@@ -364,7 +336,8 @@ if __name__ == "__main__":
                     )
                     min_qf_next_target = (
                         torch.min(qf1_next_target, qf2_next_target)
-                        -get_log_alpha(log_alpha, NUM_TASKS, data).exp() * next_state_log_pi
+                        - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
+                        * next_state_log_pi
                     )
                     next_q_value = data.rewards.flatten() + (
                         1 - data.dones.flatten()
@@ -389,8 +362,7 @@ if __name__ == "__main__":
                 qf2_pi = qf2(data.observations, pi)
                 min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
                 actor_loss = (
-                    (get_log_alpha(log_alpha, NUM_TASKS, data) * log_pi)
-                    - min_qf_pi
+                    (get_log_alpha(log_alpha, NUM_TASKS, data) * log_pi) - min_qf_pi
                 ).mean()
 
                 actor_optimizer.zero_grad()
@@ -400,7 +372,10 @@ if __name__ == "__main__":
                 if args.autotune:
                     with torch.no_grad():
                         _, log_pi, _ = actor.get_action(data.observations)
-                    alpha_loss = (-get_log_alpha(log_alpha, NUM_TASKS, data) * (log_pi + target_entropy)).mean()
+                    alpha_loss = (
+                        -get_log_alpha(log_alpha, NUM_TASKS, data)
+                        * (log_pi + target_entropy)
+                    ).mean()
 
                     a_optimizer.zero_grad()
                     alpha_loss.backward()
@@ -408,7 +383,7 @@ if __name__ == "__main__":
                     alpha = log_alpha.sum().exp().item()
 
                 # update the target networks
-                if grad_steps + grad_steps % args.target_network_frequency == 0:
+                if current_step % args.target_network_frequency == 0:
                     for param, target_param in zip(
                         qf1.parameters(), qf1_target.parameters()
                     ):
@@ -422,8 +397,7 @@ if __name__ == "__main__":
                             args.tau * param.data + (1 - args.tau) * target_param.data
                         )
 
-
-                if global_step + grad_steps % 100 == 0:
+                if current_step % 100 == 0:
                     writer.add_scalar(
                         "losses/qf1_values", qf1_a_values.mean().item(), global_step
                     )
@@ -432,8 +406,12 @@ if __name__ == "__main__":
                     )
                     writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                     writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                    writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                    writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                    writer.add_scalar(
+                        "losses/qf_loss", qf_loss.item() / 2.0, global_step
+                    )
+                    writer.add_scalar(
+                        "losses/actor_loss", actor_loss.item(), global_step
+                    )
                     writer.add_scalar("losses/alpha", alpha, global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar(
