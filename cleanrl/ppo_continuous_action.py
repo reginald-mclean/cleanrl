@@ -5,6 +5,9 @@ import random
 import time
 from distutils.util import strtobool
 
+import sys
+sys.path.append('/home/reginaldkmclean/cleanrl')
+
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
 import gymnasium as gym
@@ -40,13 +43,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1000000,
+    parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=5e-4,
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=10,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=500,
+    parser.add_argument("--num-steps", type=int, default=10000,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -72,9 +75,10 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=250, 
+    parser.add_argument("--eval-freq", type=int, default=2,
         help="how many updates to do before evaluating the agent")
     args = parser.parse_args()
+    
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     # fmt: on
@@ -92,10 +96,14 @@ class Agent(nn.Module):
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
             nn.Tanh(),
+            layer_init(nn.Linear(512, 512), std=1.0),
+            nn.Tanh(),
             layer_init(nn.Linear(512, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 512)),
+            nn.Tanh(),
+            layer_init(nn.Linear(512, 512), std=0.01),
             nn.Tanh(),
             layer_init(nn.Linear(512, np.prod(envs.single_action_space.shape)), std=0.01),
         )
@@ -179,15 +187,18 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-    num_updates = args.total_timesteps // args.batch_size
-
+    num_updates = int(args.total_timesteps // args.batch_size)
 
 
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
             ### NEED TO SET TRAIN OR TEST TASKS
+            agent = agent.to('cpu')
+            agent.eval()
             evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
                                  update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
+            agent = agent.to(device)
+            agent.train()
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -262,7 +273,13 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-
+                #print(mb_inds)
+                #print(min(b_inds), max(b_inds))
+                #print(type(b_obs))
+                #print(b_obs)
+                #print(obs.size())
+                #print(b_obs.size())
+                #print(b_obs[mb_inds], b_actions[mb_inds])
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()

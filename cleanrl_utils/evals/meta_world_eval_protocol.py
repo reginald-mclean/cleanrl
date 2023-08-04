@@ -2,8 +2,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.multiprocessing as mp
+from pynvml import *
 import time
-
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
 
 def new_evaluation_procedure(
@@ -46,6 +46,17 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     eval_rewards = []
     mean_success_rate = 0.0
     task_results = []
+    agent = agent.to('cuda:0')
+    nvmlInit()
+    h = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(h)
+    print(f'total    : {info.total}')
+    print(f'free     : {info.free}')
+    print(f'used     : {info.used}')
+    while info.free < (info.total/2):
+        print('waiting for memory')
+        time.sleep(30)
+        info = nvmlDeviceGetMemoryInfo(h)
 
     batch_size = 10 if num_envs >= 10 else num_envs
     itrs = int(num_envs/batch_size)
@@ -55,7 +66,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
             # print(f"process for {key}")
             env_cls = classes[key]
             env_tasks = [task for task in tasks if task.env_name == key]
-            p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, add_onehot, keys.index(key), num_envs, device))
+            p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, add_onehot, keys.index(key), num_envs, 'cuda:0'))
             p.start()
             workers.append(p)
         for process in workers:
@@ -70,10 +81,12 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
                 writer.add_scalar(f"charts/{worker_result['task_name']}_avg_eval_rewards", np.mean(worker_result['eval_rewards']), update - 1)
     success_rate = float(mean_success_rate) / (num_envs * num_evals)
     writer.add_scalar("charts/mean_success_rate", success_rate, update - 1)
+    #agent = agent.to('cuda:0')
     return success_rate
 
 def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device):
     # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
+    agent.eval()
     env = env_cls()
     if add_onehot:
         env = OneHotWrapper(env, idx, num_envs)
@@ -81,12 +94,14 @@ def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_eva
     env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
     rewards = []
     success = 0.0
-    for _ in range(num_evals):
+    for m in range(num_evals):
+        print(f"{env_name} {m}")
         obs, info = env.reset()
         done = False
         while not done:
-            action, _, _, _ = agent.get_action_and_value(
-                torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
+            with torch.no_grad():
+                action, _, _, _ = agent.get_action_and_value(
+                    torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
             next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).detach().cpu().numpy())
             rewards.append(reward)
             done = truncated or terminated
