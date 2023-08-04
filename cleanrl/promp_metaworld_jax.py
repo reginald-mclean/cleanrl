@@ -21,15 +21,14 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
+from cleanrl_utils.buffers_metaworld import MetaLearningReplayBuffer, Trajectory
+from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
+from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
-
-from cleanrl_utils.buffers_metaworld import MetaLearningReplayBuffer, Trajectory
-from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
-from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -247,10 +246,10 @@ class MetaTrainState(TrainState):
 def inner_step(
     policy: TrainState, trajectories: Trajectory, return_kl: bool = False
 ) -> Tuple[TrainState, Optional[jax.Array]]:
-    assert trajectories.log_probs
+    assert trajectories.log_probs is not None and trajectories.means is not None and trajectories.stds is not None
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
-        theta_dist = policy.apply_fn(_theta, obs)
+        theta_dist = policy.apply_fn(_theta, trajectories.observations)
         theta_log_probs = theta_dist.log_prob(trajectories.actions)
 
         if return_kl:
@@ -292,7 +291,7 @@ def outer_step(
         # Inner Train State now has theta^\prime
         # Compute J^Clip, Equation 11
         trajectories = all_trajectories[-1]
-        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, trajectories.obs)
+        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, trajectories.observations)
         new_param_log_probs = new_param_dist.log_prob(trajectories.actions)
 
         likelihood_ratio = jnp.exp(new_param_log_probs - trajectories.log_probs)
