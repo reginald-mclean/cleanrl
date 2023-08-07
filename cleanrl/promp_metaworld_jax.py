@@ -47,8 +47,10 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
-    parser.add_argument('--save-model-frequency', type=int, default=50_000,
+    parser.add_argument('--save-model-frequency', type=int, default=10,
         help="the frequency of saving the model")
+    parser.add_argument("--evaluation-frequency", type=int, default=10,
+        help="the frequency of evaluating the model (in outer steps)")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10", help="the id of the environment")
@@ -126,7 +128,7 @@ def make_eval_envs(
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
+        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)  # TODO proper task selection
         env.unwrapped.seed(seed)
         return env
 
@@ -250,7 +252,7 @@ def inner_step(
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
         theta_dist = policy.apply_fn(_theta, rollouts.observations)
-        theta_log_probs = theta_dist.log_prob(rollouts.actions)
+        theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
 
         if return_kl:
             kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
@@ -268,7 +270,7 @@ def inner_step(
 
 @partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks"))
 def outer_step(
-    meta_train_state: MetaTrainState,
+    train_state: MetaTrainState,
     all_rollouts: List[Rollout],
     eta: float,
     clip_eps: float,
@@ -277,7 +279,7 @@ def outer_step(
 ) -> Tuple[MetaTrainState, dict]:
     def promp_loss(theta: FrozenDict):
         vec_theta = MetaVectorPolicy.expand_params(theta, num_tasks)
-        inner_train_state = meta_train_state.inner_train_state.replace(params=vec_theta)
+        inner_train_state = train_state.inner_train_state.replace(params=vec_theta)
         kls = []
 
         # Adaptation steps using J^LR to go from theta to theta^\prime
@@ -290,7 +292,7 @@ def outer_step(
         # Compute J^Clip, Equation 11
         rollouts = all_rollouts[-1]
         new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
-        new_param_log_probs = new_param_dist.log_prob(rollouts.actions)
+        new_param_log_probs = jnp.expand_dims(new_param_dist.log_prob(rollouts.actions), -1)
 
         likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
         outer_objective = jnp.minimum(
@@ -305,14 +307,14 @@ def outer_step(
     # Update theta
     loss_before = None
     for i in range(num_grad_steps):
-        (loss, inner_kl), grads = jax.value_and_grad(promp_loss)(meta_train_state.params)
+        (loss, inner_kl), grads = jax.value_and_grad(promp_loss, has_aux=True)(train_state.params)
         if loss_before is None:
             loss_before = loss
-        meta_train_state = meta_train_state.apply_gradients(grads=grads)
+        train_state = train_state.apply_gradients(grads=grads)
 
-    (loss_after, inner_kl) = promp_loss(meta_train_state.params)
+    (loss_after, inner_kl) = promp_loss(train_state.params)
 
-    return meta_train_state, {
+    return train_state, {
         "losses/loss_before": jnp.mean(loss_before),
         "losses/loss_after": jnp.mean(loss_after),
         "losses/kl_inner": inner_kl,
@@ -354,7 +356,7 @@ class LinearFeatureBaseline:
                     break
                 reg_coeff *= 10
 
-            coeffs.append(task_coeffs)
+            coeffs.append(np.expand_dims(task_coeffs, axis=0))
 
         return np.stack(coeffs)
 
@@ -383,23 +385,16 @@ class ProMP:
     ):
         self.num_tasks = envs.unwrapped.num_envs
 
-        network_args = {
+        self.network_args = {
             "num_layers": num_layers,
             "hidden_dim": hidden_dim,
             "num_actions": np.prod(envs.single_action_space.shape),
         }
 
         # Init general parameters theta
-        theta = MetaVectorPolicy.init_single(**network_args, rng=init_key, init_args=[init_obs])
+        theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
+        self.init_multitask_policy(self.num_tasks, theta)
 
-        # Init a vectorized policy, running a separate set of parameters for each task
-        # The initial parameters for each task are all the same - theta
-        policy_network = MetaVectorPolicy(n_tasks=self.num_tasks, **network_args)
-        self.policy = TrainState.create(
-            apply_fn=policy_network.apply,
-            params=MetaVectorPolicy.expand_params(theta, self.num_tasks),
-            tx=optax.sgd(learning_rate=args.inner_lr),  # inner optimizer
-        )
         self.train_state = MetaTrainState.create(
             apply_fn=lambda x: x,
             inner_train_state=self.policy,
@@ -414,18 +409,26 @@ class ProMP:
         self._clip_eps = clip_eps
         self._num_grad_steps = num_grad_steps
 
-    def reset_inner(self):
-        self.policy = self.policy.replace(
-            params=MetaVectorPolicy.expand_params(self.train_state.params, self.num_tasks)
+    def init_multitask_policy(self, num_tasks: int, params: FrozenDict) -> None:
+        self.num_tasks = num_tasks
+
+        # Init a vectorized policy, running a separate set of parameters for each task
+        # The initial parameters for each task are all the same
+        policy_network = MetaVectorPolicy(n_tasks=num_tasks, **self.network_args)
+        self.policy = TrainState.create(
+            apply_fn=policy_network.apply,
+            params=MetaVectorPolicy.expand_params(params, num_tasks),
+            tx=optax.sgd(learning_rate=args.inner_lr),  # inner optimizer
         )
 
-    def adapt(self, rollouts: Rollout):
+    def adapt(self, rollouts: Rollout) -> None:
         self.policy, _ = inner_step(self.policy, rollouts)
 
-    def step(self, all_rollouts: Rollout):
-        return outer_step(
-            self.meta_train_state, all_rollouts, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
+    def step(self, all_rollouts: Rollout) -> dict:
+        self.train_state, logs = outer_step(
+            self.train_state, all_rollouts, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
         )
+        return logs
 
     def get_actions_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
         return get_actions_log_probs_and_dists(self.policy, obs, key)
@@ -529,12 +532,14 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps):  # Outer step
-        agent.reset_inner()
+        print(f"Step {global_step}")
+        agent.init_multitask_policy(NUM_TASKS, agent.train_state.params)
         all_rollouts: List[Rollout] = []
 
         # Sampling step
         # Collect num_inner_gradient_steps D datasets + collect 1 D' dataset
-        for inner_step in range(args.num_inner_gradient_steps + 1):
+        for _step in range(args.num_inner_gradient_steps + 1):
+            print(f"- Collecting inner step {_step}")
             while not buffer.ready:
                 action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
                 next_obs, reward, _, truncated, _ = envs.step(action)
@@ -545,50 +550,60 @@ if __name__ == "__main__":
             all_rollouts.append(rollouts)
             buffer.reset()
 
-        writer.add_scalar("charts/mean_episodic_return", all_rollouts[-1].returns.mean(), global_step)
+            writer.add_scalar("charts/mean_episodic_return", all_rollouts[-1].returns.mean(), global_step)
 
-        # Inner policy update for the sake of sampling close to adapted policy during the
-        # computation of the objective.
-        if inner_step < args.num_inner_gradient_steps:
-            agent.adapt(rollouts)
+            # Inner policy update for the sake of sampling close to adapted policy during the
+            # computation of the objective.
+            if _step < args.num_inner_gradient_steps:
+                print(f"- Adaptation step {_step}")
+                agent.adapt(rollouts)
 
-    # Outer policy update
-    logs = agent.step(all_rollouts)
-    print(f"Step {global_step}")
+        # Outer policy update
+        print("- Computing outer step")
+        logs = agent.step(all_rollouts)
+        logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
-    # Evaluation
-    _make_eval_envs_common = partial(make_eval_envs, benchmark, args.meta_batch_size, args.seed, args.max_episode_steps)
-    eval_success_rate, eval_mean_return, key = metalearning_evaluation(
-        agent,
-        train_envs=_make_eval_envs_common(terminate_on_success=False),
-        eval_envs=_make_eval_envs_common(terminate_on_success=True),
-        adaptation_steps=args.num_inner_gradient_steps,
-        adaptation_episodes=args.rollouts_per_task,
-        eval_episodes=50,
-        buffer_kwargs=buffer_processing_kwargs,
-        key=key,
-    )
+        # Evaluation
+        if global_step % args.evaluation_frequency == 0 and global_step > 0:
+            print("- Evaluating...")
+            _make_eval_envs_common = partial(
+                make_eval_envs,
+                benchmark=benchmark,
+                meta_batch_size=len(benchmark.test_classes),
+                seed=args.seed,
+                max_episode_steps=args.max_episode_steps,
+            )
+            eval_success_rate, eval_mean_return, key = metalearning_evaluation(
+                agent,
+                train_envs=_make_eval_envs_common(terminate_on_success=False),
+                eval_envs=_make_eval_envs_common(terminate_on_success=True),
+                adaptation_steps=args.num_inner_gradient_steps,
+                adaptation_episodes=args.rollouts_per_task,
+                eval_episodes=3,
+                buffer_kwargs=buffer_processing_kwargs,
+                key=key,
+            )
 
-    logs["charts/mean_success_rate"] = eval_success_rate
-    logs["charts/mean_evaluation_return"] = eval_mean_return
+            logs["charts/mean_success_rate"] = eval_success_rate
+            logs["charts/mean_evaluation_return"] = eval_mean_return
 
-    # Logging
-    for k, v in logs.items():
-        writer.add_scalar(k, v, global_step)
-    print(logs)
+        # Logging
+        for k, v in logs.items():
+            writer.add_scalar(k, v, global_step)
+        print(logs)
 
-    seconds_per_step = (time.time() - start_time) / (global_step + 1)
-    writer.add_scalar("charts/time_per_step", seconds_per_step, global_step)
-    print("Time per step: ", seconds_per_step)
+        seconds_per_step = (time.time() - start_time) / (global_step + 1)
+        writer.add_scalar("charts/time_per_step", seconds_per_step, global_step)
+        print("- Time per step: ", seconds_per_step)
 
-    # Set tasks for next iteration
-    obs, _ = zip(*envs.call("sample_tasks"))
-    obs = np.stack(obs)
+        # Set tasks for next iteration
+        obs, _ = zip(*envs.call("sample_tasks"))
+        obs = np.stack(obs)
 
-    # Checkpoint
-    if args.save_model:
-        ckpt_manager.save(step=global_step, items=agent.make_checkpoint() + {"key": key}, metrics=logs)
-        print("model saved")
+        # Checkpoint
+        if args.save_model and global_step % args.save_model_frequency == 0 and global_step > 0:
+            ckpt_manager.save(step=global_step, items=agent.make_checkpoint() + {"key": key}, metrics=logs)
+            print("- Saved Model")
 
     envs.close()
     writer.close()

@@ -51,45 +51,48 @@ def metalearning_evaluation(
     buffer_kwargs: dict,
     key: jax.random.PRNGKey,
 ):
-    agent.reset_inner()
+    agent.init_multitask_policy(train_envs.num_envs, agent.train_state.params)
 
     # Adaptation
     obs, _ = zip(*train_envs.call("sample_tasks"))
     obs = np.stack(obs)
     eval_buffer = MultiTaskRolloutBuffer(train_envs.num_envs, adaptation_episodes, 500)
 
-    for _ in range(adaptation_steps):
-        while not eval_buffer.ready():
+    for i in range(adaptation_steps):
+        print(f"-- Adaptation step {i}")
+        while not eval_buffer.ready:
             action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
-            next_obs, reward, terminated, _, _ = train_envs.step(action)
-            eval_buffer.push(obs, action, reward, terminated, log_probs, means, stds)
+            next_obs, reward, _, truncated, _ = train_envs.step(action)
+            eval_buffer.push(obs, action, reward, truncated, log_probs, means, stds)
             obs = next_obs
 
         rollouts = eval_buffer.get(**buffer_kwargs)
+        print("-- Adapting...")
         agent.adapt(rollouts)
+        eval_buffer.reset()
 
     # Evaluation
-    obs, _ = eval_envs.reset()
-    eval_buffer = MultiTaskRolloutBuffer(eval_envs.num_envs, eval_episodes, 500)
+    obs, _ = zip(*eval_envs.call("sample_tasks"))
+    obs = np.stack(obs)
 
-    task_eps = np.zeros(eval_envs.num_envs)
     successes = np.zeros(eval_envs.num_envs)
-    while not eval_buffer.ready():
+    episodic_returns = [[] for _ in range(eval_envs.num_envs)]
+    print(f"-- Evaluating on {eval_episodes} episodes per env")
+    while not all(len(returns) >= eval_episodes for returns in episodic_returns):
         action, key = agent.get_actions_eval(obs, key)
-        next_obs, reward, done, infos = eval_envs.step(action)
+        next_obs, reward, _, _, infos = eval_envs.step(action)
 
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                task_eps[i] += 1
+                episodic_returns[i].append(info["episode"]["r"])
                 # Discard any extra episodes from envs that ran ahead
-                if task_eps <= eval_episodes:
+                if len(episodic_returns[i]) <= eval_episodes:
                     successes[i] += int(info["success"])
 
-        eval_buffer.push(obs, action, reward, done)
         obs = next_obs
 
-    rollouts = eval_buffer.get(**buffer_kwargs)
-    return (successes / eval_episodes).mean(), np.mean(rollouts.returns), key
+    episodic_returns = [returns[:eval_episodes] for returns in episodic_returns]
+    return np.mean(successes / eval_episodes), np.mean(episodic_returns), key
