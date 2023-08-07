@@ -171,6 +171,7 @@ class GaussianPolicy(nn.Module):
     hidden_dim: int
 
     LOG_STD_MIN: float = np.log(1e-6)
+    LOG_STD_MAX: float = 2.0
 
     @nn.compact
     def __call__(self, x: jax.Array) -> Tuple[jax.Array, jax.Array]:
@@ -180,9 +181,17 @@ class GaussianPolicy(nn.Module):
             output_dim=2 * self.num_actions,
         )(x)
         mean, log_std = jnp.split(x, 2, axis=-1)
-        log_std = jnp.maximum(log_std, self.LOG_STD_MIN)
-        std = jnp.exp(log_std)
-        return mean, std
+        log_std = jnp.clip(log_std, a_min=self.LOG_STD_MIN, a_max=self.LOG_STD_MAX)
+        return mean, log_std
+
+
+@jax.jit
+def log_prob(dist: distrax.Distribution, pre_tanh_actions: ArrayLike) -> jax.Array:
+    """Hack to get hopefully numerically stable log probs,
+    see https://github.com/deepmind/distrax/issues/216#issuecomment-1668385413"""
+    log_probs = dist.log_prob(pre_tanh_actions)
+    log_probs -= 2.0 * (jnp.log(2.0) - pre_tanh_actions - jax.nn.softplus(-2 * pre_tanh_actions))
+    return log_probs
 
 
 class MetaVectorPolicy(nn.Module):
@@ -192,7 +201,7 @@ class MetaVectorPolicy(nn.Module):
     hidden_dim: int
 
     @nn.compact
-    def __call__(self, state: jax.Array) -> jax.Array:
+    def __call__(self, state: jax.Array) -> distrax.Distribution:
         vmap_policy = nn.vmap(
             GaussianPolicy,
             variable_axes={"params": 0},  # parameters not shared between task policies
@@ -200,10 +209,10 @@ class MetaVectorPolicy(nn.Module):
             out_axes=0,
             axis_size=self.n_tasks,
         )
-        mean, std = vmap_policy(num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim)(
-            state
-        )
-        return distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
+        mean, log_std = vmap_policy(
+            num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
+        )(state)
+        return distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
 
     @staticmethod
     def init_single(
@@ -252,7 +261,7 @@ def inner_step(
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
         theta_dist = policy.apply_fn(_theta, rollouts.observations)
-        theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
+        theta_log_probs = jnp.expand_dims(log_prob(theta_dist, rollouts.actions), -1)
 
         if return_kl:
             kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
@@ -292,7 +301,7 @@ def outer_step(
         # Compute J^Clip, Equation 11
         rollouts = all_rollouts[-1]
         new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
-        new_param_log_probs = jnp.expand_dims(new_param_dist.log_prob(rollouts.actions), -1)
+        new_param_log_probs = jnp.expand_dims(log_prob(new_param_dist, rollouts.actions), -1)
 
         likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
         outer_objective = jnp.minimum(
@@ -542,7 +551,7 @@ if __name__ == "__main__":
             print(f"- Collecting inner step {_step}")
             while not buffer.ready:
                 action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
-                next_obs, reward, _, truncated, _ = envs.step(action)
+                next_obs, reward, _, truncated, _ = envs.step(np.tanh(action))
                 buffer.push(obs, action, reward, truncated, log_probs, means, stds)
                 obs = next_obs
 
