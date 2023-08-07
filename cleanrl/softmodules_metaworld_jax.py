@@ -10,6 +10,7 @@ from typing import Deque, NamedTuple, Optional, Tuple, Type, Union
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+import distrax
 import flax
 import flax.linen as nn
 import gymnasium as gym  # type: ignore
@@ -181,14 +182,17 @@ class BasePolicyNetworkLayer(nn.Module):
     num_modules: int  # n
     module_dim: int  # d
 
-    def setup(self):
-        self.modules = [nn.Dense(self.module_dim) for _ in range(self.num_modules)]
-
+    @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        # Assuming x to be of shape [B, n, D]
-        # Output will be [B, n, d]
-        # NOTE 4, relu *should* be here according to the paper, but it's after the weighted sum
-        return jnp.stack([module(x[..., j, :]) for j, module in enumerate(self.modules)], axis=-2)
+        modules = nn.vmap(
+            nn.Dense,
+            variable_axes={"params": 0},  # Different params per module
+            split_rngs={"params": True},  # Different initialization per module
+            in_axes=1,  # Module in axis index is 1, assuming x to be of shape [B, n, D]
+            out_axes=1,  # Module out axis index is 1, output will be [B, n, d]
+            axis_size=self.num_modules,
+        )(self.module_dim)
+        return modules(x)  # NOTE 4, relu *should* be here according to the paper, but it's after the weighted sum
 
 
 class RoutingNetworkLayer(nn.Module):
@@ -305,11 +309,14 @@ class Actor(nn.Module):  # Policy network
             output_dim=2 * self.num_actions,
         )
 
-    def __call__(self, s_t: jax.Array, z_Tau: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    def __call__(self, s_t: jax.Array, z_Tau: jax.Array) -> distrax.Distribution:
         x = self.net(s_t, z_Tau)
         mean, log_std = jnp.split(x, 2, axis=-1)
         log_std = jnp.clip(log_std, a_min=self.LOG_STD_MIN, a_max=self.LOG_STD_MAX)
-        return mean, log_std
+        std = jnp.exp(log_std)
+        return distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mean, scale_diag=std), distrax.Block(distrax.Tanh(), ndims=1)
+        )
 
 
 @jax.jit
@@ -320,10 +327,8 @@ def sample_action(
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    mean, log_std = actor.apply_fn(actor.params, obs, task_ids)
-    action = jnp.tanh(
-        mean + jnp.exp(log_std) * jax.random.normal(action_key, shape=mean.shape)
-    )  # Reparameterization trick
+    dist = actor.apply_fn(actor.params, obs, task_ids)
+    action = dist.sample(seed=action_key)
     return action, key
 
 
@@ -336,13 +341,8 @@ def sample_and_log_prob(
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    mean, log_std = actor.apply_fn(actor_params, obs, task_ids)
-    std = jnp.exp(log_std)
-    gaussian_action = mean + std * jax.random.normal(action_key, shape=mean.shape)
-    log_prob = -0.5 * ((gaussian_action - mean) / std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - log_std
-    log_prob = log_prob.sum(axis=1)
-    action = jnp.tanh(gaussian_action)
-    log_prob -= jnp.sum(jnp.log((1 - action**2) + 1e-6), axis=1)
+    dist = actor.apply_fn(actor_params, obs, task_ids)
+    action, log_prob = dist.sample_and_log_prob(seed=action_key)
     return action, log_prob, key
 
 
