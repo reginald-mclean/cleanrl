@@ -17,7 +17,7 @@ class ReplayBufferSamples(NamedTuple):
     rewards: TorchOrNumpyArray
 
 
-class Trajectory(NamedTuple):
+class Rollout(NamedTuple):
     # Standard timestep data
     observations: npt.NDArray
     actions: npt.NDArray
@@ -89,6 +89,28 @@ class MultiTaskReplayBuffer:
 
         self.pos = (self.pos + 1) % self.capacity
 
+    def single_task_sample(self, task_idx: int, batch_size: int) -> ReplayBufferSamples:
+        assert task_idx < self.num_tasks, "Task index out of bounds."
+
+        sample_idx = self._rng.integers(
+            low=0,
+            high=max(self.pos, batch_size),
+            size=(batch_size,),
+        )
+
+        batch = (
+            self.obs[sample_idx][task_idx],
+            self.actions[sample_idx][task_idx],
+            self.next_obs[sample_idx][task_idx],
+            self.dones[sample_idx][task_idx],
+            self.rewards[sample_idx][task_idx],
+        )
+
+        if self.use_torch:
+            batch = map(lambda x: torch.tensor(x).to(self.device), batch)  # type: ignore
+
+        return ReplayBufferSamples(*batch)
+
     def sample(self, single_task_batch_size: int) -> ReplayBufferSamples:
         """Sample a batch of size `single_task_batch_size` for each task.
 
@@ -121,25 +143,25 @@ class MultiTaskReplayBuffer:
         return ReplayBufferSamples(*batch)
 
 
-class MetaLearningReplayBuffer:
-    """A buffer to accumulate trajectories from batches envs for batches of tasks.
-    Useful for ML1, ML10, ML45.
+class MultiTaskRolloutBuffer:
+    """A buffer to accumulate rollouts for multiple tasks.
+    Useful for ML1, ML10, ML45, or on-policy MTRL algorithms.
 
     In Metaworld, all episodes are as long as the time limit (typically 500), thus in this buffer we assume
     fixed-length episodes and leverage that for optimisations."""
 
-    trajectories: List[List[Trajectory]]
+    rollouts: List[List[Rollout]]
 
     def __init__(
         self,
         num_tasks: int,
-        trajectories_per_task: int,
+        rollouts_per_task: int,
         max_episode_steps: int,
         use_torch: bool = False,
         device: Optional[str] = None,
     ):
         self.num_tasks = num_tasks
-        self._trajectories_per_task = trajectories_per_task
+        self._rollouts_per_task = rollouts_per_task
         self._max_episode_steps = max_episode_steps
 
         self._use_torch = use_torch
@@ -149,16 +171,13 @@ class MetaLearningReplayBuffer:
 
     def reset(self):
         """Reset the buffer."""
-        self.trajectories = [[] for _ in range(self.num_tasks)]
-        self._running_trajectories = [[] for _ in range(self.num_tasks)]
+        self.rollouts = [[] for _ in range(self.num_tasks)]
+        self._running_rollouts = [[] for _ in range(self.num_tasks)]
 
     @property
     def ready(self) -> bool:
-        """Returns whether or not a full batch of trajectories for each task has been sampled.
-
-        Note that this is approximate and won't always have <trajectories_per_task> full trajectories ready.
-        Mirrors how the official ProMP code samples."""
-        return all(len(t) == self._trajectories_per_task for t in self.trajectories)
+        """Returns whether or not a full batch of rollouts for each task has been sampled."""
+        return all(len(t) == self._rollouts_per_task for t in self.rollouts)
 
     def _get_returns(self, rewards: npt.NDArray, discount: float):
         """Discounted cumulative sum.
@@ -173,8 +192,67 @@ class MetaLearningReplayBuffer:
         deltas = rewards + gamma * baselines[..., 1:] - baselines[..., :-1]
         return self._get_returns(deltas, gamma * gae_lambda)
 
-    def _to_torch(self, trajectories: Trajectory) -> Trajectory:
-        return Trajectory(*map(lambda x: torch.tensor(x).to(self._device), trajectories))  # type: ignore
+    def _to_torch(self, rollouts: Rollout) -> Rollout:
+        return Rollout(*map(lambda x: torch.tensor(x).to(self._device), rollouts))  # type: ignore
+
+    def get_single_task(
+        self,
+        task_idx: int,
+        as_is: bool = False,
+        gamma: Optional[float] = None,
+        gae_lambda: Optional[float] = None,
+        baseline: Optional[Callable] = None,
+        fit_baseline: Optional[Callable] = None,
+        normalize_advantages: bool = False,
+    ) -> Rollout:
+        """Compute returns and advantages for the collected rollouts.
+
+        Returns a Rollout tuple for a single task where each array has the batch dimensions (Timestep,).
+        The timesteps are multiple rollouts flattened into one time dimension."""
+        assert task_idx < self.num_tasks, "Task index out of bounds."
+
+        task_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *self.rollouts[task_idx]))
+
+        assert task_rollouts.observations.shape[:2] == (
+            self._rollouts_per_task,
+            self._max_episode_steps,
+        ), "Buffer does not have the expected amount of data before sampling."
+
+        if as_is:
+            return self._to_torch(task_rollouts) if self._use_torch else task_rollouts
+
+        assert (
+            gamma is not None and gae_lambda is not None
+        ), "Gamma and gae_lambda must be provided if GAE computation is not disabled through the `as_is` flag."
+
+        # 1) Get returns
+        task_rollouts = task_rollouts._replace(returns=self._get_returns(task_rollouts.rewards, gamma))  # type: ignore
+
+        # 2.1) (Optional) Fit baseline
+        if fit_baseline is not None:
+            baseline = fit_baseline(task_rollouts)
+
+        # 2.2) Apply baseline
+        # NOTE baseline is responsible for any data conversions / moving to the GPU
+        assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
+        baselines = baseline(task_rollouts.observations)
+
+        # 3) Compute advantages
+        advantages = self._compute_advantage(task_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
+        task_rollouts = task_rollouts._replace(advantages=advantages)
+
+        # 4) Flatten rollout and time dimensions
+        task_rollouts = Rollout(*map(lambda x: x.reshape(-1, *x.shape[2:]), task_rollouts))
+
+        # 4.1) (Optional) Normalize advantages
+        if normalize_advantages:
+            advantages = task_rollouts.advantages
+            norm_advantages = (advantages - np.mean(advantages, axis=1, keepdims=True)) / (
+                np.std(advantages, axis=1, keepdims=True) + 1e-8
+            )
+            task_rollouts = task_rollouts._replace(advantages=norm_advantages)
+
+        return self._to_torch(task_rollouts) if self._use_torch else task_rollouts
 
     def get(
         self,
@@ -184,56 +262,54 @@ class MetaLearningReplayBuffer:
         baseline: Optional[Callable] = None,
         fit_baseline: Optional[Callable] = None,
         normalize_advantages: bool = False,
-    ) -> Trajectory:
-        """Compute returns and advantages for the collected trajectories.
+    ) -> Rollout:
+        """Compute returns and advantages for the collected rollouts.
 
-        Returns a Trajectory tuple where each array has the batch dimensions (Task,Timestep,).
-        The timesteps are multiple trajectories flattened into one time dimension."""
-        trajectories_per_task = [Trajectory(*map(lambda *xs: np.stack(xs), *t)) for t in self.trajectories]
-        all_trajectories = Trajectory(*map(lambda *xs: np.stack(xs), *trajectories_per_task))
-        assert all_trajectories.observations.shape[:3] == (
+        Returns a Rollout tuple where each array has the batch dimensions (Task,Timestep,).
+        The timesteps are multiple rollouts flattened into one time dimension."""
+        rollouts_per_task = [Rollout(*map(lambda *xs: np.stack(xs), *t)) for t in self.rollouts]
+        all_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *rollouts_per_task))
+        assert all_rollouts.observations.shape[:3] == (
             self.num_tasks,
-            self._trajectories_per_task,
+            self._rollouts_per_task,
             self._max_episode_steps,
         ), "Buffer does not have the expected amount of data before sampling."
 
         if as_is:
-            return self._to_torch(all_trajectories) if self._use_torch else all_trajectories
+            return self._to_torch(all_rollouts) if self._use_torch else all_rollouts
 
         assert (
             gamma is not None and gae_lambda is not None
         ), "Gamma and gae_lambda must be provided if GAE computation is not disabled through the `as_is` flag."
 
         # 1) Get returns
-        all_trajectories = all_trajectories._replace(
-            returns=self._get_returns(all_trajectories.rewards, gamma)  # type: ignore
-        )
+        all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
 
         # 2.1) (Optional) Fit baseline
         if fit_baseline is not None:
-            baseline = fit_baseline(all_trajectories)
+            baseline = fit_baseline(all_rollouts)
 
         # 2.2) Apply baseline
         # NOTE baseline is responsible for any data conversions / moving to the GPU
         assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
-        baselines = baseline(all_trajectories.observations)
+        baselines = baseline(all_rollouts.observations)
 
         # 3) Compute advantages
-        advantages = self._compute_advantage(all_trajectories.rewards, baselines, gamma, gae_lambda)  # type: ignore
-        all_trajectories = all_trajectories._replace(advantages=advantages)
+        advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
+        all_rollouts = all_rollouts._replace(advantages=advantages)
 
-        # 4) Flatten trajectory and time dimensions
-        all_trajectories = Trajectory(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_trajectories))
+        # 4) Flatten rollout and time dimensions
+        all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
 
         # 4.1) (Optional) Normalize advantages
         if normalize_advantages:
-            advantages = all_trajectories.advantages
+            advantages = all_rollouts.advantages
             norm_advantages = (advantages - np.mean(advantages, axis=1, keepdims=True)) / (
                 np.std(advantages, axis=1, keepdims=True) + 1e-8
             )
-            all_trajectories = all_trajectories._replace(advantages=norm_advantages)
+            all_rollouts = all_rollouts._replace(advantages=norm_advantages)
 
-        return self._to_torch(all_trajectories) if self._use_torch else all_trajectories
+        return self._to_torch(all_rollouts) if self._use_torch else all_rollouts
 
     def push(
         self,
@@ -248,7 +324,7 @@ class MetaLearningReplayBuffer:
         """Add a batch of timesteps to the buffer. Multiple batch dims are supported, but they
         need to multiply to the buffer's meta batch size.
 
-        If an episode finishes here for any of the envs, pop the full trajectory into the trajectories buffer."""
+        If an episode finishes here for any of the envs, pop the full rollout into the rollout buffer."""
         assert np.prod(reward.shape) == self.num_tasks
 
         obs = obs.copy()
@@ -272,16 +348,16 @@ class MetaLearningReplayBuffer:
                 std = std.reshape(-1, *std.shape[2:])
 
         for i in range(self.num_tasks):
-            trajectory_step = (obs[i], action[i], reward[i], done[i])
+            timestep = (obs[i], action[i], reward[i], done[i])
             if log_prob is not None:
-                trajectory_step += (log_prob[i],)
+                timestep += (log_prob[i],)
             if mean is not None:
-                trajectory_step += (mean[i],)
+                timestep += (mean[i],)
             if std is not None:
-                trajectory_step += (std[i],)
-            self._running_trajectories[i].append(trajectory_step)
+                timestep += (std[i],)
+            self._running_rollouts[i].append(timestep)
 
-            if done[i]:  # pop full trajectories into the trajectories buffer
-                trajectory = Trajectory(*map(lambda *xs: np.stack(xs), *self._running_trajectories[i]))
-                self.trajectories[i].append(trajectory)
-                self._running_trajectories[i] = []
+            if done[i]:  # pop full rollouts into the rollouts buffer
+                rollout = Rollout(*map(lambda *xs: np.stack(xs), *self._running_rollouts[i]))
+                self.rollouts[i].append(rollout)
+                self._running_rollouts[i] = []

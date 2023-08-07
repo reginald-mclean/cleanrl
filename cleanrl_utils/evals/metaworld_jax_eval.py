@@ -6,7 +6,7 @@ import gymnasium as gym
 import jax
 import numpy as np
 
-from cleanrl_utils.buffers_metaworld import MetaLearningReplayBuffer
+from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer
 
 
 def evaluation_procedure(
@@ -56,7 +56,7 @@ def metalearning_evaluation(
     # Adaptation
     obs, _ = zip(*train_envs.call("sample_tasks"))
     obs = np.stack(obs)
-    eval_buffer = MetaLearningReplayBuffer(train_envs.num_envs, adaptation_episodes, 500)
+    eval_buffer = MultiTaskRolloutBuffer(train_envs.num_envs, adaptation_episodes, 500)
 
     for _ in range(adaptation_steps):
         while not eval_buffer.ready():
@@ -65,12 +65,12 @@ def metalearning_evaluation(
             eval_buffer.push(obs, action, reward, terminated, log_probs, means, stds)
             obs = next_obs
 
-        trajectories = eval_buffer.get(**buffer_kwargs)
-        agent.adapt(trajectories)
+        rollouts = eval_buffer.get(**buffer_kwargs)
+        agent.adapt(rollouts)
 
     # Evaluation
     obs, _ = eval_envs.reset()
-    eval_buffer = MetaLearningReplayBuffer(eval_envs.num_envs, eval_episodes, 500)
+    eval_buffer = MultiTaskRolloutBuffer(eval_envs.num_envs, eval_episodes, 500)
 
     task_eps = np.zeros(eval_envs.num_envs)
     successes = np.zeros(eval_envs.num_envs)
@@ -91,5 +91,5 @@ def metalearning_evaluation(
         eval_buffer.push(obs, action, reward, done)
         obs = next_obs
 
-    trajectories = eval_buffer.get(**buffer_kwargs)
-    return (successes / eval_episodes).mean(), np.mean(trajectories.returns), key
+    rollouts = eval_buffer.get(**buffer_kwargs)
+    return (successes / eval_episodes).mean(), np.mean(rollouts.returns), key

@@ -21,7 +21,7 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
-from cleanrl_utils.buffers_metaworld import MetaLearningReplayBuffer, Trajectory
+from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
 from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
 from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.core.frozen_dict import FrozenDict
@@ -244,23 +244,21 @@ class MetaTrainState(TrainState):
 
 @partial(jax.jit, static_argnames=("return_kl",))
 def inner_step(
-    policy: TrainState, trajectories: Trajectory, return_kl: bool = False
+    policy: TrainState, rollouts: Rollout, return_kl: bool = False
 ) -> Tuple[TrainState, Optional[jax.Array]]:
-    assert trajectories.log_probs is not None and trajectories.means is not None and trajectories.stds is not None
+    assert rollouts.log_probs is not None and rollouts.means is not None and rollouts.stds is not None
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
-        theta_dist = policy.apply_fn(_theta, trajectories.observations)
-        theta_log_probs = theta_dist.log_prob(trajectories.actions)
+        theta_dist = policy.apply_fn(_theta, rollouts.observations)
+        theta_log_probs = theta_dist.log_prob(rollouts.actions)
 
         if return_kl:
-            kl = distrax.MultivariateNormalDiag(loc=trajectories.means, scale_diag=trajectories.stds).kl_divergence(
-                theta_dist
-            )
+            kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
         else:
             kl = None
 
-        ratio = jnp.exp(theta_log_probs - trajectories.log_probs)
-        return -(ratio * trajectories.advantages).mean(), kl
+        ratio = jnp.exp(theta_log_probs - rollouts.log_probs)
+        return -(ratio * rollouts.advantages).mean(), kl
 
     grads, kl = jax.grad(inner_opt_objective, has_aux=True)(policy.params)
     updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step, SGD
@@ -271,7 +269,7 @@ def inner_step(
 @partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks"))
 def outer_step(
     meta_train_state: MetaTrainState,
-    all_trajectories: List[Trajectory],
+    all_rollouts: List[Rollout],
     eta: float,
     clip_eps: float,
     num_grad_steps: int,
@@ -283,21 +281,21 @@ def outer_step(
         kls = []
 
         # Adaptation steps using J^LR to go from theta to theta^\prime
-        for i in range(len(all_trajectories) - 1):
-            trajectories = all_trajectories[i]
-            inner_train_state, kl = inner_step(inner_train_state, trajectories, return_kl=True)
+        for i in range(len(all_rollouts) - 1):
+            rollouts = all_rollouts[i]
+            inner_train_state, kl = inner_step(inner_train_state, rollouts, return_kl=True)
             kls.append(kl)
 
         # Inner Train State now has theta^\prime
         # Compute J^Clip, Equation 11
-        trajectories = all_trajectories[-1]
-        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, trajectories.observations)
-        new_param_log_probs = new_param_dist.log_prob(trajectories.actions)
+        rollouts = all_rollouts[-1]
+        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
+        new_param_log_probs = new_param_dist.log_prob(rollouts.actions)
 
-        likelihood_ratio = jnp.exp(new_param_log_probs - trajectories.log_probs)
+        likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
         outer_objective = jnp.minimum(
-            likelihood_ratio * trajectories.advantages,
-            jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * trajectories.advantages,
+            likelihood_ratio * rollouts.advantages,
+            jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * rollouts.advantages,
         )
 
         mean_kl = jnp.stack(kls).mean(axis=1).sum()
@@ -361,8 +359,8 @@ class LinearFeatureBaseline:
         return np.stack(coeffs)
 
     @classmethod
-    def fit_baseline(cls, trajectories: Trajectory) -> np.ndarray:
-        coeffs = cls._fit_baseline(trajectories.observations, trajectories.returns)
+    def fit_baseline(cls, rollouts: Rollout) -> np.ndarray:
+        coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
 
         def baseline(obs: np.ndarray) -> np.ndarray:
             features = cls._extract_features(obs, reshape=False)
@@ -421,12 +419,12 @@ class ProMP:
             params=MetaVectorPolicy.expand_params(self.train_state.params, self.num_tasks)
         )
 
-    def adapt(self, trajectories: Trajectory):
-        self.policy, _ = inner_step(self.policy, trajectories)
+    def adapt(self, rollouts: Rollout):
+        self.policy, _ = inner_step(self.policy, rollouts)
 
-    def step(self, all_trajectories: Trajectory):
+    def step(self, all_rollouts: Rollout):
         return outer_step(
-            self.meta_train_state, all_trajectories, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
+            self.meta_train_state, all_rollouts, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
         )
 
     def get_actions_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
@@ -493,9 +491,9 @@ if __name__ == "__main__":
 
     # agent setup
     envs.single_observation_space.dtype = np.float32
-    buffer = MetaLearningReplayBuffer(
+    buffer = MultiTaskRolloutBuffer(
         num_tasks=args.meta_batch_size,
-        trajectories_per_task=args.rollouts_per_task,
+        rollouts_per_task=args.rollouts_per_task,
         max_episode_steps=args.max_episode_steps,
     )
 
@@ -532,7 +530,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps):  # Outer step
         agent.reset_inner()
-        all_trajectories: List[Trajectory] = []
+        all_rollouts: List[Rollout] = []
 
         # Sampling step
         # Collect num_inner_gradient_steps D datasets + collect 1 D' dataset
@@ -543,19 +541,19 @@ if __name__ == "__main__":
                 buffer.push(obs, action, reward, truncated, log_probs, means, stds)
                 obs = next_obs
 
-            trajectories = buffer.get(**buffer_processing_kwargs)
-            all_trajectories.append(trajectories)
+            rollouts = buffer.get(**buffer_processing_kwargs)
+            all_rollouts.append(rollouts)
             buffer.reset()
 
-        writer.add_scalar("charts/mean_episodic_return", all_trajectories[-1].returns.mean(), global_step)
+        writer.add_scalar("charts/mean_episodic_return", all_rollouts[-1].returns.mean(), global_step)
 
         # Inner policy update for the sake of sampling close to adapted policy during the
         # computation of the objective.
         if inner_step < args.num_inner_gradient_steps:
-            agent.adapt(trajectories)
+            agent.adapt(rollouts)
 
     # Outer policy update
-    logs = agent.step(all_trajectories)
+    logs = agent.step(all_rollouts)
     print(f"Step {global_step}")
 
     # Evaluation
