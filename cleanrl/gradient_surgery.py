@@ -368,7 +368,7 @@ if __name__ == "__main__":
                 q_optimizer.zero_grad()
                 actor_optimizer.zero_grad()
                 for i in range(args.num_envs):
-                    assert 1 == 0, 'Need to sample data per task'
+                    data = rb.single_task_sample(task_idx=i, batch_size=128)
                     with torch.no_grad():
                         next_state_actions, next_state_log_pi, _ = actor.get_action(
                             data.next_observations
@@ -452,7 +452,7 @@ if __name__ == "__main__":
                         grads = grads - torch.min(projection_direction,
                                                           torch.zeros_like(projection_direction)) ** qf_grads_task[i]
                     return grads
-                #  torch.vmap() ?? 
+                #  torch.vmap() ??
                 proj_qf_grads = torch.sum(torch.stack(list(map(_project_gradients_qf, list(qf_proj_grad)))), dim=0)
                 proj_actor_grads = torch.sum(torch.stack(list(map(_project_gradients_actor,
                                                                   list(actor_proj_grad)))), dim=0)
