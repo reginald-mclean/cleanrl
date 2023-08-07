@@ -44,7 +44,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=15_000_000, help="total timesteps of the experiments")
-    parser.add_argument("--max-episode-steps", type=int, default=200, help="maximum number of timesteps in one episode during training")
+    parser.add_argument("--max-episode-steps", type=int, default=None, help="maximum number of timesteps in one episode during training")
     parser.add_argument("--evaluation-frequency", type=int, default=100_000, help="how many updates to before evaluating the agent")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50, help="the number episodes to run per evaluation")
 
@@ -58,7 +58,6 @@ def parse_args():
     parser.add_argument("--policy-lr", type=float, default=3e-4, help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
     parser.add_argument("--target-network-frequency", type=int, default=1, help="the frequency of updates for the target nerworks")
-    parser.add_argument("--noise-clip", type=float, default=0.5, help="noise clip parameter of the Target Policy Smoothing Regularization")
 
     parser.add_argument("--alpha", type=float, default=1.0, help="Entropy regularization coefficient.")
     parser.add_argument("--autotune", type=lambda x:bool(strtobool(x)), default=True, nargs="?", const=True,
@@ -101,21 +100,6 @@ class Actor(nn.Module):
 
         self.fc_mean = nn.Linear(400, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(400, np.prod(env.single_action_space.shape))
-        # action rescaling
-        self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.single_action_space.high - env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.single_action_space.high + env.single_action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
 
     def forward(self, x):
         x.shape[0]
@@ -149,7 +133,7 @@ class Actor(nn.Module):
         # Enforcing Action Bound
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(dim=1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
+        mean = torch.tanh(mean)
         return action, log_prob, mean
 
     def get_action_and_value(self, x):
@@ -217,6 +201,12 @@ if __name__ == "__main__":
     envs = make_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
     )
+    eval_envs = make_eval_envs(
+        benchmark,
+        args.seed,
+        args.max_episode_steps,
+        use_one_hot=use_one_hot_wrapper,
+    )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -274,8 +264,9 @@ if __name__ == "__main__":
                 [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
             )
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            with torch.no_grad():
+                actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            actions = actions.cpu().numpy()
 
         env_steps += actions.shape[0]
 
@@ -445,12 +436,6 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
-            eval_envs = make_eval_envs(
-                benchmark,
-                args.seed,
-                args.max_episode_steps,
-                use_one_hot=use_one_hot_wrapper,
-            )
             eval_success_rate, eval_returns = new_evaluation_procedure(
                 actor, eval_envs, args.evaluation_num_episodes, device
             )
