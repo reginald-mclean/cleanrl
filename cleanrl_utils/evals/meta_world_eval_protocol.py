@@ -1,10 +1,13 @@
+import time
+
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 from pynvml import *
-import time
+
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper, RandomTaskSelectWrapper
+
 
 def new_evaluation_procedure(
     agent,
@@ -19,8 +22,9 @@ def new_evaluation_procedure(
     start_time = time.time()
 
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
-        actions, _, _ = agent.get_action(torch.Tensor(obs).to(device))
-        obs, _, _, _, infos = eval_envs.step(actions.detach().cpu().numpy())
+        with torch.no_grad():
+            actions, _, _ = agent.get_action(torch.tensor(obs, device=device))
+        obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
                 # Skip the envs that are not done
