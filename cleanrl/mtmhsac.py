@@ -182,16 +182,14 @@ def sac_loss(
     qf1, qf2 = qfs
     qf1_target, qf2_target = target_qfs
     q_optimizer, actor_optimizer, a_optimizer = optimizers
+    alpha = get_log_alpha(log_alpha, NUM_TASKS, data).exp().detach()
 
     # QF Loss
     with torch.no_grad():
         next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
         qf1_next_target = qf1_target(data.next_observations, next_state_actions)
         qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-        min_qf_next_target = (
-            torch.min(qf1_next_target, qf2_next_target)
-            - get_log_alpha(log_alpha, NUM_TASKS, data).exp() * next_state_log_pi
-        )
+        min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
         next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
     qf1_a_values = qf1(data.observations, data.actions.type(torch.float32)).view(-1)
@@ -209,7 +207,7 @@ def sac_loss(
     qf1_pi = qf1(data.observations, pi)
     qf2_pi = qf2(data.observations, pi)
     min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-    actor_loss = ((get_log_alpha(log_alpha, NUM_TASKS, data) * log_pi) - min_qf_pi).mean()
+    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
     actor_optimizer.zero_grad()
     actor_loss.backward()
