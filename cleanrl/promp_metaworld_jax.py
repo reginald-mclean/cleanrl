@@ -190,7 +190,7 @@ def log_prob(dist: distrax.Distribution, pre_tanh_actions: ArrayLike) -> jax.Arr
     """Hack to get hopefully numerically stable log probs,
     see https://github.com/deepmind/distrax/issues/216#issuecomment-1668385413"""
     log_probs = dist.log_prob(pre_tanh_actions)
-    log_probs -= 2.0 * (jnp.log(2.0) - pre_tanh_actions - jax.nn.softplus(-2 * pre_tanh_actions))
+    log_probs -= jnp.sum(2.0 * (jnp.log(2.0) - pre_tanh_actions - jax.nn.softplus(-2 * pre_tanh_actions)), axis=-1)
     return log_probs
 
 
@@ -238,7 +238,8 @@ def sample_actions(
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     dist = actor.apply_fn(actor.params, obs)
-    action_samples, action_log_probs = dist.sample_and_log_prob(seed=action_key)
+    action_samples = dist.sample(seed=action_key)
+    action_log_probs = log_prob(dist, action_samples)
     return action_samples, action_log_probs, dist.loc, dist.scale_diag, key
 
 
