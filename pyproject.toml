@@ -36,9 +36,9 @@ free-mujoco-py = {version = "^2.1.6", optional = true}
 mkdocs-material = {version = "^8.4.3", optional = true}
 markdown-include = {version = "^0.7.0", optional = true}
 openrlbenchmark = {version = "^0.1.1b4", optional = true}
-jax = {version = "^0.3.17", optional = true}
-jaxlib = {version = "^0.3.15", optional = true}
-flax = {version = "^0.6.0", optional = true}
+jax = {version = "^0.4.13", optional = true}
+jaxlib = {version = "^0.4.13", optional = true}
+flax = {version = "^0.7.0", optional = true}
 distrax = {version = "^0.1.4", optional = true}
 optuna = {version = "^3.0.1", optional = true}
 optuna-dashboard = {version = "^0.7.2", optional = true}
@@ -107,6 +107,7 @@ qdagger_dqn_atari_jax_impalacnn = [
     "ale-py", "AutoROM", "opencv-python", # atari
     "jax", "jaxlib", "flax", # jax
 ]
-softmodules_metaworld_jax = [
-    "metaworld", "jax", "jaxlib", "flax", "distrax"  # jax
+metaworld_jax = [
+    "metaworld",  # metaworld
+    "jax", "jaxlib", "flax", "distrax"  # jax
 ]

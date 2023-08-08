@@ -5,3 +5,6 @@ mujoco
 tensorboard
 torch
 wandb
+jax
+jaxlib
+distrax
