@@ -32,6 +32,7 @@ class Rollout(NamedTuple):
     # Computed statistics about observed rewards
     returns: Optional[npt.NDArray] = None
     advantages: Optional[npt.NDArray] = None
+    episode_returns: Optional[npt.NDArray] = None
 
 
 class MultiTaskReplayBuffer:
@@ -225,6 +226,9 @@ class MultiTaskRolloutBuffer:
             gamma is not None and gae_lambda is not None
         ), "Gamma and gae_lambda must be provided if GAE computation is not disabled through the `as_is` flag."
 
+        # 0) Get episode rewards for logging
+        task_rollouts = task_rollouts._replace(episode_returns=np.sum(task_rollouts.rewards, axis=1))  # type: ignore
+
         # 1) Get returns
         task_rollouts = task_rollouts._replace(returns=self._get_returns(task_rollouts.rewards, gamma))  # type: ignore
 
@@ -281,6 +285,9 @@ class MultiTaskRolloutBuffer:
         assert (
             gamma is not None and gae_lambda is not None
         ), "Gamma and gae_lambda must be provided if GAE computation is not disabled through the `as_is` flag."
+
+        # 0) Get episode rewards for logging
+        all_rollouts = all_rollouts._replace(episode_returns=np.sum(all_rollouts.rewards, axis=2))  # type: ignore
 
         # 1) Get returns
         all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore

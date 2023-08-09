@@ -48,8 +48,17 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
         self.tasks = tasks
+        self.sample_tasks_on_reset = True
+
+    def toggle_task_sampling_on_reset(self, on: bool):
+        self.sample_tasks_on_reset = on
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        if self.sample_tasks_on_reset:
+            self._set_random_task()
+        return self.env.reset(seed=seed, options=options)
+
+    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
@@ -59,9 +68,7 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
 
     Pseudorandom implies no collisions therefore the next task in the list will be used cyclically.
 
-    Note that the task initialization is not every environment reset, but only when sample_tasks() is explicitly called.
-
-    For use in MetaRL algorithms with the Metaworld ML benchmark classes.
+    Doesn't sample new tasks on reset by default.
     """
 
     tasks: List[object]
@@ -71,10 +78,19 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
         self.current_task_idx = (self.current_task_idx + 1) % len(self.tasks)
         self.unwrapped.set_task(self.tasks[self.current_task_idx])
 
+    def toggle_task_sampling_on_reset(self, on: bool):
+        self.sample_tasks_on_reset = on
+
     def __init__(self, env: Env, tasks: List[object]):
         super().__init__(env)
+        self.sample_tasks_on_reset = False
         self.tasks = tasks
         self.current_task_idx = -1
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        if self.sample_tasks_on_reset:
+            self._set_pseudo_random_task()
+        return self.env.reset(seed=seed, options=options)
 
     def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_pseudo_random_task()
@@ -93,10 +109,16 @@ class AutoTerminateOnSuccessWrapper(gym.Wrapper):
 
     def __init__(self, env: Env):
         super().__init__(env)
+        self.terminate_on_success = True
+
+    def toggle_success_termination(self, on: bool):
+        self.terminate_on_success = on
 
     def step(self, action):
-        obs, reward, _, truncated, info = self.env.step(action)
-        return obs, reward, info["success"] == 1.0, truncated, info
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if self.terminate_on_success:
+            terminated = info["success"] == 1.0
+        return obs, reward, terminated, truncated, info
 
 
 # ---- Kept for compatibility ----

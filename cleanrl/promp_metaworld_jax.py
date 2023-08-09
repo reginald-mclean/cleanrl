@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument("--rollouts-per-task", type=int, default=10,
         help="the number of trajectories to collect per task in the meta batch")
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
-    parser.add_argument("--hidden-dim", type=int, default=64, help="the dimension of each hidden layer in the MLP")
+    parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
     parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
     parser.add_argument("--num-promp-steps", type=int, default=5, help="the number of ProMP steps without re-sampling")
@@ -117,7 +117,6 @@ def make_eval_envs(
     seed: int,
     meta_batch_size: int,
     max_episode_steps: Optional[int] = None,
-    terminate_on_success: bool = False,
 ) -> gym.vector.VectorEnv:
     assert meta_batch_size % len(benchmark.test_classes) == 0, "meta_batch_size must be divisible by envs_per_task"
     tasks_per_env = meta_batch_size // len(benchmark.test_classes)
@@ -125,10 +124,9 @@ def make_eval_envs(
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        if terminate_on_success:
-            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)  # TODO proper task selection
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.unwrapped.seed(seed)
         return env
 
@@ -500,6 +498,12 @@ if __name__ == "__main__":
     envs = make_envs(
         benchmark, meta_batch_size=args.meta_batch_size, seed=args.seed, max_episode_steps=args.max_episode_steps
     )
+    eval_envs = make_eval_envs(
+        benchmark=benchmark,
+        meta_batch_size=len(benchmark.test_classes),
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
+    )
     NUM_TASKS = len(benchmark.train_classes)
 
     # agent setup
@@ -560,13 +564,15 @@ if __name__ == "__main__":
             all_rollouts.append(rollouts)
             buffer.reset()
 
-            writer.add_scalar("charts/mean_episodic_return", all_rollouts[-1].returns.mean(), global_step)
-
             # Inner policy update for the sake of sampling close to adapted policy during the
             # computation of the objective.
             if _step < args.num_inner_gradient_steps:
                 print(f"- Adaptation step {_step}")
                 agent.adapt(rollouts)
+
+        mean_episodic_return = all_rollouts[-1].episode_returns.mean()
+        writer.add_scalar("charts/mean_episodic_return", mean_episodic_return, global_step)
+        print("- Mean episodic return: ", mean_episodic_return)
 
         # Outer policy update
         print("- Computing outer step")
@@ -576,28 +582,21 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print("- Evaluating...")
-            _make_eval_envs_common = partial(
-                make_eval_envs,
-                benchmark=benchmark,
-                meta_batch_size=len(benchmark.test_classes),
-                seed=args.seed,
-                max_episode_steps=args.max_episode_steps,
-            )
             eval_success_rate, eval_mean_return, key = metalearning_evaluation(
                 agent,
-                train_envs=_make_eval_envs_common(terminate_on_success=False),
-                eval_envs=_make_eval_envs_common(terminate_on_success=True),
+                eval_envs=eval_envs,
                 adaptation_steps=args.num_inner_gradient_steps,
                 adaptation_episodes=args.rollouts_per_task,
-                eval_episodes=3,
+                eval_episodes=50,
                 buffer_kwargs=buffer_processing_kwargs,
                 key=key,
             )
 
-            logs["charts/mean_success_rate"] = eval_success_rate
-            logs["charts/mean_evaluation_return"] = eval_mean_return
+            logs["charts/mean_success_rate"] = float(eval_success_rate)
+            logs["charts/mean_evaluation_return"] = float(eval_mean_return)
 
         # Logging
+        logs = jax.device_get(logs)
         for k, v in logs.items():
             writer.add_scalar(k, v, global_step)
         print(logs)
@@ -612,7 +611,9 @@ if __name__ == "__main__":
 
         # Checkpoint
         if args.save_model and global_step % args.save_model_frequency == 0 and global_step > 0:
-            ckpt_manager.save(step=global_step, items=agent.make_checkpoint() + {"key": key}, metrics=logs)
+            ckpt_manager.save(
+                step=global_step, items=agent.make_checkpoint() | {"key": key, "global_step": global_step}, metrics=logs
+            )
             print("- Saved Model")
 
     envs.close()

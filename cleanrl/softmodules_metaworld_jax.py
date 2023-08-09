@@ -21,7 +21,7 @@ import numpy as np
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
-from cleanrl_utils.evals.metaworld_jax_eval import evaluation_procedure
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
@@ -49,11 +49,8 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=15_000_000,
-        help="total timesteps of the experiments")
-    parser.add_argument("--epoch-size", type=int, default=200,
-        help="""if > 1, we'll collect epoch_size * num_envs samples, and then run epoch_size gradient steps.\
-            Otherwise, a gradient step will happen once every timestep after learning starts.""")
+    parser.add_argument("--total-timesteps", type=int, default=int(2e7),
+        help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=None,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
@@ -64,7 +61,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=128,
         help="the batch size of sample from the reply memory for each task")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
-    parser.add_argument("--evaluation-frequency", type=int, default=150_000,
+    parser.add_argument("--evaluation-frequency", type=int, default=200_000,
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
@@ -628,6 +625,7 @@ if __name__ == "__main__":
 
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
     envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
+    eval_envs = make_eval_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -666,7 +664,9 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    for global_step in range(args.total_timesteps):
+    for global_step in range(args.total_timesteps // NUM_TASKS):
+        total_steps = global_step * NUM_TASKS
+
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
@@ -691,91 +691,86 @@ if __name__ == "__main__":
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
 
-        # Store scaled actions
+        # Store data in the buffer
         rb.add(obs, real_next_obs, actions, rewards, terminations)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(f"global_step={global_step}, mean_episodic_return={np.mean(list(global_episodic_return))}")
+            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),
-                global_step,
+                total_steps,
             )
             writer.add_scalar(
                 "charts/mean_episodic_length",
                 np.mean(list(global_episodic_length)),
-                global_step,
+                total_steps,
             )
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            if global_step % args.epoch_size == 0:  # torchrl-style training loop
-                for epoch_step in range(args.epoch_size):
-                    current_step = global_step + epoch_step
+            # Sample a batch from replay buffer
+            data = rb.sample(args.batch_size)
+            observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
+            next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
+            batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
 
-                    # Sample a batch from replay buffer
-                    data = rb.sample(args.batch_size)
-                    observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-                    next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-                    batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
-                    logs = {}
+            # Update agent
+            (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
+                agent.actor,
+                agent.critic,
+                agent.alpha_train_state,
+                batch,
+                agent.target_entropy,
+                args.gamma,
+                key,
+            )
+            logs = jax.device_get(logs)
 
-                    # Update agent
-                    (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
-                        agent.actor,
-                        agent.critic,
-                        agent.alpha_train_state,
-                        batch,
-                        agent.target_entropy,
-                        args.gamma,
-                        key,
+            # update the target networks
+            if global_step % args.target_network_frequency == 0:
+                agent.soft_update_target_networks(args.tau)
+
+            # Logging
+            if global_step % 100 == 0:
+                for _key, value in logs.items():
+                    writer.add_scalar(_key, value, total_steps)
+                print("SPS:", int(total_steps / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(total_steps / (time.time() - start_time)), total_steps)
+
+            # Evaluation
+            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
+                eval_success_rate, eval_returns, eval_success_per_task, key = evaluation(
+                    agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
+                )
+                eval_metrics = {
+                    "charts/mean_success_rate": float(eval_success_rate),
+                    "charts/mean_evaluation_return": float(eval_returns),
+                } | {
+                    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+                }
+
+                for k, v in eval_metrics.items():
+                    writer.add_scalar(k, v, total_steps)
+                print(
+                    f"global_step={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
+                    + f" return: {eval_returns:.4f}"
+                )
+
+                # Checkpointing
+                if args.save_model:
+                    ckpt = agent.get_ckpt()
+                    ckpt["rng_key"] = key
+                    ckpt["global_step"] = global_step
+                    save_args = orbax_utils.save_args_from_target(ckpt)
+                    ckpt_manager.save(
+                        step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=logs | eval_metrics
                     )
-
-                    # update the target networks
-                    if current_step % args.target_network_frequency == 0:
-                        agent.soft_update_target_networks(args.tau)
-
-                    # Logging
-                    if current_step % 100 == 0:
-                        logs = jax.device_get(logs)
-                        for _key, value in logs.items():
-                            writer.add_scalar(_key, value, global_step)
-                        print("SPS:", int(global_step / (time.time() - start_time)))
-                        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-                    # Evaluation
-                    if (current_step + 1) % args.evaluation_frequency == 0:
-                        eval_envs = make_eval_envs(
-                            benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-                        )
-                        print("evaluating...")
-                        eval_success_rate, eval_returns, key = evaluation_procedure(
-                            agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
-                        )
-                        metrics = {
-                            "charts/mean_success_rate": float(eval_success_rate),
-                            "charts/mean_evaluation_return": float(eval_returns),
-                        }
-                        for k, v in metrics.items():
-                            writer.add_scalar(k, v, global_step)
-                        print(
-                            f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
-                            + f" return: {eval_returns:.4f}"
-                        )
-
-                        # Checkpointing
-                        if args.save_model:
-                            ckpt = agent.get_ckpt()
-                            ckpt["rng_key"] = key
-                            ckpt["global_step"] = global_step
-                            save_args = orbax_utils.save_args_from_target(ckpt)
-                            ckpt_manager.save(
-                                step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=metrics
-                            )
-                            print(f"model saved to {ckpt_manager.directory}")
+                    print(f"model saved to {ckpt_manager.directory}")
 
     envs.close()
     writer.close()
