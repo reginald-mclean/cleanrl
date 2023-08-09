@@ -60,22 +60,20 @@ def parse_args():
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95,
+    parser.add_argument("--gae-lambda", type=float, default=1.0,
         help="the lambda for the general advantage estimation")
     # ProMP 
-    parser.add_argument("--meta-batch-size", type=int, default=10,
+    parser.add_argument("--meta-batch-size", type=int, default=20,
         help="the number of tasks to sample and train on in parallel")
     parser.add_argument("--rollouts-per-task", type=int, default=10,
         help="the number of trajectories to collect per task in the meta batch")
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
-    parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
+    parser.add_argument("--hidden-dim", type=int, default=100, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
     parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
     parser.add_argument("--num-promp-steps", type=int, default=5, help="the number of ProMP steps without re-sampling")
     parser.add_argument("--clip-eps", type=float, default=0.3, help="clipping range")
     parser.add_argument("--inner-kl-penalty", type=float, default=5e-4, help="kl penalty parameter eta")
-    parser.add_argument("--adaptive-inner-kl-penalty", type=lambda x: bool(strtobool(x)), default=False, nargs="?",
-        const=True, help="whether to use an adaptive or fixed KL-penalty coefficient")
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
         help="number of inner / adaptation gradient steps")
 
@@ -149,13 +147,16 @@ class MLPTorso(nn.Module):
     output_dim: int
     hidden_dim: int = 64
     activate_last: bool = False
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
+        CustomDense = partial(nn.Dense, kernel_init=self.kernel_init)
+
         for i in range(self.num_hidden_layers):
-            x = nn.Dense(self.hidden_dim, name=f"layer_{i}")(x)  # type: ignore
+            x = CustomDense(self.hidden_dim, name=f"layer_{i}")(x)
             x = nn.tanh(x)
-        x = nn.Dense(self.output_dim, name=f"layer_{self.num_hidden_layers}")(x)  # type: ignore
+        x = CustomDense(self.output_dim, name=f"layer_{self.num_hidden_layers}")(x)
         if self.activate_last:
             x = nn.tanh(x)
         return x
@@ -169,27 +170,17 @@ class GaussianPolicy(nn.Module):
     hidden_dim: int
 
     LOG_STD_MIN: float = np.log(1e-6)
-    LOG_STD_MAX: float = 2.0
 
     @nn.compact
     def __call__(self, x: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        x = MLPTorso(
+        mean = MLPTorso(
             num_hidden_layers=self.num_layers,
             hidden_dim=self.hidden_dim,
-            output_dim=2 * self.num_actions,
+            output_dim=self.num_actions,
         )(x)
-        mean, log_std = jnp.split(x, 2, axis=-1)
-        log_std = jnp.clip(log_std, a_min=self.LOG_STD_MIN, a_max=self.LOG_STD_MAX)
+        log_std = self.param("log_std", nn.initializers.ones_init(), (self.num_actions,))
+        log_std = jnp.minimum(log_std, self.LOG_STD_MIN)
         return mean, log_std
-
-
-@jax.jit
-def log_prob(dist: distrax.Distribution, pre_tanh_actions: ArrayLike) -> jax.Array:
-    """Hack to get hopefully numerically stable log probs,
-    see https://github.com/deepmind/distrax/issues/216#issuecomment-1668385413"""
-    log_probs = dist.log_prob(pre_tanh_actions)
-    log_probs -= jnp.sum(2.0 * (jnp.log(2.0) - pre_tanh_actions - jax.nn.softplus(-2 * pre_tanh_actions)), axis=-1)
-    return log_probs
 
 
 class MetaVectorPolicy(nn.Module):
@@ -236,8 +227,7 @@ def sample_actions(
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     dist = actor.apply_fn(actor.params, obs)
-    action_samples = dist.sample(seed=action_key)
-    action_log_probs = log_prob(dist, action_samples)
+    action_samples, action_log_probs = dist.sample_and_log_prob(seed=action_key)
     return action_samples, action_log_probs, dist.loc, dist.scale_diag, key
 
 
@@ -260,7 +250,7 @@ def inner_step(
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
         theta_dist = policy.apply_fn(_theta, rollouts.observations)
-        theta_log_probs = jnp.expand_dims(log_prob(theta_dist, rollouts.actions), -1)
+        theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
 
         if return_kl:
             kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
@@ -300,7 +290,7 @@ def outer_step(
         # Compute J^Clip, Equation 11
         rollouts = all_rollouts[-1]
         new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
-        new_param_log_probs = jnp.expand_dims(log_prob(new_param_dist, rollouts.actions), -1)
+        new_param_log_probs = jnp.expand_dims(new_param_dist.log_prob(rollouts.actions), -1)
 
         likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
         outer_objective = jnp.minimum(
@@ -556,7 +546,7 @@ if __name__ == "__main__":
             print(f"- Collecting inner step {_step}")
             while not buffer.ready:
                 action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
-                next_obs, reward, _, truncated, _ = envs.step(np.tanh(action))
+                next_obs, reward, _, truncated, _ = envs.step(action)
                 buffer.push(obs, action, reward, truncated, log_probs, means, stds)
                 obs = next_obs
 

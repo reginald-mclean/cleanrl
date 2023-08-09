@@ -768,7 +768,7 @@ if __name__ == "__main__":
                     ckpt["global_step"] = global_step
                     save_args = orbax_utils.save_args_from_target(ckpt)
                     ckpt_manager.save(
-                        step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=logs | eval_metrics
+                        step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=eval_metrics
                     )
                     print(f"model saved to {ckpt_manager.directory}")
 

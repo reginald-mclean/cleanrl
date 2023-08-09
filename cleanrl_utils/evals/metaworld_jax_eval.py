@@ -67,7 +67,7 @@ def metalearning_evaluation(
     for i in range(adaptation_steps):
         while not eval_buffer.ready:
             action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
-            next_obs, reward, _, truncated, _ = eval_envs.step(np.tanh(action))
+            next_obs, reward, _, truncated, _ = eval_envs.step(action)
             eval_buffer.push(obs, action, reward, truncated, log_probs, means, stds)
             obs = next_obs
 
