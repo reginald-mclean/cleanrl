@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument("--rollouts-per-task", type=int, default=10,
         help="the number of trajectories to collect per task in the meta batch")
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
-    parser.add_argument("--hidden-dim", type=int, default=100, help="the dimension of each hidden layer in the MLP")
+    parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
     parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
     parser.add_argument("--num-promp-steps", type=int, default=5, help="the number of ProMP steps without re-sampling")
@@ -178,8 +178,12 @@ class GaussianPolicy(nn.Module):
             hidden_dim=self.hidden_dim,
             output_dim=self.num_actions,
         )(x)
-        log_std = self.param("log_std", nn.initializers.ones_init(), (self.num_actions,))
-        log_std = jnp.minimum(log_std, self.LOG_STD_MIN)
+        # fmt: off
+        #                               zeros_init = log(ones_init)
+        log_std = self.param("log_std", nn.initializers.zeros_init(), (self.num_actions,))
+        log_std = jnp.maximum(log_std, self.LOG_STD_MIN)
+        # fmt: on
+        log_std = jnp.broadcast_to(log_std, mean.shape)
         return mean, log_std
 
 
@@ -298,9 +302,9 @@ def outer_step(
             jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * rollouts.advantages,
         )
 
-        mean_kl = jnp.stack(kls).mean(axis=1).sum()
+        mean_kl = jnp.stack(kls).mean()
 
-        return -(outer_objective.mean(axis=1).sum() - eta * mean_kl), mean_kl  # Equation 13
+        return -(outer_objective.mean() - eta * mean_kl), mean_kl  # Equation 13
 
     # Update theta
     loss_before = None
@@ -494,7 +498,6 @@ if __name__ == "__main__":
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
     )
-    NUM_TASKS = len(benchmark.train_classes)
 
     # agent setup
     envs.single_observation_space.dtype = np.float32
@@ -537,7 +540,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps):  # Outer step
         print(f"Step {global_step}")
-        agent.init_multitask_policy(NUM_TASKS, agent.train_state.params)
+        agent.init_multitask_policy(envs.num_envs, agent.train_state.params)
         all_rollouts: List[Rollout] = []
 
         # Sampling step
