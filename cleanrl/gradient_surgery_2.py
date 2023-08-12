@@ -1,3 +1,6 @@
+import sys
+sys.path.append('/home/reggiemclean/gradientSurgery/cleanrl')
+
 import argparse
 import os
 import random
@@ -18,7 +21,9 @@ from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedur
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl.cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
+print(os.getcwd())
+
+from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 
 DISABLE_COMPILE = os.environ.get("DISABLE_COMPILE", False)
 
@@ -424,7 +429,7 @@ if __name__ == "__main__":
                     qfs=(qf1, qf2),
                     target_qfs=(qf1_target, qf2_target),
                     log_alpha=log_alpha,
-                    data=rb,
+                    rb=rb,
                     autotune=args.autotune,
                     target_entropy=target_entropy,
                     optimizers=(q_optimizer, actor_optimizer, a_optimizer),
