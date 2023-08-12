@@ -191,6 +191,8 @@ def sac_loss(
     autotune: bool = True,
     target_entropy: float = 0.0,
     optimizers=Tuple[optim.Optimizer, ...],
+    qf_grad_num_elements: list = [],
+    actor_grad_num_elements: list = [],
 ) -> dict:
     qf1, qf2 = qfs
     qf1_target, qf2_target = target_qfs
@@ -421,6 +423,14 @@ if __name__ == "__main__":
             global_step > args.learning_starts
             and global_step % args.gradient_steps == 0
         ):  # torchrl-style training loop
+            qf_grad_num_elements = [p.numel() if p.requires_grad is True else 0 for group in q_optimizer.param_groups
+                                    for p in group['params']]
+            qf_grad_shapes = [p.shape if p.requires_grad is True else None for group in q_optimizer.param_groups
+                              for p in group['params']]
+            actor_grad_num_element = [p.numel() if p.requires_grad is True else 0 for group in
+                                      actor_optimizer.param_groups for p in group['params']]
+            actor_grad_shapes = [p.shape if p.requires_grad is True else None for group in actor_optimizer.param_groups
+                                 for p in group['params']]
             for epoch_step in range(args.gradient_steps):
                 current_step = global_step + epoch_step
 
@@ -433,6 +443,8 @@ if __name__ == "__main__":
                     autotune=args.autotune,
                     target_entropy=target_entropy,
                     optimizers=(q_optimizer, actor_optimizer, a_optimizer),
+                    qf_grad_num_elements=qf_grad_num_elements,
+                    actor_grad_num_elements=actor_grad_num_element,
                 )
 
                 random.shuffle(qf_grad_tasks)
