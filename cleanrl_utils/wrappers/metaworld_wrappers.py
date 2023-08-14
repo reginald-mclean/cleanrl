@@ -381,3 +381,38 @@ class SyncVectorEnv(VectorEnv):
                 )
 
         return True
+
+class RL2Env(gym.Wrapper):
+    """Environment wrapper for RL2.
+
+    In RL2, observation is concatenated with previous action,
+    reward and terminal signal to form new observation.
+
+    Args:
+        env (Environment): An env that will be wrapped.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        obs_flat_dim = np.prod(self.env.observation_space.shape)
+        action_flat_dim = np.prod(self.env.action_space.shape)
+        self._observation_space = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+            shape=(obs_flat_dim + action_flat_dim + 1 + 1,)
+        )
+
+    def step(self, action):
+        next_state, reward, terminate, truncate, info = self.env.step(action)
+        next_state = np.concatenate([
+            next_state, action, [reward], [terminate]
+        ])
+        return next_state, reward, terminate, truncate, info
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        obs = np.concatenate(
+            [obs,
+             np.zeros(self.env.action_space.shape), [0], [0]])
+
+        return obs, info
