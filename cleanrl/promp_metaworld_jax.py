@@ -420,7 +420,7 @@ class ProMP:
     def get_actions_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
         return get_actions_log_probs_and_dists(self.policy, obs, key)
 
-    def get_actions_eval(self, obs: ArrayLike, key: jax.random.PRNGKey):
+    def get_action(self, obs: ArrayLike, key: jax.random.PRNGKey):
         actions, _, _, _, key = get_actions_log_probs_and_dists(self.policy, obs, key)
         return actions, key
 
@@ -560,7 +560,7 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print("- Evaluating...")
-            eval_success_rate, eval_mean_return, key = metalearning_evaluation(
+            eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = metalearning_evaluation(
                 agent,
                 eval_envs=eval_envs,
                 adaptation_steps=args.num_inner_gradient_steps,
@@ -573,6 +573,8 @@ if __name__ == "__main__":
 
             logs["charts/mean_success_rate"] = float(eval_success_rate)
             logs["charts/mean_evaluation_return"] = float(eval_mean_return)
+            for i, (env_name, _) in enumerate(benchmark.test_classes.items()):
+                logs[f"charts/{env_name}_success_rate"] = float(eval_success_rate_per_task[i])
 
         # Logging
         logs = jax.device_get(logs)

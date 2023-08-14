@@ -82,9 +82,9 @@ def metalearning_evaluation(
 
         # Evaluation
         eval_envs.call("toggle_success_termination", True)
-        mean_success_rate, mean_return, success_rate_per_task, key = evaluation(agent, eval_envs, eval_episodes, key)
+        mean_success_rate, mean_return, _success_rate_per_task, key = evaluation(agent, eval_envs, eval_episodes, key)
         mean_success_rate += mean_success_rate
         mean_return += mean_return
-        success_rate_per_task[i] = success_rate_per_task
+        success_rate_per_task[i] = _success_rate_per_task
 
-    return mean_success_rate / num_evals, mean_return / num_evals, success_rate_per_task / num_evals, key
+    return mean_success_rate / num_evals, mean_return / num_evals, (success_rate_per_task).mean(axis=0), key
