@@ -26,6 +26,7 @@ from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
 from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
+from jax.flatten_util import ravel_pytree
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
@@ -62,7 +63,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=1.0,
         help="the lambda for the general advantage estimation")
-    # ProMP 
+    # MAML 
     parser.add_argument("--meta-batch-size", type=int, default=20,
         help="the number of tasks to sample and train on in parallel")
     parser.add_argument("--rollouts-per-task", type=int, default=10,
@@ -71,12 +72,17 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
     parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
-    parser.add_argument("--num-promp-steps", type=int, default=5, help="the number of ProMP steps without re-sampling")
-    parser.add_argument("--clip-eps", type=float, default=0.3, help="clipping range")
-    parser.add_argument("--inner-kl-penalty", type=float, default=5e-4, help="kl penalty parameter eta")
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
         help="number of inner / adaptation gradient steps")
-
+    # TRPO
+    parser.add_argument("--delta", type=float, default=0.01,
+        help="the value the KL divergence is constrianed to in TRPO")
+    parser.add_argument("--cg-iters", type=int, default=10,
+        help="the maximum number of iterations of the conjugate gradient algorithm")
+    parser.add_argument("--backtrack-ratio", type=float, default=0.8,
+        help="the backtrack ratio in the line search for TRPO (exponential decay rate)")
+    parser.add_argument("--max-backtrack-iters", type=int, default=15,
+        help="the maximum number of iterations in the line search for TRPO")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -231,84 +237,106 @@ class MetaTrainState(TrainState):
     inner_train_state: TrainState
 
 
-@partial(jax.jit, static_argnames=("return_kl",))
-def inner_step(
-    policy: TrainState, rollouts: Rollout, return_kl: bool = False
-) -> Tuple[TrainState, Optional[jax.Array]]:
+@jax.jit
+def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
     assert rollouts.log_probs is not None and rollouts.means is not None and rollouts.stds is not None
 
-    def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
-        theta_dist = policy.apply_fn(_theta, rollouts.observations)
-        theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
+    def inner_opt_objective(_theta: FrozenDict):
+        log_probs = jnp.expand_dims(policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions), -1)
+        return -(log_probs * rollouts.advantages).mean()
 
-        if return_kl:
-            kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
-        else:
-            kl = None
-
-        ratio = jnp.exp(theta_log_probs - rollouts.log_probs)
-        return -(ratio * rollouts.advantages).mean(), kl
-
-    grads, kl = jax.grad(inner_opt_objective, has_aux=True)(policy.params)
+    grads = jax.grad(inner_opt_objective)(policy.params)
     updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step, SGD
 
-    return updated_policy, kl
+    return updated_policy
 
 
-@partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks"))
+@partial(jax.jit, static_argnames=("num_tasks", "delta", "cg_iters", "backtrack_ratio", "max_backtrack_iters"))
 def outer_step(
     train_state: MetaTrainState,
     all_rollouts: List[Rollout],
-    eta: float,
-    clip_eps: float,
-    num_grad_steps: int,
     num_tasks: int,
+    delta: float,
+    cg_iters: int,
+    backtrack_ratio: float,
+    max_backtrack_iters: int,
 ) -> Tuple[MetaTrainState, dict]:
-    def promp_loss(theta: FrozenDict):
+    def maml_loss(theta: FrozenDict):
         vec_theta = MetaVectorPolicy.expand_params(theta, num_tasks)
         inner_train_state = train_state.inner_train_state.replace(params=vec_theta)
-        kls = []
 
-        # Adaptation steps using J^LR to go from theta to theta^\prime
+        # Adaptation steps
         for i in range(len(all_rollouts) - 1):
             rollouts = all_rollouts[i]
-            inner_train_state, kl = inner_step(inner_train_state, rollouts, return_kl=True)
-            kls.append(kl)
+            inner_train_state = inner_step(inner_train_state, rollouts)
 
         # Inner Train State now has theta^\prime
-        # Compute J^Clip, Equation 11
+        # Compute MAML objective
         rollouts = all_rollouts[-1]
         new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
         new_param_log_probs = jnp.expand_dims(new_param_dist.log_prob(rollouts.actions), -1)
 
         likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
-        outer_objective = jnp.minimum(
-            likelihood_ratio * rollouts.advantages,
-            jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * rollouts.advantages,
+        outer_objective = likelihood_ratio * rollouts.advantages
+        return -outer_objective.mean()
+
+    # TRPO
+    rollouts = all_rollouts[-1]
+
+    def kl_constraint(params: FrozenDict, inputs: Rollout, targets: distrax.Distribution):
+        vec_theta = MetaVectorPolicy.expand_params(params, num_tasks)
+        return train_state.inner_train_state.apply_fn(vec_theta, inputs.observations).kl_divergence(targets).mean()
+
+    target_dist = distrax.MultivariateNormalDiag(rollouts.means, rollouts.stds)
+    kl_before = kl_constraint(train_state.params, rollouts, target_dist)
+
+    ## Compute search direction by solving for Ax = g
+
+    def hvp(x):
+        hvp_deep = optax.hvp(kl_constraint, v=x, params=train_state.params, inputs=rollouts, targets=target_dist)
+        return ravel_pytree(hvp_deep)[0]
+
+    loss_before, opt_objective_grads = jax.value_and_grad(maml_loss)(train_state.params)
+    g, unravel_params = ravel_pytree(opt_objective_grads)
+    s, _ = jax.scipy.sparse.linalg.cg(hvp, g, maxiter=cg_iters)
+
+    ## Compute optimal step beta
+    beta = jnp.sqrt(2.0 * delta * (1 / (jnp.dot(s, hvp(s)) + 1e-8)))
+
+    ## Line search
+    s = unravel_params(s)
+
+    def _cond_fn(val):
+        step, loss, kl, _ = val
+        return ((kl > delta) | (loss >= loss_before)) & (step < max_backtrack_iters)
+
+    def _body_fn(val):
+        step, loss, kl, _ = val
+        new_params = jax.tree_util.tree_map(
+            lambda theta_i, s_i: theta_i - (backtrack_ratio**step) * beta * s_i, train_state.params, s
         )
+        loss, kl = maml_loss(new_params), kl_constraint(new_params, rollouts, target_dist)
+        return step + 1, loss, kl, new_params
 
-        mean_kl = jnp.stack(kls).mean()
+    step, loss, kl, new_params = jax.lax.while_loop(
+        _cond_fn, _body_fn, init_val=(0, loss_before, jnp.finfo(jnp.float32).max, train_state.params)
+    )
 
-        return -(outer_objective.mean() - eta * mean_kl), mean_kl  # Equation 13
-
-    # Update theta
-    loss_before = None
-    for i in range(num_grad_steps):
-        (loss, inner_kl), grads = jax.value_and_grad(promp_loss, has_aux=True)(train_state.params)
-        if loss_before is None:
-            loss_before = loss
-        train_state = train_state.apply_gradients(grads=grads)
-
-    (loss_after, inner_kl) = promp_loss(train_state.params)
+    # Param updates
+    # Reject params if line search failed
+    params = jax.lax.cond((loss < loss_before) & (kl <= delta), lambda: new_params, lambda: train_state.params)
+    train_state = train_state.replace(params=params)
 
     return train_state, {
         "losses/loss_before": jnp.mean(loss_before),
-        "losses/loss_after": jnp.mean(loss_after),
-        "losses/kl_inner": inner_kl,
+        "losses/loss_after": jnp.mean(loss),
+        "losses/kl_before": kl_before,
+        "losses/kl_after": kl,
+        "losses/backtrack_steps": step,
     }
 
 
-# NOTE ProMP Uses a Linear time-dependent return baseline model from
+# NOTE MAML Uses a Linear time-dependent return baseline model from
 # Duan et al. 2016, "Benchmarking Deep Reinforcement Learning for Continuous Control" as its
 # baseline, rather than a neural network used as a learned value function like e.g. PPO.
 
@@ -358,7 +386,7 @@ class LinearFeatureBaseline:
         return baseline
 
 
-class ProMP:
+class MAMLTRPO:
     def __init__(
         self,
         envs: gym.vector.VectorEnv,
@@ -366,9 +394,10 @@ class ProMP:
         hidden_dim: int,
         init_key: jax.random.PRNGKey,
         init_obs: ArrayLike,
-        eta: float,
-        clip_eps: float,
-        num_grad_steps: int,
+        delta: float,
+        cg_iters: int,
+        backtrack_ratio: float,
+        max_backtrack_iters: int,
     ):
         self.num_tasks = envs.unwrapped.num_envs
 
@@ -389,12 +418,13 @@ class ProMP:
             tx=optax.adam(args.meta_lr),  # outer optimizer
         )
 
-        self.fit_baseline = LinearFeatureBaseline.fit_baseline
+        # TRPO
+        self.delta = delta
+        self.cg_iters = cg_iters
+        self.backtrack_ratio = backtrack_ratio
+        self.max_backtrack_iters = max_backtrack_iters
 
-        # Outer step hparams
-        self._eta = eta
-        self._clip_eps = clip_eps
-        self._num_grad_steps = num_grad_steps
+        self.fit_baseline = LinearFeatureBaseline.fit_baseline
 
     def init_multitask_policy(self, num_tasks: int, params: FrozenDict) -> None:
         self.num_tasks = num_tasks
@@ -409,11 +439,17 @@ class ProMP:
         )
 
     def adapt(self, rollouts: Rollout) -> None:
-        self.policy, _ = inner_step(self.policy, rollouts)
+        self.policy = inner_step(self.policy, rollouts)
 
     def step(self, all_rollouts: Rollout) -> dict:
         self.train_state, logs = outer_step(
-            self.train_state, all_rollouts, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
+            self.train_state,
+            all_rollouts,
+            self.num_tasks,
+            self.delta,
+            self.cg_iters,
+            self.backtrack_ratio,
+            self.max_backtrack_iters,
         )
         return logs
 
@@ -496,15 +532,16 @@ if __name__ == "__main__":
     obs = np.stack(obs)
 
     key, agent_init_key = jax.random.split(key)
-    agent = ProMP(
+    agent = MAMLTRPO(
         envs=envs,
         num_layers=args.num_layers,
         hidden_dim=args.hidden_dim,
         init_key=agent_init_key,
         init_obs=jax.device_put(obs),
-        eta=args.inner_kl_penalty,
-        clip_eps=args.clip_eps,
-        num_grad_steps=args.num_promp_steps,
+        delta=args.delta,
+        cg_iters=args.cg_iters,
+        backtrack_ratio=args.backtrack_ratio,
+        max_backtrack_iters=args.max_backtrack_iters,
     )
 
     network_args = {
