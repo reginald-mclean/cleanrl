@@ -312,6 +312,7 @@ def _make_envs_common(
 
 
 make_envs = partial(_make_envs_common, terminate_on_success=False)
+make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
 
 
 class MetaEpisode:
@@ -525,6 +526,46 @@ def _flatten(T: int, N: int, _tensor: torch.Tensor) -> torch.Tensor:
     """
     return _tensor.view(T * N, *_tensor.size()[2:])
 
+def rl2_evaluation(
+    agent,
+    eval_envs: gym.vector.VectorEnv,
+    num_episodes: int,
+    device = torch.device("cpu")
+):
+    obs, _ = eval_envs.reset()
+    successes = np.zeros(eval_envs.num_envs)
+    episodic_returns = [[] for _ in range(eval_envs.num_envs)]
+
+    start_time = time.time()
+    actor_state = torch.zeros_like(1, 1, 128, device=device)
+    critic_state = torch.zeros_like(1, 1, 128, device=device)
+
+    while not all(len(returns) >= num_episodes for returns in episodic_returns):
+        with torch.no_grad():
+            actions, _, _ = agent.get_action(torch.tensor(obs, device=device))
+            agent_dict = agent.get_action_and_value(torch.tensor(obs, device=device),
+                                    actor_state, critic_state)
+        actions = agent_dict["action"]
+        obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
+        actor_state = agent_dict["actor_state"]
+        critic_state = agent_dict["critic_state"]
+
+        if "final_info" in infos:
+            for i, info in enumerate(infos["final_info"]):
+                # Skip the envs that are not done
+                if info is None:
+                    continue
+                episodic_returns[i].append(info["episode"]["r"])
+                # Discard any extra episodes from envs that ran ahead
+                if len(episodic_returns[i]) <= num_episodes:
+                    successes[i] += int(info["success"])
+
+    episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
+
+    print(f"Evaluation time: {time.time() - start_time:.2f}s")
+
+    return (successes / num_episodes).mean(), np.mean(episodic_returns)
+
 if __name__ == "__main__":
     import torch.multiprocessing as mp
 
@@ -565,6 +606,11 @@ if __name__ == "__main__":
     # env setup
     envs = make_envs(benchmark, args.seed, args.meta_episode_length)
     keys = list(benchmark.train_classes.keys())
+
+    eval_envs = make_eval_envs(
+        benchmark,
+        args.seed,
+    )
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -749,6 +795,10 @@ if __name__ == "__main__":
                     )
 
         if global_step % 500 == 0 and global_episodic_return:
+            print(f"Evaluating... at global_step={global_step}")
+            eval_success_rate, eval_returns = rl2_evaluation(
+                actor, eval_envs, args.evaluation_num_episodes, device
+            )
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(global_episodic_return),
