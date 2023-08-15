@@ -32,7 +32,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
+    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -87,6 +87,8 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--eval-freq", type=int, default=2,
         help="how many updates to do before evaluating the agent")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
+        help="the number episodes to run per evaluation")
 
     args = parser.parse_args()
 
@@ -289,6 +291,7 @@ def _make_envs_common(
     seed: int,
     max_episode_steps: Optional[int] = None,
     terminate_on_success: bool = False,
+    train=True,
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls()
@@ -297,15 +300,23 @@ def _make_envs_common(
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = metaworld_wrappers.RL2Env(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        if train:
+            tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        else:
+            tasks = [task for task in benchmark.test_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
 
+    if train:
+        classes = benchmark.train_classes
+    else:
+        classes = benchmark.test_classes
+
     return gym.vector.SyncVectorEnv(
         [
             partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
-            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+            for env_id, (name, env_cls) in enumerate(classes.items())
         ]
     )
 
@@ -599,16 +610,21 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
+    elif args.env_id == "ML10":
+        benchmark = metaworld.ML10(seed=args.seed)
     elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
+    elif args.env_id == "ML50":
+        benchmark = metaworld.ML50(seed=args.seed)
 
     # env setup
-    envs = make_envs(benchmark, args.seed, args.meta_episode_length)
+    envs = make_envs(benchmark, args.seed, args.meta_episode_length, train=True)
     keys = list(benchmark.train_classes.keys())
 
     eval_envs = make_eval_envs(
         benchmark,
         args.seed,
+        train=args.env_id in ["MT10", "MT50"]
     )
 
     NUM_TASKS = len(benchmark.train_classes)
@@ -793,7 +809,7 @@ if __name__ == "__main__":
                         "charts/SPS", int(global_step / (time.time() - start_time)), global_step
                     )
 
-        if global_step % 500 == 0 and global_episodic_return:
+        if global_step % 200 == 0 and global_episodic_return:
             print(f"Evaluating... at global_step={global_step}")
             eval_success_rate, eval_returns = rl2_evaluation(
                 agent, eval_envs, args.evaluation_num_episodes, device
