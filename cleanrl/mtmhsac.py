@@ -18,7 +18,7 @@ from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedur
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl.cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
+from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 
 DISABLE_COMPILE = os.environ.get("DISABLE_COMPILE", False)
 
