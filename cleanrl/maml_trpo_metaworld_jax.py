@@ -48,8 +48,6 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
-    parser.add_argument('--save-model-frequency', type=int, default=10,
-        help="the frequency of saving the model")
     parser.add_argument("--evaluation-frequency", type=int, default=10,
         help="the frequency of evaluating the model (in outer steps)")
 
@@ -70,7 +68,7 @@ def parse_args():
         help="the number of trajectories to collect per task in the meta batch")
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
-    parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
+    parser.add_argument("--inner-lr", type=float, default=0.05, help="the inner (adaptation) step size")
     parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
         help="number of inner / adaptation gradient steps")
@@ -614,6 +612,14 @@ if __name__ == "__main__":
             for i, (env_name, _) in enumerate(benchmark.test_classes.items()):
                 logs[f"charts/{env_name}_success_rate"] = float(eval_success_rate_per_task[i])
 
+            if args.save_model:  # Checkpoint
+                ckpt_manager.save(
+                    step=global_step,
+                    items=agent.make_checkpoint() | {"key": key, "global_step": global_step},
+                    metrics=logs,
+                )
+                print("- Saved Model")
+
         # Logging
         logs = jax.device_get(logs)
         for k, v in logs.items():
@@ -627,13 +633,6 @@ if __name__ == "__main__":
         # Set tasks for next iteration
         obs, _ = zip(*envs.call("sample_tasks"))
         obs = np.stack(obs)
-
-        # Checkpoint
-        if args.save_model and global_step % args.save_model_frequency == 0 and global_step > 0:
-            ckpt_manager.save(
-                step=global_step, items=agent.make_checkpoint() | {"key": key, "global_step": global_step}, metrics=logs
-            )
-            print("- Saved Model")
 
     envs.close()
     writer.close()

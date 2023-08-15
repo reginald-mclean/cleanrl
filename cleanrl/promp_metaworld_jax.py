@@ -47,8 +47,6 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
-    parser.add_argument('--save-model-frequency', type=int, default=10,
-        help="the frequency of saving the model")
     parser.add_argument("--evaluation-frequency", type=int, default=10,
         help="the frequency of evaluating the model (in outer steps)")
 
@@ -576,6 +574,14 @@ if __name__ == "__main__":
             for i, (env_name, _) in enumerate(benchmark.test_classes.items()):
                 logs[f"charts/{env_name}_success_rate"] = float(eval_success_rate_per_task[i])
 
+            if args.save_model:  # Checkpoint
+                ckpt_manager.save(
+                    step=global_step,
+                    items=agent.make_checkpoint() | {"key": key, "global_step": global_step},
+                    metrics=logs,
+                )
+                print("- Saved Model")
+
         # Logging
         logs = jax.device_get(logs)
         for k, v in logs.items():
@@ -589,13 +595,6 @@ if __name__ == "__main__":
         # Set tasks for next iteration
         obs, _ = zip(*envs.call("sample_tasks"))
         obs = np.stack(obs)
-
-        # Checkpoint
-        if args.save_model and global_step % args.save_model_frequency == 0 and global_step > 0:
-            ckpt_manager.save(
-                step=global_step, items=agent.make_checkpoint() | {"key": key, "global_step": global_step}, metrics=logs
-            )
-            print("- Saved Model")
 
     envs.close()
     writer.close()
