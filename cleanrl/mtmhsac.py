@@ -45,10 +45,10 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=15_000_000, help="total timesteps of the experiments")
+    parser.add_argument("--total-timesteps", type=int, default=int(2e7), help="total timesteps of the experiments")
     parser.add_argument("--max-episode-steps", type=int, default=None,
         help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--evaluation-frequency", type=int, default=100_000,
+    parser.add_argument("--evaluation-frequency", type=int, default=200_000,
         help="how many updates to before evaluating the agent")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
@@ -352,8 +352,8 @@ if __name__ == "__main__":
 
     obs, info = envs.reset()
 
-    for global_step in range(args.total_timesteps):
-        # ALGO LOGIC: put action logic here
+    for global_step in range(args.total_timesteps // NUM_TASKS):
+        total_steps = global_step * NUM_TASKS
         if global_step < args.learning_starts:
             actions = np.array(
                 [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
@@ -386,15 +386,15 @@ if __name__ == "__main__":
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(global_episodic_return),
-                global_step,
+                total_steps,
             )
             writer.add_scalar(
                 "charts/mean_episodic_length",
                 np.mean(global_episodic_length),
-                global_step,
+                total_steps,
             )
             print(
-                f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
+                f"total_steps={total_steps}, mean_episodic_return={np.mean(global_episodic_return)}"
             )
 
         # ALGO LOGIC: training.
@@ -435,32 +435,32 @@ if __name__ == "__main__":
                 if current_step % 100 == 0:
                     for k, v in logs.items():
                         writer.add_scalar(k, v, current_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
+                    print("SPS:", int(total_steps / (time.time() - start_time)))
                     writer.add_scalar(
                         "charts/SPS",
-                        int(global_step / (time.time() - start_time)),
-                        global_step,
+                        int(total_steps / (time.time() - start_time)),
+                        total_steps,
                     )
                     writer.add_scalar(
                         "charts/SPS",
-                        int(global_step / (time.time() - start_time)),
-                        global_step,
+                        int(total_steps / (time.time() - start_time)),
+                        total_steps,
                     )
 
         # Evaluation
-        if global_step % args.evaluation_frequency == 0 and global_step > 0:
+        if total_steps % args.evaluation_frequency == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
             eval_success_rate, eval_returns = new_evaluation_procedure(
                 actor, eval_envs, args.evaluation_num_episodes, device
             )
             writer.add_scalar(
-                "charts/mean_success_rate", eval_success_rate, global_step
+                "charts/mean_success_rate", eval_success_rate, total_steps
             )
             writer.add_scalar(
-                "charts/mean_evaluation_return", eval_returns, global_step
+                "charts/mean_evaluation_return", eval_returns, total_steps
             )
             print(
-                f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
 
