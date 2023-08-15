@@ -1,4 +1,3 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import argparse
 import os
 import random
@@ -66,11 +65,11 @@ def parse_args():
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.97,
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=32,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=16,
+    parser.add_argument("--update-epochs", type=int, default=10,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -78,7 +77,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=5e-3,
+    parser.add_argument("--ent-coef", type=float, default=2e-3,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.0,
         help="coefficient of the value function")
@@ -702,7 +701,7 @@ if __name__ == "__main__":
         meta_episodes.compute_returns(next_value, args.use_gae, args.gamma, args.gae_lambda)
         meta_episode_batch.append(meta_episodes)
 
-        if len(meta_episode_batch) == 32:
+        if len(meta_episode_batch) == NUM_TASKS / args.num_meta_episodes:
 
             clipfracs = []
             for epoch in range(args.update_epochs):
@@ -797,7 +796,7 @@ if __name__ == "__main__":
         if global_step % 500 == 0 and global_episodic_return:
             print(f"Evaluating... at global_step={global_step}")
             eval_success_rate, eval_returns = rl2_evaluation(
-                actor, eval_envs, args.evaluation_num_episodes, device
+                agent, eval_envs, args.evaluation_num_episodes, device
             )
             writer.add_scalar(
                 "charts/mean_episodic_return",
