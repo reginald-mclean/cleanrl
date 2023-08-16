@@ -87,7 +87,7 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--eval-freq", type=int, default=2,
         help="how many updates to do before evaluating the agent")
-    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
+    parser.add_argument("--evaluation-num-episodes", type=int, default=10,
         help="the number episodes to run per evaluation")
 
     args = parser.parse_args()
@@ -284,6 +284,7 @@ class Agent(nn.Module):
         result.update(self.actor(x, state_actor, action))
         result.update(self.critic(x, state_critic))
         return result
+
 
 
 def _make_envs_common(
@@ -537,6 +538,7 @@ def _flatten(T: int, N: int, _tensor: torch.Tensor) -> torch.Tensor:
     return _tensor.view(T * N, *_tensor.size()[2:])
 
 def rl2_evaluation(
+    args,
     agent,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
@@ -547,12 +549,12 @@ def rl2_evaluation(
     episodic_returns = [[] for _ in range(eval_envs.num_envs)]
 
     start_time = time.time()
-    actor_state = torch.zeros_like(1, 1, 128, device=device)
-    critic_state = torch.zeros_like(1, 1, 128, device=device)
+    # initial states
+    actor_state = torch.zeros(eval_envs.num_envs, args.recurrent_state_size, device=device)
+    critic_state = torch.zeros(eval_envs.num_envs, args.recurrent_state_size, device=device)
 
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
         with torch.no_grad():
-            actions, _, _ = agent.get_action(torch.tensor(obs, device=device))
             agent_dict = agent.get_action_and_value(torch.tensor(obs, device=device),
                                     actor_state, critic_state)
         actions = agent_dict["action"]
@@ -812,7 +814,7 @@ if __name__ == "__main__":
         if global_step % 200 == 0 and global_episodic_return:
             print(f"Evaluating... at global_step={global_step}")
             eval_success_rate, eval_returns = rl2_evaluation(
-                agent, eval_envs, args.evaluation_num_episodes, device
+                args, agent, eval_envs, args.evaluation_num_episodes, device
             )
             writer.add_scalar(
                 "charts/mean_episodic_return",
