@@ -827,7 +827,8 @@ if __name__ == "__main__":
                 global_step,
             )
             print(
-                f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
+                f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                + f" return: {eval_returns:.4f}"
             )
         global_step +=1
 
