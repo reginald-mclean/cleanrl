@@ -78,20 +78,32 @@ def parse_args():
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, num_tasks=1):
         super().__init__()
+        self.num_tasks = num_tasks
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod()
             + np.prod(env.single_action_space.shape),
             400,
         )
-        self.fc2 = nn.Linear(400, 400)
+        self.fc2 = nn.Linear(400, 400 * self.num_tasks)
+
         self.fc3 = nn.Linear(400, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
+
+        if self.num_tasks > 1:
+            # extract the task ids from the one-hot encodings of the observations
+            task_idx = (
+                x[:, -self.num_tasks :].argmax(1).unsqueeze(1).detach().to(x.device)
+            )
+            indices = torch.arange(400).unsqueeze(0).to(x.device) + task_idx * 400
+
+            x = x.gather(1, indices)
+
         x = self.fc3(x)
         return x
 
@@ -310,10 +322,10 @@ if __name__ == "__main__":
     ), "only continuous action space is supported"
 
     actor = Actor(envs, NUM_TASKS).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    qf1 = SoftQNetwork(envs, NUM_TASKS).to(device)
+    qf2 = SoftQNetwork(envs, NUM_TASKS).to(device)
+    qf1_target = SoftQNetwork(envs, NUM_TASKS).to(device)
+    qf2_target = SoftQNetwork(envs, NUM_TASKS).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(
