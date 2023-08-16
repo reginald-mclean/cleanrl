@@ -5,7 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 from functools import partial
-from typing import List, Optional, Tuple, Type
+from typing import List, Optional, Tuple, Type, Callable
 
 os.environ[
     "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -52,7 +52,7 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1001,
+    parser.add_argument("--total-timesteps", type=int, default=15_000_000,
         help="total number of meta gradient steps")
     parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
@@ -248,7 +248,7 @@ def inner_step(
         return -(ratio * rollouts.advantages).mean(), kl
 
     grads, kl = jax.grad(inner_opt_objective, has_aux=True)(policy.params)
-    updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step, SGD
+    updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step
 
     return updated_policy, kl
 
@@ -346,11 +346,11 @@ class LinearFeatureBaseline:
         return np.stack(coeffs)
 
     @classmethod
-    def fit_baseline(cls, rollouts: Rollout) -> np.ndarray:
+    def fit_baseline(cls, rollouts: Rollout) -> Callable[[Rollout], np.ndarray]:
         coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
 
-        def baseline(obs: np.ndarray) -> np.ndarray:
-            features = cls._extract_features(obs, reshape=False)
+        def baseline(rollouts: Rollout) -> np.ndarray:
+            features = cls._extract_features(rollouts.observations, reshape=False)
             return features @ coeffs
 
         return baseline
@@ -400,11 +400,16 @@ class ProMP:
         # Init a vectorized policy, running a separate set of parameters for each task
         # The initial parameters for each task are all the same
         policy_network = MetaVectorPolicy(n_tasks=num_tasks, **self.network_args)
-        self.policy = TrainState.create(
-            apply_fn=policy_network.apply,
-            params=MetaVectorPolicy.expand_params(params, num_tasks),
-            tx=optax.sgd(learning_rate=args.inner_lr),  # inner optimizer
-        )
+        if not self.policy:
+            self.policy = TrainState.create(
+                apply_fn=policy_network.apply,
+                params=MetaVectorPolicy.expand_params(params, num_tasks),
+                tx=optax.adam(learning_rate=self.inner_lr),  # inner optimizer
+            )
+        else:
+            self.policy = self.policy.replace(
+                apply_fn=policy_network.apply, params=policy_network.expand_params(params, num_tasks)
+            )
 
     def adapt(self, rollouts: Rollout) -> None:
         self.policy, _ = inner_step(self.policy, rollouts)
@@ -521,8 +526,11 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    for global_step in range(args.total_timesteps):  # Outer step
-        print(f"Step {global_step}")
+    steps_per_iter = args.meta_batch_size * args.rollouts_per_task * args.max_episode_steps
+    n_iters = args.total_timesteps // steps_per_iter
+    for _iter in range(n_iters):  # Outer step
+        global_step = _iter * steps_per_iter
+        print(f"Iteration {_iter}, Global num of steps {global_step}")
         agent.init_multitask_policy(envs.num_envs, agent.train_state.params)
         all_rollouts: List[Rollout] = []
 

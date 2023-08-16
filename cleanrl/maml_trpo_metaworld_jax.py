@@ -5,7 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 from functools import partial
-from typing import List, Optional, Tuple, Type
+from typing import Callable, List, Optional, Tuple, Type
 
 os.environ[
     "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -53,8 +53,8 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10", help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1001,
-        help="total number of meta gradient steps")
+    parser.add_argument("--total-timesteps", type=int, default=15_000_000,
+        help="total number timesteps to collect from the environment")
     parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -68,13 +68,12 @@ def parse_args():
         help="the number of trajectories to collect per task in the meta batch")
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
-    parser.add_argument("--inner-lr", type=float, default=0.05, help="the inner (adaptation) step size")
-    parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
+    parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
         help="number of inner / adaptation gradient steps")
     # TRPO
     parser.add_argument("--delta", type=float, default=0.01,
-        help="the value the KL divergence is constrianed to in TRPO")
+        help="the value the KL divergence is constrained to in TRPO")
     parser.add_argument("--cg-iters", type=int, default=10,
         help="the maximum number of iterations of the conjugate gradient algorithm")
     parser.add_argument("--backtrack-ratio", type=float, default=0.8,
@@ -244,7 +243,7 @@ def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
         return -(log_probs * rollouts.advantages).mean()
 
     grads = jax.grad(inner_opt_objective)(policy.params)
-    updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step, SGD
+    updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step
 
     return updated_policy
 
@@ -278,7 +277,7 @@ def outer_step(
         outer_objective = likelihood_ratio * rollouts.advantages
         return -outer_objective.mean()
 
-    # TRPO
+    # TRPO, outer gradient step
     rollouts = all_rollouts[-1]
 
     def kl_constraint(params: FrozenDict, inputs: Rollout, targets: distrax.Distribution):
@@ -375,11 +374,11 @@ class LinearFeatureBaseline:
         return np.stack(coeffs)
 
     @classmethod
-    def fit_baseline(cls, rollouts: Rollout) -> np.ndarray:
+    def fit_baseline(cls, rollouts: Rollout) -> Callable[[Rollout], np.ndarray]:
         coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
 
-        def baseline(obs: np.ndarray) -> np.ndarray:
-            features = cls._extract_features(obs, reshape=False)
+        def baseline(rollouts: Rollout) -> np.ndarray:
+            features = cls._extract_features(rollouts.observations, reshape=False)
             return features @ coeffs
 
         return baseline
@@ -393,6 +392,7 @@ class MAMLTRPO:
         hidden_dim: int,
         init_key: jax.random.PRNGKey,
         init_obs: ArrayLike,
+        inner_lr: float,
         delta: float,
         cg_iters: int,
         backtrack_ratio: float,
@@ -406,6 +406,8 @@ class MAMLTRPO:
             "num_actions": np.prod(envs.single_action_space.shape),
         }
 
+        self.inner_lr = inner_lr
+
         # Init general parameters theta
         theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
         self.init_multitask_policy(self.num_tasks, theta)
@@ -414,7 +416,6 @@ class MAMLTRPO:
             apply_fn=lambda x: x,
             inner_train_state=self.policy,
             params=theta,
-            tx=optax.adam(args.meta_lr),  # outer optimizer
         )
 
         # TRPO
@@ -431,11 +432,16 @@ class MAMLTRPO:
         # Init a vectorized policy, running a separate set of parameters for each task
         # The initial parameters for each task are all the same
         policy_network = MetaVectorPolicy(n_tasks=num_tasks, **self.network_args)
-        self.policy = TrainState.create(
-            apply_fn=policy_network.apply,
-            params=MetaVectorPolicy.expand_params(params, num_tasks),
-            tx=optax.sgd(learning_rate=args.inner_lr),  # inner optimizer
-        )
+        if not self.policy:
+            self.policy = TrainState.create(
+                apply_fn=policy_network.apply,
+                params=MetaVectorPolicy.expand_params(params, num_tasks),
+                tx=optax.adam(learning_rate=self.inner_lr),  # inner optimizer
+            )
+        else:
+            self.policy = self.policy.replace(
+                apply_fn=policy_network.apply, params=policy_network.expand_params(params, num_tasks)
+            )
 
     def adapt(self, rollouts: Rollout) -> None:
         self.policy = inner_step(self.policy, rollouts)
@@ -559,8 +565,11 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    for global_step in range(args.total_timesteps):  # Outer step
-        print(f"Step {global_step}")
+    steps_per_iter = args.meta_batch_size * args.rollouts_per_task * args.max_episode_steps
+    n_iters = args.total_timesteps // steps_per_iter
+    for _iter in range(n_iters):  # Outer step
+        global_step = _iter * steps_per_iter
+        print(f"Iteration {_iter}, Global num of steps {global_step}")
         agent.init_multitask_policy(envs.num_envs, agent.train_state.params)
         all_rollouts: List[Rollout] = []
 

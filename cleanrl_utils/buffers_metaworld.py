@@ -184,14 +184,32 @@ class MultiTaskRolloutBuffer:
         """Discounted cumulative sum.
 
         See https://docs.scipy.org/doc/scipy/reference/tutorial/signal.html#difference-equation-filtering"""
-        # From garage, modified to work on multi-dimensional arrays
-        return scipy.signal.lfilter([1], [1, float(-discount)], rewards[..., ::-1], axis=-1)[..., ::-1]
+        # From garage, modified to work on multi-dimensional arrays, and column reward vectors
+        reshape = rewards.shape[-1] == 1
+        if reshape:
+            rewards = rewards.reshape(rewards.shape[:-1])
+        returns = scipy.signal.lfilter([1], [1, float(-discount)], rewards[..., ::-1], axis=-1)[..., ::-1]
+        return returns if not reshape else returns.reshape(*returns.shape, 1)
 
     def _compute_advantage(self, rewards: npt.NDArray, baselines: npt.NDArray, gamma: float, gae_lambda: float):
+        assert rewards.shape == baselines.shape, "Rewards and baselines must have the same shape."
+        reshape = rewards.shape[-1] == 1
+        if reshape:
+            rewards = rewards.reshape(rewards.shape[:-1])
+            baselines = baselines.reshape(baselines.shape[:-1])
+
         # From ProMP's advantage computation, modified to work on multi-dimensional arrays
         baselines = np.append(baselines, np.zeros((*baselines.shape[:-1], 1)), axis=-1)
         deltas = rewards + gamma * baselines[..., 1:] - baselines[..., :-1]
-        return self._get_returns(deltas, gamma * gae_lambda)
+        advantages = self._get_returns(deltas, gamma * gae_lambda)
+        return advantages if not reshape else advantages.reshape(*advantages.shape, 1)
+
+    def _normalize_advantages(self, advantages: npt.NDArray) -> npt.NDArray:
+        axis = tuple(np.arange(advantages.ndim)[1:]) if (advantages.ndim > 2 and advantages.shape[-1] == 1) else None
+        mean = np.mean(advantages, axis=axis, keepdims=axis is not None)
+        var = np.var(advantages, axis=axis, keepdims=axis is not None)
+
+        return (advantages - mean) / (var + 1e-8)
 
     def _to_torch(self, rollouts: Rollout) -> Rollout:
         return Rollout(*map(lambda x: torch.tensor(x).to(self._device), rollouts))  # type: ignore
@@ -250,11 +268,7 @@ class MultiTaskRolloutBuffer:
 
         # 4.1) (Optional) Normalize advantages
         if normalize_advantages:
-            advantages = task_rollouts.advantages
-            norm_advantages = (advantages - np.mean(advantages, axis=1, keepdims=True)) / (
-                np.std(advantages, axis=1, keepdims=True) + 1e-8
-            )
-            task_rollouts = task_rollouts._replace(advantages=norm_advantages)
+            task_rollouts = task_rollouts._replace(advantages=self._normalize_advantages(task_rollouts.advantages))
 
         return self._to_torch(task_rollouts) if self._use_torch else task_rollouts
 
@@ -299,7 +313,7 @@ class MultiTaskRolloutBuffer:
         # 2.2) Apply baseline
         # NOTE baseline is responsible for any data conversions / moving to the GPU
         assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
-        baselines = baseline(all_rollouts.observations)
+        baselines = baseline(all_rollouts)
 
         # 3) Compute advantages
         advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
