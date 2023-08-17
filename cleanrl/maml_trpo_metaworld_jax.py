@@ -150,10 +150,10 @@ class MLPTorso(nn.Module):
         return x
 
 
-class GaussianPolicy(nn.Module):
+class GaussianMLP(nn.Module):
     """The Policy network."""
 
-    num_actions: int
+    output_dim: int
     num_layers: int
     hidden_dim: int
 
@@ -164,11 +164,11 @@ class GaussianPolicy(nn.Module):
         mean = MLPTorso(
             num_hidden_layers=self.num_layers,
             hidden_dim=self.hidden_dim,
-            output_dim=self.num_actions,
+            output_dim=self.output_dim,
         )(x)
         # fmt: off
         #                               zeros_init = log(ones_init)
-        log_std = self.param("log_std", nn.initializers.zeros_init(), (self.num_actions,))
+        log_std = self.param("log_std", nn.initializers.zeros_init(), (self.output_dim,))
         log_std = jnp.maximum(log_std, self.LOG_STD_MIN)
         # fmt: on
         log_std = jnp.broadcast_to(log_std, mean.shape)
@@ -184,14 +184,14 @@ class MetaVectorPolicy(nn.Module):
     @nn.compact
     def __call__(self, state: jax.Array) -> distrax.Distribution:
         vmap_policy = nn.vmap(
-            GaussianPolicy,
+            GaussianMLP,
             variable_axes={"params": 0},  # parameters not shared between task policies
             in_axes=0,
             out_axes=0,
             axis_size=self.n_tasks,
         )
         mean, log_std = vmap_policy(
-            num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
+            output_dim=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
         )(state)
         return distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
 
@@ -203,14 +203,12 @@ class MetaVectorPolicy(nn.Module):
         rng: jax.random.PRNGKeyArray,
         init_args: list,
     ) -> FrozenDict:
-        return GaussianPolicy(num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(
-            rng, *init_args
-        )
+        return GaussianMLP(output_dim=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(rng, *init_args)
 
     @staticmethod
     def expand_params(params: FrozenDict, axis_size: int) -> FrozenDict:
         inner_params = jax.tree_map(lambda x: jnp.stack([x for _ in range(axis_size)]), params)["params"]
-        return FrozenDict({"params": {"VmapGaussianPolicy_0": inner_params}})
+        return FrozenDict({"params": {"VmapGaussianMLP_0": inner_params}})
 
 
 @jax.jit
@@ -234,6 +232,7 @@ class MetaTrainState(TrainState):
     inner_train_state: TrainState
 
 
+# MAMLTRPO
 @jax.jit
 def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
     assert rollouts.log_probs is not None and rollouts.means is not None and rollouts.stds is not None
@@ -334,56 +333,29 @@ def outer_step(
     }
 
 
-# NOTE MAML Uses a Linear time-dependent return baseline model from
-# Duan et al. 2016, "Benchmarking Deep Reinforcement Learning for Continuous Control" as its
-# baseline, rather than a neural network used as a learned value function like e.g. PPO.
+# Baseline
+class GaussianMLPBaseline(MetaVectorPolicy):
+    n_tasks: int
+    num_actions: int = 1
+    hidden_dim: int = 32
+    num_layers: int = 2
 
 
-class LinearFeatureBaseline:
-    @staticmethod
-    def _extract_features(obs: np.ndarray, reshape=True):
-        obs = np.clip(obs, -10, 10)
-        ones = jnp.ones((*obs.shape[:-1], 1))
-        time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
-        features = np.concatenate([obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1)
-        if reshape:
-            features = features.reshape(features.shape[0], -1, features.shape[-1])
-        return features
+@jax.jit
+def update_mlp_baseline(train_state: TrainState, obs: ArrayLike, returns: ArrayLike) -> TrainState:
+    def loss(params: FrozenDict):
+        return -train_state.apply_fn(params, obs).log_prob(returns).mean()
 
-    @classmethod
-    def _fit_baseline(cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5) -> np.ndarray:
-        features = cls._extract_features(obs)
-        target = returns.reshape(returns.shape[0], -1, 1)
-
-        coeffs = []
-        for task in range(obs.shape[0]):
-            featmat = features[task]
-            _target = target[task]
-            for _ in range(5):
-                task_coeffs = np.linalg.lstsq(
-                    featmat.T @ featmat + reg_coeff * np.identity(featmat.shape[1]),
-                    featmat.T @ _target,
-                    rcond=-1,
-                )[0]
-                if not np.any(np.isnan(task_coeffs)):
-                    break
-                reg_coeff *= 10
-
-            coeffs.append(np.expand_dims(task_coeffs, axis=0))
-
-        return np.stack(coeffs)
-
-    @classmethod
-    def fit_baseline(cls, rollouts: Rollout) -> Callable[[Rollout], np.ndarray]:
-        coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
-
-        def baseline(rollouts: Rollout) -> np.ndarray:
-            features = cls._extract_features(rollouts.observations, reshape=False)
-            return features @ coeffs
-
-        return baseline
+    grads = jax.grad(loss)(train_state.params)
+    return train_state.apply_gradients(grads=grads)
 
 
+@jax.jit
+def get_gaussian_mlp_baselines(train_state: TrainState, obs: ArrayLike) -> jax.Array:
+    return train_state.apply_fn(train_state.params, obs).loc
+
+
+# Wrapper
 class MAMLTRPO:
     def __init__(
         self,
@@ -398,6 +370,8 @@ class MAMLTRPO:
         backtrack_ratio: float,
         max_backtrack_iters: int,
     ):
+        baseline_init_key, policy_init_key = jax.random.split(init_key)
+
         self.num_tasks = envs.unwrapped.num_envs
 
         self.network_args = {
@@ -409,13 +383,15 @@ class MAMLTRPO:
         self.inner_lr = inner_lr
 
         # Init general parameters theta
-        theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
+        self.policy = None
+        theta = MetaVectorPolicy.init_single(**self.network_args, rng=policy_init_key, init_args=[init_obs])
         self.init_multitask_policy(self.num_tasks, theta)
 
         self.train_state = MetaTrainState.create(
             apply_fn=lambda x: x,
             inner_train_state=self.policy,
             params=theta,
+            tx=optax.identity(),  # TRPO optimiser's in outer_step
         )
 
         # TRPO
@@ -424,7 +400,37 @@ class MAMLTRPO:
         self.backtrack_ratio = backtrack_ratio
         self.max_backtrack_iters = max_backtrack_iters
 
-        self.fit_baseline = LinearFeatureBaseline.fit_baseline
+        # Baseline
+        self.baseline = GaussianMLPBaseline(n_tasks=envs.num_envs)
+        self.init_baseline_params = GaussianMLPBaseline.init_single(
+            self.baseline.num_actions, self.baseline.num_layers, self.baseline.hidden_dim, baseline_init_key, [init_obs]
+        )
+        self.baseline_state = None
+        self.init_multitask_baseline(envs.num_envs)
+
+    def init_multitask_baseline(self, num_tasks: int) -> None:
+        self.baseline = GaussianMLPBaseline(n_tasks=num_tasks)
+        self.num_tasks = num_tasks
+        params = GaussianMLPBaseline.expand_params(self.init_baseline_params, num_tasks)
+
+        if self.baseline_state is None:
+            self.baseline_state = TrainState.create(
+                apply_fn=self.baseline.apply,
+                params=params,
+                tx=optax.sgd(learning_rate=self.inner_lr),  # Inner optimiser
+            )
+        else:
+            self.baseline_state = self.baseline_state.replace(apply_fn=self.baseline.apply, params=params)
+
+    def fit_baseline(self, rollouts: Rollout) -> Callable[[Rollout], np.ndarray]:
+        params = GaussianMLPBaseline.expand_params(self.init_baseline_params, self.num_tasks)
+        baseline_state = self.baseline_state.replace(params=params)
+        baseline_state = update_mlp_baseline(baseline_state, rollouts.observations, rollouts.returns)
+
+        def baseline(rollouts: Rollout) -> np.ndarray:
+            return jax.device_get(get_gaussian_mlp_baselines(self.baseline_state, rollouts.observations))
+
+        return baseline
 
     def init_multitask_policy(self, num_tasks: int, params: FrozenDict) -> None:
         self.num_tasks = num_tasks
@@ -543,6 +549,7 @@ if __name__ == "__main__":
         hidden_dim=args.hidden_dim,
         init_key=agent_init_key,
         init_obs=jax.device_put(obs),
+        inner_lr=args.inner_lr,
         delta=args.delta,
         cg_iters=args.cg_iters,
         backtrack_ratio=args.backtrack_ratio,
@@ -571,6 +578,7 @@ if __name__ == "__main__":
         global_step = _iter * steps_per_iter
         print(f"Iteration {_iter}, Global num of steps {global_step}")
         agent.init_multitask_policy(envs.num_envs, agent.train_state.params)
+        agent.init_multitask_baseline(envs.num_envs)
         all_rollouts: List[Rollout] = []
 
         # Sampling step

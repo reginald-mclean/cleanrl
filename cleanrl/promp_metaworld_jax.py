@@ -5,7 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 from functools import partial
-from typing import List, Optional, Tuple, Type, Callable
+from typing import Callable, List, Optional, Tuple, Type
 
 os.environ[
     "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -364,11 +364,14 @@ class ProMP:
         hidden_dim: int,
         init_key: jax.random.PRNGKey,
         init_obs: ArrayLike,
+        inner_lr: float,
         eta: float,
         clip_eps: float,
         num_grad_steps: int,
     ):
         self.num_tasks = envs.unwrapped.num_envs
+
+        self.inner_lr = inner_lr
 
         self.network_args = {
             "num_layers": num_layers,
@@ -377,6 +380,7 @@ class ProMP:
         }
 
         # Init general parameters theta
+        self.policy = None
         theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
         self.init_multitask_policy(self.num_tasks, theta)
 
@@ -404,7 +408,7 @@ class ProMP:
             self.policy = TrainState.create(
                 apply_fn=policy_network.apply,
                 params=MetaVectorPolicy.expand_params(params, num_tasks),
-                tx=optax.adam(learning_rate=self.inner_lr),  # inner optimizer
+                tx=optax.sgd(learning_rate=self.inner_lr),  # inner optimizer
             )
         else:
             self.policy = self.policy.replace(
@@ -505,6 +509,7 @@ if __name__ == "__main__":
         hidden_dim=args.hidden_dim,
         init_key=agent_init_key,
         init_obs=jax.device_put(obs),
+        inner_lr=args.inner_lr,
         eta=args.inner_kl_penalty,
         clip_eps=args.clip_eps,
         num_grad_steps=args.num_promp_steps,

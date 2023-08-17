@@ -257,18 +257,18 @@ class MultiTaskRolloutBuffer:
         # 2.2) Apply baseline
         # NOTE baseline is responsible for any data conversions / moving to the GPU
         assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
-        baselines = baseline(task_rollouts.observations)
+        baselines = baseline(task_rollouts)
 
         # 3) Compute advantages
         advantages = self._compute_advantage(task_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
         task_rollouts = task_rollouts._replace(advantages=advantages)
 
-        # 4) Flatten rollout and time dimensions
-        task_rollouts = Rollout(*map(lambda x: x.reshape(-1, *x.shape[2:]), task_rollouts))
-
-        # 4.1) (Optional) Normalize advantages
+        # 3.1) (Optional) Normalize advantages
         if normalize_advantages:
             task_rollouts = task_rollouts._replace(advantages=self._normalize_advantages(task_rollouts.advantages))
+
+        # 4) Flatten rollout and time dimensions
+        task_rollouts = Rollout(*map(lambda x: x.reshape(-1, *x.shape[2:]), task_rollouts))
 
         return self._to_torch(task_rollouts) if self._use_torch else task_rollouts
 
@@ -319,16 +319,12 @@ class MultiTaskRolloutBuffer:
         advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
         all_rollouts = all_rollouts._replace(advantages=advantages)
 
+        # 3.1) (Optional) Normalize advantages
+        if normalize_advantages:
+            all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
+
         # 4) Flatten rollout and time dimensions
         all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
-
-        # 4.1) (Optional) Normalize advantages
-        if normalize_advantages:
-            advantages = all_rollouts.advantages
-            norm_advantages = (advantages - np.mean(advantages, axis=1, keepdims=True)) / (
-                np.std(advantages, axis=1, keepdims=True) + 1e-8
-            )
-            all_rollouts = all_rollouts._replace(advantages=norm_advantages)
 
         return self._to_torch(all_rollouts) if self._use_torch else all_rollouts
 
