@@ -1,6 +1,6 @@
 # ruff: noqa: E402
 import time
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import gymnasium as gym
 import jax
@@ -15,14 +15,28 @@ def evaluation(
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     key: jax.random.PRNGKey,
+    task_names: Optional[List[str]] = None,
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
+    print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
-    successes = np.zeros(eval_envs.num_envs)
-    episodic_returns = [[] for _ in range(eval_envs.num_envs)]
+
+    if task_names is not None:
+        successes = {task_name: 0 for task_name in set(task_names)}
+        episodic_returns = {task_name: [] for task_name in set(task_names)}
+        envs_per_task = {task_name: task_names.count(task_name) for task_name in set(task_names)}
+    else:
+        successes = np.zeros(eval_envs.num_envs)
+        episodic_returns = [[] for _ in range(eval_envs.num_envs)]
 
     start_time = time.time()
 
-    while not all(len(returns) >= num_episodes for returns in episodic_returns):
+    def eval_done(returns):
+        if type(returns) is dict:
+            return all(len(r) >= (num_episodes * envs_per_task[task_name]) for task_name, r in returns.items())
+        else:
+            return all(len(r) >= num_episodes for r in returns)
+
+    while not eval_done(episodic_returns):
         actions, key = agent.get_action(obs, key)
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
@@ -30,48 +44,74 @@ def evaluation(
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                episodic_returns[i].append(info["episode"]["r"])
-                # Discard any extra episodes from envs that ran ahead
-                if len(episodic_returns[i]) <= num_episodes:
-                    successes[i] += int(info["success"])
+                if task_names is not None:
+                    episodic_returns[task_names[i]].append(float(info["episode"]["r"][0]))
+                    if len(episodic_returns[task_names[i]]) <= num_episodes * envs_per_task[task_names[i]]:
+                        successes[task_names[i]] += int(info["success"])
+                else:
+                    episodic_returns[i].append(float(info["episode"]["r"][0]))
+                    if len(episodic_returns[i]) <= num_episodes:
+                        successes[i] += int(info["success"])
 
-    episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
+    if type(episodic_returns) is dict:
+        episodic_returns = {
+            task_name: returns[: (num_episodes * envs_per_task[task_name])]
+            for task_name, returns in episodic_returns.items()
+        }
+    else:
+        episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
 
-    success_rate_per_task = successes / num_episodes
+    if type(successes) is dict:
+        success_rate_per_task = np.array(
+            [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
+        )
+        mean_success_rate = np.mean(success_rate_per_task)
+        mean_returns = np.mean(list(episodic_returns.values()))
+    else:
+        success_rate_per_task = successes / num_episodes
+        mean_success_rate = np.mean(success_rate_per_task)
+        mean_returns = np.mean(episodic_returns)
 
-    return (success_rate_per_task).mean(), np.mean(episodic_returns), success_rate_per_task, key
+    return mean_success_rate, mean_returns, success_rate_per_task, key
 
 
 def metalearning_evaluation(
     agent,
     eval_envs: gym.vector.VectorEnv,
     adaptation_steps: int,
+    max_episode_steps: int,
     adaptation_episodes: int,
     eval_episodes: int,
     num_evals: int,
     buffer_kwargs: dict,
     key: jax.random.PRNGKey,
+    task_names: Optional[List[str]] = None,
 ):
     agent.init_multitask_policy(eval_envs.num_envs, agent.train_state.params)
     if hasattr(agent, "init_multitask_baseline"):
         agent.init_multitask_baseline(eval_envs.num_envs)
 
     # Adaptation
-    mean_success_rate = 0.0
-    mean_return = 0.0
-    success_rate_per_task = np.zeros((num_evals, eval_envs.num_envs))
+    total_mean_success_rate = 0.0
+    total_mean_return = 0.0
+
+    if task_names is not None:
+        success_rate_per_task = np.zeros((num_evals, len(set(task_names))))
+    else:
+        success_rate_per_task = np.zeros((num_evals, eval_envs.num_envs))
+
     for i in range(num_evals):
-        eval_envs.call("toggle_success_termination", False)
-        eval_envs.call("toggle_task_sampling_on_reset", False)
+        eval_envs.call("toggle_sample_tasks_on_reset", False)
+        eval_envs.call("toggle_terminate_on_success", False)
         obs, _ = zip(*eval_envs.call("sample_tasks"))
         obs = np.stack(obs)
         eval_buffer = MultiTaskRolloutBuffer(
-            num_tasks=eval_envs.num_envs, rollouts_per_task=adaptation_episodes, max_episode_steps=500
+            num_tasks=eval_envs.num_envs, rollouts_per_task=adaptation_episodes, max_episode_steps=max_episode_steps
         )
 
-        for i in range(adaptation_steps):
+        for _ in range(adaptation_steps):
             while not eval_buffer.ready:
                 action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
                 next_obs, reward, _, truncated, _ = eval_envs.step(action)
@@ -83,10 +123,15 @@ def metalearning_evaluation(
             eval_buffer.reset()
 
         # Evaluation
-        eval_envs.call("toggle_success_termination", True)
-        mean_success_rate, mean_return, _success_rate_per_task, key = evaluation(agent, eval_envs, eval_episodes, key)
-        mean_success_rate += mean_success_rate
-        mean_return += mean_return
+        eval_envs.call("toggle_terminate_on_success", True)
+        mean_success_rate, mean_return, _success_rate_per_task, key = evaluation(
+            agent, eval_envs, eval_episodes, key, task_names
+        )
+        total_mean_success_rate += mean_success_rate
+        total_mean_return += mean_return
         success_rate_per_task[i] = _success_rate_per_task
 
-    return mean_success_rate / num_evals, mean_return / num_evals, (success_rate_per_task).mean(axis=0), key
+    success_rates = (success_rate_per_task).mean(axis=0)
+    task_success_rates = {task_name: success_rates[i] for i, task_name in enumerate(set(task_names))}
+
+    return total_mean_success_rate / num_evals, total_mean_return / num_evals, task_success_rates, key

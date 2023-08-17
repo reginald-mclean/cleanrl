@@ -47,8 +47,10 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
-    parser.add_argument("--evaluation-frequency", type=int, default=10,
-        help="the frequency of evaluating the model (in outer steps)")
+    parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
+        help="the frequency of evaluating the model (in total timesteps collected from the env)")
+    parser.add_argument("--num-evaluation-goals", type=int, default=10,
+        help="the number of goal positions to evaluate on per test task")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10", help="the id of the environment")
@@ -88,7 +90,8 @@ def _make_envs_common(
     split: str = "train",
     terminate_on_success: bool = False,
     task_select: str = "random",
-) -> gym.vector.VectorEnv:
+    total_tasks_per_class: Optional[int] = None,
+) -> Tuple[gym.vector.VectorEnv, List[str]]:
     all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
     assert meta_batch_size % len(all_classes) == 0, "meta_batch_size must be divisible by envs_per_task"
@@ -108,14 +111,21 @@ def _make_envs_common(
         return env
 
     env_tuples = []
+    task_names = []
     for env_name, env_cls in all_classes.items():
         tasks = [task for task in all_tasks if task.env_name == env_name]
+        if total_tasks_per_class is not None:
+            tasks = tasks[:total_tasks_per_class]
         subenv_tasks = [tasks[i::tasks_per_env] for i in range(0, tasks_per_env)]
         for tasks_for_subenv in subenv_tasks:
             assert len(tasks_for_subenv) == len(tasks) // tasks_per_env
             env_tuples.append((env_cls, tasks_for_subenv))
+            task_names.append(env_name)
 
-    return gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples])
+    return (
+        gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples]),
+        task_names,
+    )
 
 
 make_envs = partial(_make_envs_common, terminate_on_success=False, task_select="pseudorandom", split="train")
@@ -481,14 +491,15 @@ if __name__ == "__main__":
         benchmark = metaworld.ML45(seed=args.seed)
     else:
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
-    envs = make_envs(
+    envs, train_task_names = make_envs(
         benchmark, meta_batch_size=args.meta_batch_size, seed=args.seed, max_episode_steps=args.max_episode_steps
     )
-    eval_envs = make_eval_envs(
+    eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
-        meta_batch_size=len(benchmark.test_classes),
+        meta_batch_size=args.meta_batch_size,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
+        total_tasks_per_class=args.num_evaluation_goals,
     )
 
     # agent setup
@@ -571,21 +582,24 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print("- Evaluating...")
+            num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // args.meta_batch_size
             eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = metalearning_evaluation(
                 agent,
                 eval_envs=eval_envs,
                 adaptation_steps=args.num_inner_gradient_steps,
                 adaptation_episodes=args.rollouts_per_task,
-                num_evals=50,  # How many times to sample new tasks to do meta evaluation on
-                eval_episodes=1,  # How many episodes to evaluate the adapted policy *per sampled task*
+                max_episode_steps=args.max_episode_steps,
+                num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
+                eval_episodes=3,  # How many episodes to evaluate the adapted policy *per sampled task*
                 buffer_kwargs=buffer_processing_kwargs,
                 key=key,
+                task_names=eval_task_names,
             )
 
             logs["charts/mean_success_rate"] = float(eval_success_rate)
             logs["charts/mean_evaluation_return"] = float(eval_mean_return)
-            for i, (env_name, _) in enumerate(benchmark.test_classes.items()):
-                logs[f"charts/{env_name}_success_rate"] = float(eval_success_rate_per_task[i])
+            for task_name, success_rate in eval_success_rate_per_task.items():
+                logs[f"charts/{task_name}_success_rate"] = float(success_rate)
 
             if args.save_model:  # Checkpoint
                 ckpt_manager.save(

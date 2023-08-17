@@ -41,16 +41,18 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     task."""
 
     tasks: List[object]
+    sample_tasks_on_reset: bool = True
 
     def _set_random_task(self):
-        self.unwrapped.set_task(self.tasks[self.np_random.choice(len(self.tasks))])
+        task_idx = self.np_random.choice(len(self.tasks))
+        self.unwrapped.set_task(self.tasks[task_idx])
 
-    def __init__(self, env: Env, tasks: List[object]):
+    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = True):
         super().__init__(env)
         self.tasks = tasks
-        self.sample_tasks_on_reset = True
+        self.sample_tasks_on_reset = sample_tasks_on_reset
 
-    def toggle_task_sampling_on_reset(self, on: bool):
+    def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -67,23 +69,27 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
     """A Gymnasium Wrapper to automatically reset the environment to a *pseudo*random task when explicitly called.
 
     Pseudorandom implies no collisions therefore the next task in the list will be used cyclically.
+    However, the tasks will be shuffled every time the last task of the previous shuffle is reached.
 
     Doesn't sample new tasks on reset by default.
     """
 
     tasks: List[object]
     current_task_idx: int
+    sample_tasks_on_reset: bool = False
 
     def _set_pseudo_random_task(self):
         self.current_task_idx = (self.current_task_idx + 1) % len(self.tasks)
+        if self.current_task_idx == 0:
+            np.random.shuffle(self.tasks)
         self.unwrapped.set_task(self.tasks[self.current_task_idx])
 
-    def toggle_task_sampling_on_reset(self, on: bool):
+    def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
-    def __init__(self, env: Env, tasks: List[object]):
+    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = False):
         super().__init__(env)
-        self.sample_tasks_on_reset = False
+        self.sample_tasks_on_reset = sample_tasks_on_reset
         self.tasks = tasks
         self.current_task_idx = -1
 
@@ -107,11 +113,13 @@ class AutoTerminateOnSuccessWrapper(gym.Wrapper):
 
     Best used *under* an AutoResetWrapper and RecordEpisodeStatistics and the like."""
 
+    terminate_on_success: bool = True
+
     def __init__(self, env: Env):
         super().__init__(env)
         self.terminate_on_success = True
 
-    def toggle_success_termination(self, on: bool):
+    def toggle_terminate_on_success(self, on: bool):
         self.terminate_on_success = on
 
     def step(self, action):
@@ -382,6 +390,7 @@ class SyncVectorEnv(VectorEnv):
 
         return True
 
+
 class RL2Env(gym.Wrapper):
     """Environment wrapper for RL2.
 
@@ -397,22 +406,16 @@ class RL2Env(gym.Wrapper):
         obs_flat_dim = np.prod(self.env.observation_space.shape)
         action_flat_dim = np.prod(self.env.action_space.shape)
         self._observation_space = gym.spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-            shape=(obs_flat_dim + action_flat_dim + 1 + 1,)
+            low=-np.inf, high=np.inf, shape=(obs_flat_dim + action_flat_dim + 1 + 1,)
         )
 
     def step(self, action):
         next_state, reward, terminate, truncate, info = self.env.step(action)
-        next_state = np.concatenate([
-            next_state, action, [reward], [terminate]
-        ])
+        next_state = np.concatenate([next_state, action, [reward], [terminate]])
         return next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
-        obs = np.concatenate(
-            [obs,
-             np.zeros(self.env.action_space.shape), [0], [0]])
+        obs = np.concatenate([obs, np.zeros(self.env.action_space.shape), [0], [0]])
 
         return obs, info
