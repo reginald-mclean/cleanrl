@@ -100,8 +100,8 @@ def _make_envs_common(
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        if terminate_on_success:
-            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env.toggle_terminate_on_success(terminate_on_success)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if task_select != "random":
             env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
@@ -250,7 +250,11 @@ def inner_step(
         theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
 
         if return_kl:
-            kl = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds).kl_divergence(theta_dist)
+            kl = (
+                distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
+                .kl_divergence(theta_dist)
+                .mean()
+            )
         else:
             kl = None
 
@@ -581,25 +585,44 @@ if __name__ == "__main__":
 
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
-            print("- Evaluating...")
+            print("- Evaluating on test set...")
             num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // args.meta_batch_size
+
+            evaluation_kwargs = {
+                "agent": agent,
+                "adaptation_steps": args.num_inner_gradient_steps,
+                "adaptation_episodes": args.rollouts_per_task,
+                "max_episode_steps": args.max_episode_steps,
+                "eval_episodes": 3,  # How many episodes to evaluate the adapted policy *per sampled task*
+                "buffer_kwargs": buffer_processing_kwargs,
+            }
+
             eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = metalearning_evaluation(
-                agent,
                 eval_envs=eval_envs,
-                adaptation_steps=args.num_inner_gradient_steps,
-                adaptation_episodes=args.rollouts_per_task,
-                max_episode_steps=args.max_episode_steps,
                 num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
-                eval_episodes=3,  # How many episodes to evaluate the adapted policy *per sampled task*
-                buffer_kwargs=buffer_processing_kwargs,
                 key=key,
                 task_names=eval_task_names,
+                **evaluation_kwargs,
             )
 
             logs["charts/mean_success_rate"] = float(eval_success_rate)
             logs["charts/mean_evaluation_return"] = float(eval_mean_return)
             for task_name, success_rate in eval_success_rate_per_task.items():
                 logs[f"charts/{task_name}_success_rate"] = float(success_rate)
+
+            print("- Evaluating on train set...")
+            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // args.meta_batch_size
+            _, _, eval_success_rate_per_train_task, key = metalearning_evaluation(
+                eval_envs=envs,
+                num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
+                key=key,
+                task_names=train_task_names,
+                **evaluation_kwargs,
+            )
+            for task_name, success_rate in eval_success_rate_per_train_task.items():
+                logs[f"charts/{task_name}_train_success_rate"] = float(success_rate)
+
+            envs.call("toggle_terminate_on_success", False)
 
             if args.save_model:  # Checkpoint
                 ckpt_manager.save(
@@ -615,9 +638,8 @@ if __name__ == "__main__":
             writer.add_scalar(k, v, global_step)
         print(logs)
 
-        seconds_per_step = (time.time() - start_time) / (global_step + 1)
-        writer.add_scalar("charts/time_per_step", seconds_per_step, global_step)
-        print("- Time per step: ", seconds_per_step)
+        writer.add_scalar("charts/sps", global_step / (time.time() - start_time), global_step)
+        print("- SPS: ", global_step / (time.time() - start_time))
 
         # Set tasks for next iteration
         obs, _ = zip(*envs.call("sample_tasks"))

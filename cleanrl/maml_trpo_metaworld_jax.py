@@ -95,6 +95,7 @@ def _make_envs_common(
     split: str = "train",
     terminate_on_success: bool = False,
     task_select: str = "random",
+    total_tasks_per_class: Optional[int] = None,
 ) -> Tuple[gym.vector.VectorEnv, List[str]]:
     all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
@@ -104,8 +105,8 @@ def _make_envs_common(
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        if terminate_on_success:
-            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env.toggle_terminate_on_success(terminate_on_success)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if task_select != "random":
             env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
@@ -118,6 +119,8 @@ def _make_envs_common(
     task_names = []
     for env_name, env_cls in all_classes.items():
         tasks = [task for task in all_tasks if task.env_name == env_name]
+        if total_tasks_per_class is not None:
+            tasks = tasks[:total_tasks_per_class]
         subenv_tasks = [tasks[i::tasks_per_env] for i in range(0, tasks_per_env)]
         for tasks_for_subenv in subenv_tasks:
             assert len(tasks_for_subenv) == len(tasks) // tasks_per_env
@@ -424,7 +427,7 @@ class MAMLTRPO:
             self.baseline_state = TrainState.create(
                 apply_fn=self.baseline.apply,
                 params=params,
-                tx=optax.sgd(learning_rate=self.inner_lr),  # Inner optimiser
+                tx=optax.adam(learning_rate=self.inner_lr),  # Inner optimiser
             )
         else:
             self.baseline_state = self.baseline_state.replace(apply_fn=self.baseline.apply, params=params)
@@ -449,7 +452,7 @@ class MAMLTRPO:
             self.policy = TrainState.create(
                 apply_fn=policy_network.apply,
                 params=MetaVectorPolicy.expand_params(params, num_tasks),
-                tx=optax.adam(learning_rate=self.inner_lr),  # inner optimizer
+                tx=optax.sgd(learning_rate=self.inner_lr),  # inner optimizer
             )
         else:
             self.policy = self.policy.replace(
@@ -536,6 +539,7 @@ if __name__ == "__main__":
         meta_batch_size=args.meta_batch_size,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
+        total_tasks_per_class=args.num_evaluation_goals,
     )
 
     # agent setup
@@ -619,25 +623,44 @@ if __name__ == "__main__":
 
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
-            print("- Evaluating...")
+            print("- Evaluating on test set...")
             num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // args.meta_batch_size
+
+            evaluation_kwargs = {
+                "agent": agent,
+                "adaptation_steps": args.num_inner_gradient_steps,
+                "adaptation_episodes": args.rollouts_per_task,
+                "max_episode_steps": args.max_episode_steps,
+                "eval_episodes": 3,  # How many episodes to evaluate the adapted policy *per sampled task*
+                "buffer_kwargs": buffer_processing_kwargs,
+            }
+
             eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = metalearning_evaluation(
-                agent,
                 eval_envs=eval_envs,
-                adaptation_steps=args.num_inner_gradient_steps,
-                adaptation_episodes=args.rollouts_per_task,
-                max_episode_steps=args.max_episode_steps,
                 num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
-                eval_episodes=3,  # How many episodes to evaluate the adapted policy *per sampled task*
-                buffer_kwargs=buffer_processing_kwargs,
                 key=key,
                 task_names=eval_task_names,
+                **evaluation_kwargs,
             )
 
             logs["charts/mean_success_rate"] = float(eval_success_rate)
             logs["charts/mean_evaluation_return"] = float(eval_mean_return)
             for task_name, success_rate in eval_success_rate_per_task.items():
                 logs[f"charts/{task_name}_success_rate"] = float(success_rate)
+
+            print("- Evaluating on train set...")
+            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // args.meta_batch_size
+            _, _, eval_success_rate_per_train_task, key = metalearning_evaluation(
+                eval_envs=envs,
+                num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
+                key=key,
+                task_names=train_task_names,
+                **evaluation_kwargs,
+            )
+            for task_name, success_rate in eval_success_rate_per_train_task.items():
+                logs[f"charts/{task_name}_train_success_rate"] = float(success_rate)
+
+            envs.call("toggle_terminate_on_success", False)
 
             if args.save_model:  # Checkpoint
                 ckpt_manager.save(
@@ -653,9 +676,8 @@ if __name__ == "__main__":
             writer.add_scalar(k, v, global_step)
         print(logs)
 
-        seconds_per_step = (time.time() - start_time) / (global_step + 1)
-        writer.add_scalar("charts/time_per_step", seconds_per_step, global_step)
-        print("- Time per step: ", seconds_per_step)
+        writer.add_scalar("charts/sps", global_step / (time.time() - start_time), global_step)
+        print("- SPS: ", global_step / (time.time() - start_time))
 
         # Set tasks for next iteration
         obs, _ = zip(*envs.call("sample_tasks"))
