@@ -411,7 +411,9 @@ class RL2Env(gym.Wrapper):
 
     def step(self, action):
         next_state, reward, terminate, truncate, info = self.env.step(action)
-        next_state = np.concatenate([next_state, action, [reward], [terminate]])
+        next_state = np.concatenate([
+            next_state, action, [reward], [terminate or truncate]
+        ])
         return next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):
