@@ -453,11 +453,6 @@ if __name__ == "__main__":
                         int(total_steps / (time.time() - start_time)),
                         total_steps,
                     )
-                    writer.add_scalar(
-                        "charts/SPS",
-                        int(total_steps / (time.time() - start_time)),
-                        total_steps,
-                    )
 
         # Evaluation
         if total_steps % args.evaluation_frequency == 0 and global_step > 0:
