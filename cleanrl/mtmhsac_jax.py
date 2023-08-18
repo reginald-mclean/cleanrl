@@ -298,7 +298,8 @@ class Agent:
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
     def get_action_eval(self, obs: np.ndarray) -> Tuple[np.ndarray]:
-        return np.array(self.actor_state.apply_fn(self.actor_state.params, obs, task_ids)[0])
+        state, task_ids = split_obs_task_id(obs, self._num_tasks)
+        return np.array(self.actor_state.apply_fn(self.actor_state.params, state, task_ids)[0])
 
     @partial(jax.jit, static_argnames=("self"))
     def sample_action(
