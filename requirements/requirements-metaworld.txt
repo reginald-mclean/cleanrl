@@ -1,5 +1,4 @@
 metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git
-stable-baselines3 @ git+ssh://git@github.com/DLR-RM/stable-baselines3.git
 moviepy
 mujoco
 tensorboard
