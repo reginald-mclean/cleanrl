@@ -349,7 +349,7 @@ if __name__ == "__main__":
 
     envs.single_observation_space.dtype = np.float32
     rb = MultiTaskReplayBuffer(
-        capacity=args.buffer_size,
+        total_capacity=args.buffer_size,
         num_tasks=NUM_TASKS,
         envs=envs,
         use_torch=True,

@@ -1,4 +1,5 @@
 import sys
+
 sys.path.append('/home/reggiemclean/gradientSurgery/cleanrl')
 
 import argparse
@@ -7,6 +8,7 @@ import random
 import time
 from collections import deque
 from distutils.util import strtobool
+from itertools import accumulate
 from typing import Tuple
 
 import gymnasium as gym
@@ -17,12 +19,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
+from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedure
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
-from itertools import accumulate
-
-from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 
 DISABLE_COMPILE = os.environ.get("DISABLE_COMPILE", False)
 
@@ -359,7 +359,7 @@ if __name__ == "__main__":
 
     envs.single_observation_space.dtype = np.float32
     rb = MultiTaskReplayBuffer(
-        capacity=args.buffer_size,
+        total_capacity=args.buffer_size,
         num_tasks=NUM_TASKS,
         envs=envs,
         use_torch=True,

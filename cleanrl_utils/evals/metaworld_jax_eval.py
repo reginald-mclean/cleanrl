@@ -14,7 +14,6 @@ def evaluation(
     agent,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
-    key: jax.random.PRNGKey,
     task_names: Optional[List[str]] = None,
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
     print(f"Evaluating for {num_episodes} episodes.")
@@ -37,7 +36,7 @@ def evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        actions, key = agent.get_action(obs, key)
+        actions = agent.get_action_eval(obs)
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
@@ -74,7 +73,7 @@ def evaluation(
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(episodic_returns)
 
-    return mean_success_rate, mean_returns, success_rate_per_task, key
+    return mean_success_rate, mean_returns, success_rate_per_task
 
 
 def metalearning_evaluation(
@@ -124,9 +123,7 @@ def metalearning_evaluation(
 
         # Evaluation
         eval_envs.call("toggle_terminate_on_success", True)
-        mean_success_rate, mean_return, _success_rate_per_task, key = evaluation(
-            agent, eval_envs, eval_episodes, key, task_names
-        )
+        mean_success_rate, mean_return, _success_rate_per_task = evaluation(agent, eval_envs, eval_episodes, task_names)
         total_mean_success_rate += mean_success_rate
         total_mean_return += mean_return
         success_rate_per_task[i] = _success_rate_per_task

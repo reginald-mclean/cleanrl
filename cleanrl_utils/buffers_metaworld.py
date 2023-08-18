@@ -50,14 +50,15 @@ class MultiTaskReplayBuffer:
 
     def __init__(
         self,
-        capacity: int,
+        total_capacity: int,
         num_tasks: int,
         envs: gym.vector.VectorEnv,
         use_torch: bool = True,
         device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        self.capacity = capacity
+        assert total_capacity % num_tasks == 0, "Total capacity must be divisible by the number of tasks."
+        self.capacity = total_capacity // num_tasks
         self.num_tasks = num_tasks
         self.use_torch = use_torch
         self.device = device

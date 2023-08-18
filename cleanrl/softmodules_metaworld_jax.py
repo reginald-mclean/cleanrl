@@ -318,6 +318,16 @@ def sample_action(
 
 
 @jax.jit
+def get_deterministic_action(
+    actor: TrainState,
+    obs: ArrayLike,
+    task_ids: ArrayLike,
+) -> jax.Array:
+    dist = actor.apply_fn(actor.params, obs, task_ids)
+    return jnp.tanh(dist.distribution.loc)
+
+
+@jax.jit
 def sample_and_log_prob(
     actor: TrainState,
     actor_params: flax.core.FrozenDict,  # For actor loss
@@ -453,11 +463,19 @@ class Agent:  # MT SAC Agent
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
-    def get_action(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
+    def get_action_train(
+        self, obs: np.ndarray, key: jax.random.PRNGKeyArray
+    ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, s_t, z_Tau, key)
         actions = jax.device_get(actions)
         return actions, key
+
+    def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
+        s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
+        actions = get_deterministic_action(self.actor, s_t, z_Tau)
+        actions = jax.device_get(actions)
+        return actions
 
     @staticmethod
     @jax.jit
@@ -621,7 +639,7 @@ if __name__ == "__main__":
 
     # agent setup
     rb = MultiTaskReplayBuffer(
-        capacity=args.buffer_size,
+        total_capacity=args.buffer_size,
         num_tasks=NUM_TASKS,
         envs=envs,
         use_torch=False,
@@ -659,7 +677,7 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
         else:
-            actions, key = agent.get_action(obs, key)
+            actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -731,8 +749,10 @@ if __name__ == "__main__":
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                eval_success_rate, eval_returns, eval_success_per_task, key = evaluation(
-                    agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes, key=key
+                eval_success_rate, eval_returns, eval_success_per_task = evaluation(
+                    agent=agent,
+                    eval_envs=eval_envs,
+                    num_episodes=args.evaluation_num_episodes,
                 )
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
