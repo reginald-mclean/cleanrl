@@ -231,6 +231,11 @@ def sample_actions(
     return action_samples, action_log_probs, dist.loc, dist.scale_diag, key
 
 
+@jax.jit
+def get_deterministic_actions(actor: TrainState, obs: ArrayLike) -> jax.Array:
+    return actor.apply_fn(actor.params, obs).loc
+
+
 def get_actions_log_probs_and_dists(
     actor: TrainState, obs: ArrayLike, key: jax.random.PRNGKey
 ) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, jax.random.PRNGKeyArray]:
@@ -474,12 +479,12 @@ class MAMLTRPO:
         )
         return logs
 
-    def get_actions_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
+    def get_action_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
         return get_actions_log_probs_and_dists(self.policy, obs, key)
 
-    def get_action(self, obs: ArrayLike, key: jax.random.PRNGKey):
-        actions, _, _, _, key = get_actions_log_probs_and_dists(self.policy, obs, key)
-        return actions, key
+    def get_action_eval(self, obs: ArrayLike) -> np.ndarray:
+        actions = get_deterministic_actions(self.policy, obs)
+        return jax.device_get(actions)
 
     def make_checkpoint(self):
         return {
@@ -597,7 +602,7 @@ if __name__ == "__main__":
         for _step in range(args.num_inner_gradient_steps + 1):
             print(f"- Collecting inner step {_step}")
             while not buffer.ready:
-                action, log_probs, means, stds, key = agent.get_actions_train(obs, key)
+                action, log_probs, means, stds, key = agent.get_action_train(obs, key)
                 next_obs, reward, _, truncated, _ = envs.step(action)
                 buffer.push(obs, action, reward, truncated, log_probs, means, stds)
                 obs = next_obs

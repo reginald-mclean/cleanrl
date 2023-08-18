@@ -113,15 +113,18 @@ class MultiTaskReplayBuffer:
 
         return ReplayBufferSamples(*batch)
 
-    def sample(self, single_task_batch_size: int) -> ReplayBufferSamples:
+    def sample(self, batch_size: int) -> ReplayBufferSamples:
         """Sample a batch of size `single_task_batch_size` for each task.
 
         Args:
-            single_task_batch_size (int): The batch size for each task.
+            batch_size (int): The total batch size. Must be divisible by number of tasks
 
         Returns:
-            ReplayBufferSamples: A batch of samples of batch shape (num_tasks * single_task_batch_size,).
+            ReplayBufferSamples: A batch of samples of batch shape (batch_size,).
         """
+        assert batch_size % self.num_tasks == 0, "Batch size must be divisible by the number of tasks."
+        single_task_batch_size = batch_size // self.num_tasks
+
         sample_idx = self._rng.integers(
             low=0,
             high=max(self.pos, single_task_batch_size),

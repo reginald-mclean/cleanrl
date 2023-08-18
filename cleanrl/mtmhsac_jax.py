@@ -57,8 +57,8 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=128,
-        help="the batch size of sample from the reply memory for each task")
+    parser.add_argument("--batch-size", type=int, default=1280,
+        help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=200_000,
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
