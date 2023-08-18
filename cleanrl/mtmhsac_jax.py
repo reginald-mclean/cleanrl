@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
 
-    parser.add_argument("--log-freq", type=int, default=20_000)
+    parser.add_argument("--log-freq", type=int, default=500)
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
@@ -140,14 +140,6 @@ class Actor(nn.Module):
         )(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return mu, log_sigma
-
-@jax.jit
-def get_deterministic_action(
-    actor: TrainState,
-    obs: ArrayLike,
-    task_ids: ArrayLike,
-) -> jax.Array:
-    return actor.apply_fn(actor.params, obs, task_ids).mean()
 
 @jax.jit
 def sample_and_log_prob(
@@ -317,7 +309,7 @@ class Agent:
             action_key, shape=mean.shape
         )
         action = jnp.tanh(gaussian_action)
-        return action, key
+        return jax.device_get(action), key
 
     @staticmethod
     @jax.jit
@@ -354,7 +346,7 @@ def update(
     Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray
 ]:
     key, subkey = jax.random.split(key, 2)
-    mean, log_std = actor_state.apply_fn(actor_state.params, observations, batch.task_ids)
+    mean, log_std = actor_state.apply_fn(actor_state.params, batch.observations, batch.task_ids)
     next_actions, next_action_log_probs = sample_and_log_prob(mean, log_std, subkey)
     q_values = critic_state.apply_fn(
         critic_state.target_params, batch.next_observations, next_actions, batch.task_ids
@@ -368,7 +360,7 @@ def update(
         q_pred = critic_state.apply_fn(
             params, batch.observations, batch.actions, batch.task_ids
         )
-        return ((next_q_value - q_pred) ** 2).mean(1).sum(), q_pred.mean()
+        return 0.5 * ((next_q_value - q_pred) ** 2).mean(1).sum(), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
@@ -420,12 +412,12 @@ def update(
             logs,
         )
 
-    (actor_loss_value, (new_alpha, new_critic_state, logs)), actor_grads = jax.value_and_grad(
+    (actor_loss_value, (alpha_state, critic_state, logs)), actor_grads = jax.value_and_grad(
         actor_loss, has_aux=True
     )(actor_state.params)
-    new_actor_state = actor_state.apply_gradients(grads=actor_grads)
+    actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-    return (new_actor_state, new_critic_state, new_alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
+    return (actor_state, critic_state, alpha_state), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
 # Training loop
@@ -528,7 +520,7 @@ if __name__ == "__main__":
             )
         else:
             actions, key = agent.sample_action(obs, key)
-            actions = np.array(actions).clip(-1, 1)
+            actions = np.array(actions)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
@@ -554,7 +546,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
-        if total_steps % args.log_freq == 0 and global_episodic_return:
+        if global_step % args.log_freq == 0 and global_episodic_return:
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
             )
@@ -605,7 +597,7 @@ if __name__ == "__main__":
                 agent.soft_update_target_networks(args.tau)
 
             # Logging
-            if global_step % args.log_freq == 0:
+            if global_step % 100 == 0:
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
                 print("SPS:", int(total_steps / (time.time() - start_time)))
