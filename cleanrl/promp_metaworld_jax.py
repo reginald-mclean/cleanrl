@@ -258,7 +258,7 @@ def inner_step(
             kl = (
                 distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
                 .kl_divergence(theta_dist)
-                .mean()
+                .mean(axis=1)  # Mean per rollout, not per task
             )
         else:
             kl = None
@@ -304,9 +304,14 @@ def outer_step(
             jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * rollouts.advantages,
         )
 
-        mean_kl = jnp.stack(kls).mean()
+        # Compute J^ProMP, Equation 13
+        mean_obj = -jnp.mean(outer_objective)
 
-        return -(outer_objective.mean() - eta * mean_kl), mean_kl  # Equation 13
+        # KLs is a list of len(num_inner_gradient_steps), where each element is of shape (num_tasks,)
+        # Mean over tasks for each step (axis=1) and then weight by eta, and then mean over everything.
+        mean_kl = jnp.mean(eta * jnp.stack(kls).mean(axis=1))
+
+        return mean_obj + mean_kl, mean_kl
 
     # Update theta
     loss_before = None

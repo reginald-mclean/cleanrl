@@ -294,19 +294,25 @@ def outer_step(
         return -outer_objective.mean()
 
     # TRPO, outer gradient step
-    rollouts = all_rollouts[-1]
-
     def kl_constraint(params: FrozenDict, inputs: Rollout, targets: distrax.Distribution):
         vec_theta = MetaVectorPolicy.expand_params(params, num_tasks)
-        return train_state.inner_train_state.apply_fn(vec_theta, inputs.observations).kl_divergence(targets).mean()
+        inner_train_state = train_state.inner_train_state.replace(params=vec_theta)
 
-    target_dist = distrax.MultivariateNormalDiag(rollouts.means, rollouts.stds)
-    kl_before = kl_constraint(train_state.params, rollouts, target_dist)
+        # Adaptation steps
+        for i in range(len(inputs) - 1):
+            rollouts = inputs[i]
+            inner_train_state = inner_step(inner_train_state, rollouts)
+
+        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, inputs[-1].observations)
+        return new_param_dist.kl_divergence(targets).mean()
+
+    target_dist = distrax.MultivariateNormalDiag(all_rollouts[-1].means, all_rollouts[-1].stds)
+    kl_before = kl_constraint(train_state.params, all_rollouts, target_dist)
 
     ## Compute search direction by solving for Ax = g
 
     def hvp(x):
-        hvp_deep = optax.hvp(kl_constraint, v=x, params=train_state.params, inputs=rollouts, targets=target_dist)
+        hvp_deep = optax.hvp(kl_constraint, v=x, params=train_state.params, inputs=all_rollouts, targets=target_dist)
         hvp_shallow = ravel_pytree(hvp_deep)[0]
         return hvp_shallow + 1e-5 * x  # Ensure positive definite
 
@@ -329,7 +335,7 @@ def outer_step(
         new_params = jax.tree_util.tree_map(
             lambda theta_i, s_i: theta_i - (backtrack_ratio**step) * beta * s_i, train_state.params, s
         )
-        loss, kl = maml_loss(new_params), kl_constraint(new_params, rollouts, target_dist)
+        loss, kl = maml_loss(new_params), kl_constraint(new_params, all_rollouts, target_dist)
         return step + 1, loss, kl, new_params
 
     step, loss, kl, new_params = jax.lax.while_loop(
