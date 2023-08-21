@@ -410,6 +410,7 @@ class ProMP:
             tx=optax.adam(args.meta_lr),  # outer optimizer
         )
 
+        # Baseline
         self.fit_baseline = LinearFeatureBaseline.fit_baseline
 
         # Outer step hparams

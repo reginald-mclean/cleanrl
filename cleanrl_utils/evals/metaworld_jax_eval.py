@@ -89,8 +89,6 @@ def metalearning_evaluation(
     task_names: Optional[List[str]] = None,
 ):
     agent.init_multitask_policy(eval_envs.num_envs, agent.train_state.params)
-    if hasattr(agent, "init_multitask_baseline"):
-        agent.init_multitask_baseline(eval_envs.num_envs)
 
     # Adaptation
     total_mean_success_rate = 0.0
