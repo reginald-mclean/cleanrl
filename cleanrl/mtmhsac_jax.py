@@ -304,15 +304,6 @@ class Agent:
             "target_entropy": self.target_entropy,
         }
 
-
-@jax.jit
-def extract_task_weights(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
-    task_weights = jax.nn.softmax(-log_alpha)  # NOTE 6
-    task_weights = task_ids @ task_weights.reshape(-1, 1)
-    task_weights *= log_alpha.shape[0]  # NOTE 6
-    return task_weights
-
-
 @partial(jax.jit, static_argnames=("gamma", "target_entropy"))
 def update(
     actor: TrainState,
@@ -333,7 +324,7 @@ def update(
         next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
 
         q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
-        return ((q_pred - next_q_value.reshape(1, -1)) ** 2).mean(1).sum(0), q_pred.mean()
+        return 0.5 * ((q_pred - next_q_value.reshape(1, -1)) ** 2).mean(1).sum(0), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
