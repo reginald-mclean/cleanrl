@@ -9,11 +9,12 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions.normal import Normal
-from typing import Optional, Type, Tuple
+from typing import Optional, Type
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
+from cleanrl_utils.buffers_metaworld import MetaRolloutBuffer
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
 from collections import deque
@@ -40,14 +41,14 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=10, help="number of episodes sampled per trial/meta-batch")
+    parser.add_argument("--n-episodes-per-trial", type=int, default=2, help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--max-episode-steps", type=int, default=500, help="maximum number of timesteps in one episode during training")
 
     parser.add_argument("--use-gae", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="MT10",
+    parser.add_argument("--env-id", type=str, default="ML10",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
@@ -94,191 +95,120 @@ def parse_args():
     return args
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class GRU(nn.Module):
-    def __init__(self, input_size: int, state_size: int):
+class Critic(nn.Module):
+    def __init__(self, env, args):
         super().__init__()
-
-        self._gru = nn.GRU(input_size, state_size)
-
-        for name, param in self._gru.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        recurrent_states: torch.Tensor,
-        recurrent_state_masks: torch.Tensor = None,
-        device: torch.device = torch.device("cpu"),
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if x.size(0) == recurrent_states.size(0):
-            if recurrent_state_masks is None:
-                recurrent_state_masks = torch.ones(recurrent_states.shape)
-
-            x = x.to(device)
-            recurrent_states = recurrent_states.to(device)
-            recurrent_state_masks = recurrent_state_masks.to(device)
-
-            x, recurrent_states = self._gru(
-                x.unsqueeze(0), (recurrent_states * recurrent_state_masks).unsqueeze(0)
-            )
-
-            x = x.squeeze(0)
-            recurrent_states = recurrent_states.squeeze(0)
-
-            return x, recurrent_states
-
-        # x is a (T, N, -1) batch from the sampler that has been flattend to (T * N, -1)
-        N = recurrent_states.size(0)
-        T = int(x.size(0) / N)
-
-        # unflatten
-        x = x.view(T, N, x.size(1))
-
-        # masks
-        if recurrent_state_masks is None:
-            recurrent_state_masks = torch.ones((T, N))
-        else:
-            recurrent_state_masks = recurrent_state_masks.view(T, N)
-
-        has_zeros = (
-            (recurrent_state_masks[1:] == 0.0).any(dim=-1).nonzero().squeeze().cpu()
+        self.fc1 = nn.Linear(
+            args.recurrent_state_size,
+            400,
         )
+        self.fc2 = nn.Linear(400, 400)
+        self.fc3 = nn.Linear(400, 1)
 
-        # +1 to correct the recurrent_masks[1:] where zeros are present.
-        if has_zeros.dim() == 0:
-            # Deal with scalar
-            has_zeros = [has_zeros.item() + 1]
-        else:
-            has_zeros = (has_zeros + 1).numpy().tolist()
-
-        # add t=0 and t=T to the list
-        has_zeros = [0] + has_zeros + [T]
-
-        recurrent_state_masks.to(device)
-        recurrent_states = recurrent_states.unsqueeze(0)
-        outputs = []
-
-        x = x.to(device)
-        recurrent_states = recurrent_states.to(device)
-        recurrent_state_masks = recurrent_state_masks.to(device)
-
-        for i in range(len(has_zeros) - 1):
-            # We can now process steps that don't have any zeros in done_masks together!
-            # This is much faster
-            start_idx = has_zeros[i]
-            end_idx = has_zeros[i + 1]
-
-            rnn_scores, recurrent_states = self._gru(
-                x[start_idx:end_idx],
-                recurrent_states * recurrent_state_masks[start_idx].view(1, -1, 1),
-            )
-
-            outputs.append(rnn_scores)
-            pass
-
-        # x is a (T, N, -1) tensor
-        x = torch.cat(outputs, dim=0)
-
-        # flatten
-        x = x.view(T * N, -1)
-        recurrent_states = recurrent_states.squeeze(0)
-        pass
-
-        return x, recurrent_states
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
 
-class GRUActor(nn.Module):
-    def __init__(self, envs, args):
+LOG_STD_MAX = 2
+LOG_STD_MIN = -5
+
+
+class Actor(nn.Module):
+    def __init__(self, env, args):
         super().__init__()
-        obs_shape = np.array(envs.single_observation_space.shape).prod()
-        # self.gru = nn.GRU(obs_shape, args.recurrent_state_size, batch_first=True)
-        self.gru = GRU(obs_shape, args.recurrent_state_size)
-        for name, param in self.gru.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param)
+        self.fc1 = nn.Linear(args.recurrent_state_size, 400)
+        self.fc2 = nn.Linear(400, 400)
+        self.fc_mean = nn.Linear(400, np.prod(env.single_action_space.shape))
+        self.fc_logstd = nn.Linear(400, np.prod(env.single_action_space.shape))
 
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(args.recurrent_state_size, 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 512), std=0.01),
-            nn.Tanh(),
-            layer_init(
-                nn.Linear(512, np.prod(envs.single_action_space.shape)), std=0.01
-            ),
-        )
-        self.actor_logstd = nn.Parameter(
-            torch.zeros(1, np.prod(envs.single_action_space.shape))
-        )
+    def forward(self, x, action=None):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        mean = self.fc_mean(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
+            log_std + 1
+        )  # From SpinUp / Denis Yarats
 
-    def forward(self, x: torch.Tensor, recurrent_state: torch.Tensor, action=None):
-        x, recurrent_state = self.gru(x, recurrent_state, device=x.device)
-        action_mean = self.actor_mean(x)
-        if x.size()[0] == 10:
-            action_logstd = self.actor_logstd.expand_as(action_mean)
-        else:
-            action_logstd = self.actor_logstd
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        action_std = torch.exp(log_std)
+        probs = torch.distributions.Normal(mean, action_std)
         if action is None:
             action = probs.sample()
-        return {
-            "action": action,
-            "logprob": probs.log_prob(action).sum(1),
-            "entropy": probs.entropy().sum(1),
-            "actor_state": recurrent_state,
-        }
-
-
-class GRUCritic(nn.Module):
-    def __init__(self, envs, args):
-        super().__init__()
-        obs_shape = np.array(envs.single_observation_space.shape).prod()
-        # self.gru = nn.GRU(obs_shape, args.recurrent_state_size, batch_first=True)
-        self.gru = GRU(obs_shape, args.recurrent_state_size)
-        for name, param in self.gru.named_parameters():
-            if "bias" in name:
-                nn.init.constant_(param, 0)
-            elif "weight" in name:
-                nn.init.orthogonal_(param)
-
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(args.recurrent_state_size, 512)),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 512), std=1.0),
-            nn.Tanh(),
-            layer_init(nn.Linear(512, 1), std=1.0),
-        )
-
-    def forward(self, x: torch.Tensor, recurrent_state: torch.Tensor):
-        x, recurrent_state = self.gru(x, recurrent_state, device=x.device)
-        return {"value": self.critic(x), "critic_state": recurrent_state}
+        return action, probs.log_prob(action).sum(-1).view(*x.shape[:-1], 1), probs.entropy().sum(-1).view(*x.shape[:-1], 1)
 
 
 class Agent(nn.Module):
-    def __init__(self, envs, args):
+    def __init__(self, envs, args, device):
         super().__init__()
-        self.actor = GRUActor(envs, args)
-        self.critic = GRUCritic(envs, args)
+        self.actor = Actor(envs, args)
+        self.critic = Critic(envs, args)
+        self.device = device
+        self.recurrent_state_size = args.recurrent_state_size
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        obs_enc_dim = 128
+        act_dim = np.prod(envs.single_action_space.shape)
+        rnn_input = obs_enc_dim + 1 + act_dim
+        self.rnn = nn.GRU(rnn_input, self.recurrent_state_size, batch_first=True).to(
+            device
+        )
+        self.obs_enc = nn.Linear(obs_dim, obs_enc_dim).to(device)
 
-    def get_value(self, x, state_critic):
-        return self.critic(x, state_critic)["value"]
+    def init_state(self, batch_size):
+        return torch.zeros(1, batch_size, self.recurrent_state_size).to(self.device)
 
-    def get_action_and_value(self, x, state_actor, state_critic, action=None):
-        result = {}
-        result.update(self.actor(x, state_actor, action))
-        result.update(self.critic(x, state_critic))
-        return result
+    def recurrent_state(self, obs, prev_action, prev_reward, rnn_state, training=False):
+        # observation encoding
+        obs_enc = self.obs_enc(obs)
+
+        # Concat the encodings with previous reward
+        rnn_input = torch.cat([obs_enc, prev_action, prev_reward], dim=-1).float()
+
+        if training:
+            # Input rnn: (batch size, sequence length, features)
+            rnn_out, rnn_state_out = self.rnn(rnn_input, rnn_state)
+        else:
+            # Input rnn: (1, 1, features)
+            # Alternative to training bool: len(rnn_input) == 2 do the unsqueezing.
+
+            # rnn_input = rnn_input.unsqueeze(1)
+            rnn_out, rnn_state_out = self.rnn(rnn_input, rnn_state)
+            rnn_out = rnn_out.squeeze(1)
+            # Output rnn: (1, features)
+
+        return rnn_out, rnn_state_out
+
+    def get_value(self, obs, prev_action, prev_reward, rnn_state, training=False):
+        rnn_out, rnn_state = self.recurrent_state(
+            obs, prev_action, prev_reward, rnn_state, training
+        )
+
+        return self.critic(rnn_out), rnn_state
+
+    def get_action(
+        self, obs, prev_action, prev_reward, rnn_state, action=None, training=False
+    ):
+        rnn_out, rnn_state = self.recurrent_state(
+            obs, prev_action, prev_reward, rnn_state, training
+        )
+
+        action, log_prob, entropy  = self.actor(rnn_out, action)
+
+        return action, log_prob, entropy, rnn_state
+
+    def step(self, obs, prev_action, prev_reward, rnn_state):
+        with torch.no_grad():
+            rnn_out, rnn_state = self.recurrent_state(
+                obs, prev_action, prev_reward, rnn_state
+            )
+
+            action, log_prob, entropy,  = self.actor(rnn_out)
+            value = self.critic(rnn_out)
+
+        return action, value, log_prob, rnn_state
 
 
 def _make_envs_common(
@@ -320,220 +250,6 @@ make_envs = partial(_make_envs_common, terminate_on_success=False)
 make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
 
 
-class MetaEpisode:
-    def __init__(self, args):
-        self.step = 1
-        self.max_episode_steps = args.max_episode_steps
-
-        self.obs = torch.zeros(
-            args.max_episode_steps + 1,
-            args.n_episodes_per_trial,
-            *envs.single_observation_space.shape,
-        )
-        self.actions = torch.zeros(
-            args.max_episode_steps,
-            args.n_episodes_per_trial,
-            *envs.single_action_space.shape,
-        )
-        self.rewards = torch.zeros(args.max_episode_steps, args.n_episodes_per_trial, 1)
-        self.values = torch.zeros(
-            args.max_episode_steps + 1, args.n_episodes_per_trial, 1
-        )
-
-        self.logprobs = torch.zeros(
-            args.max_episode_steps,
-            args.n_episodes_per_trial,
-            *envs.single_action_space.shape,
-        )
-        self.dones = torch.zeros(
-            args.max_episode_steps + 1, args.n_episodes_per_trial, 1
-        )
-
-        self.states_actor = torch.zeros(
-            args.max_episode_steps + 1,
-            args.n_episodes_per_trial,
-            args.recurrent_state_size,
-        )
-        self.states_critic = torch.zeros(
-            args.max_episode_steps + 1,
-            args.n_episodes_per_trial,
-            args.recurrent_state_size,
-        )
-
-        self.returns = torch.zeros(
-            args.max_episode_steps + 1, args.n_episodes_per_trial, 1
-        )
-
-    def to_device(self, device: torch.device) -> None:
-        self.obs = self.obs.to(device)
-        self.actions = self.actions.to(device)
-        self.rewards = self.rewards.to(device)
-        self.values = self.values.to(device)
-        self.logprobs = self.logprobs.to(device)
-        self.dones = self.dones.to(device)
-        self.states_actor = self.states_actor.to(device)
-        self.states_critic = self.states_critic.to(device)
-        self.returns = self.returns.to(device)
-
-    def add(
-        self,
-        obs,
-        states_actor,
-        states_critic,
-        actions,
-        logprobs,
-        values,
-        rewards,
-        dones,
-    ):
-        if self.step > self.max_episode_steps:
-            raise IndexError("Step limit reached")
-
-        self.obs[self.step + 1].copy_(torch.from_numpy(obs))
-        self.dones[self.step + 1].copy_(torch.from_numpy(done[:, None]))
-        self.actions[self.step].copy_(actions)
-        self.logprobs[self.step].copy_(logprobs)
-        self.values[self.step].copy_(values[:, None])
-        self.rewards[self.step].copy_(torch.from_numpy(rewards[:, None]))
-
-        self.states_actor[self.step + 1].copy_(states_actor)
-        self.states_critic[self.step + 1].copy_(states_critic)
-
-        self.step = self.step + 1
-
-    def compute_returns(
-        self, next_value: torch.Tensor, use_gae: bool, gamma: float, gae_lambda: float
-    ) -> None:
-        if use_gae:
-            self.values[-1] = next_value
-            gae = 0
-            for step in reversed(range(self.rewards.size(0))):
-                delta = (
-                    self.rewards[step]
-                    + gamma * self.values[step + 1] * (1 - self.dones[step + 1])
-                    - self.values[step]
-                )
-                gae = delta + gamma * gae_lambda * (1 - self.dones[step + 1]) * gae
-                self.returns[step] = gae + self.values[step]
-        else:
-            self.returns[-1] = next_value
-            for step in reversed(range(self.rewards.size(0))):
-                self.returns[step] = (
-                    self.returns[step + 1] * gamma * (1 - self.dones[step + 1])
-                    + self.rewards[step]
-                )
-
-
-class MetaBatchSampler:
-    def __init__(self, batches, device: torch.device):
-        self.meta_episode_batches = batches
-        self.device = device
-
-        self.obs = self._concat_attr("obs")
-        self.rewards = self._concat_attr("rewards")
-        self.values = self._concat_attr("values")
-        self.returns = self._concat_attr("returns")
-        self.logprobs = self._concat_attr("logprobs")
-        self.actions = self._concat_attr("actions")
-
-        self.states_actor = self._concat_attr("states_actor")
-        self.states_critic = self._concat_attr("states_critic")
-
-        self.dones = self._concat_attr("dones")
-
-    def _concat_attr(self, attr: str) -> torch.Tensor:
-        """
-        Concatenate attribute values.
-
-        Args:
-          attr (str): Attribute whose values to concatenate.
-
-        Returns:
-          torch.Tensor
-        """
-        tensors = [
-            getattr(meta_episode_batch, attr)
-            for meta_episode_batch in self.meta_episode_batches
-        ]
-
-        return torch.cat(tensors=tensors, dim=1).to(self.device)
-
-    def sample(self, advantages: torch.Tensor, num_minibatches: int):
-        max_episode_steps = self.rewards.shape[0]
-        n_episodes_per_trial = self.rewards.shape[1]
-
-        num_envs_per_batch = n_episodes_per_trial // num_minibatches
-        perm = torch.randperm(n_episodes_per_trial)
-
-        for start_ind in range(0, n_episodes_per_trial, num_envs_per_batch):
-            obs_batch = []
-            actions_batch = []
-            values_batch = []
-            return_batch = []
-            dones_batch = []
-            old_logprobs_batch = []
-            adv_targ = []
-
-            states_actor_batch = []
-            states_critic_batch = []
-
-            for offset in range(num_envs_per_batch):
-                ind = perm[start_ind + offset]
-
-                obs_batch.append(self.obs[:-1, ind])
-                actions_batch.append(self.actions[:, ind])
-                values_batch.append(self.values[:-1, ind])
-                return_batch.append(self.returns[:-1, ind])
-
-                dones_batch.append(self.dones[:-1, ind])
-                old_logprobs_batch.append(self.logprobs[:, ind])
-                adv_targ.append(advantages[:, ind])
-
-                states_actor_batch.append(self.states_actor[0:1, ind])
-                states_critic_batch.append(self.states_critic[0:1, ind])
-
-            T, N = max_episode_steps, num_envs_per_batch
-            obs_batch = torch.stack(obs_batch, 1)
-            actions_batch = torch.stack(actions_batch, 1)
-            values_batch = torch.stack(values_batch, 1)
-            return_batch = torch.stack(return_batch, 1)
-            dones_batch = torch.stack(dones_batch, 1)
-            old_logprobs_batch = torch.stack(old_logprobs_batch, 1)
-            adv_targ = torch.stack(adv_targ, 1)
-
-            # recurrent states
-            states_actor_batch = torch.stack(states_actor_batch, 1).view(N, -1)
-
-            states_critic_batch = torch.stack(states_critic_batch, 1).view(N, -1)
-
-            # flatten the (T, N, ...) tensors to (T * N, ...)
-            obs_batch = _flatten(T, N, obs_batch)
-            actions_batch = _flatten(T, N, actions_batch)
-            values_batch = _flatten(T, N, values_batch)
-            return_batch = _flatten(T, N, return_batch)
-            dones_batch = _flatten(T, N, dones_batch)
-            old_logprobs_batch = _flatten(T, N, old_logprobs_batch)
-
-            adv_targ = _flatten(T, N, adv_targ)
-
-        yield obs_batch, states_actor_batch, states_critic_batch, actions_batch, values_batch, return_batch, dones_batch, old_logprobs_batch, adv_targ
-
-
-def _flatten(T: int, N: int, _tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Flatten a given tensor containing rollout information.
-
-    Args:
-        T (int): Corresponds to the number of steps in the rollout.
-        N (int): Number of processes running.
-        _tensor (torch.Tensor): Tensor to flatten.
-
-    Returns:
-        torch.Tensor
-    """
-    return _tensor.view(T * N, *_tensor.size()[2:])
-
-
 def rl2_evaluation(
     args,
     agent,
@@ -542,27 +258,31 @@ def rl2_evaluation(
     device=torch.device("cpu"),
 ):
     obs, _ = eval_envs.reset()
-    successes = np.zeros(eval_envs.num_envs)
-    episodic_returns = [[] for _ in range(eval_envs.num_envs)]
-
+    NUM_TASKS = eval_envs.num_envs
+    successes = np.zeros(NUM_TASKS)
+    episodic_returns = [[] for _ in range(NUM_TASKS)]
     start_time = time.time()
-    # initial states
-    actor_state = torch.zeros(
-        eval_envs.num_envs, args.recurrent_state_size, device=device
+    rnn_state = agent.init_state(NUM_TASKS)
+    prev_action = (
+        torch.tensor(
+            np.array(
+                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
+            )
+        )
+        .to(device)
+        .unsqueeze(1)
     )
-    critic_state = torch.zeros(
-        eval_envs.num_envs, args.recurrent_state_size, device=device
-    )
+    prev_reward = torch.tensor([0] * NUM_TASKS).to(device).view(NUM_TASKS, 1, 1)
 
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
         with torch.no_grad():
-            agent_dict = agent.get_action_and_value(
-                torch.tensor(obs, device=device), actor_state, critic_state
-            )
-        actions = agent_dict["action"]
-        obs, _, _, _, infos = eval_envs.step(actions.cpu().numpy())
-        actor_state = agent_dict["actor_state"]
-        critic_state = agent_dict["critic_state"]
+            obs = torch.tensor(obs).to(device).float().unsqueeze(1)
+            action, value, log_prob, rnn_state = agent.step(obs, prev_action, prev_reward, rnn_state)
+
+        obs, reward, _, _, infos = eval_envs.step(action.cpu().numpy())
+
+        prev_action = action.detach().view(NUM_TASKS, 1, -1)
+        prev_reward = torch.tensor(reward).to(device).view(NUM_TASKS, 1, 1)
 
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
@@ -610,14 +330,12 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    if args.env_id == "MT10":
-        benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == "ML10":
+    if args.env_id == "ML10":
         benchmark = metaworld.ML10(seed=args.seed)
-    elif args.env_id == "MT50":
-        benchmark = metaworld.MT50(seed=args.seed)
     elif args.env_id == "ML50":
         benchmark = metaworld.ML50(seed=args.seed)
+    else:
+        benchmark = metaworld.ML1(args.env_id, seed=args.seed)
 
     # env setup
     envs = make_envs(benchmark, args.seed, args.max_episode_steps, train=True)
@@ -633,15 +351,13 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
-    agent = Agent(envs, args).to(torch.float32).to(device)
+    agent = Agent(envs, args, device).to(torch.float32).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
-
-    # ALGO Logic: Storage setup
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
+    obs, _ = envs.reset(seed=args.seed)
     num_updates = int(args.total_timesteps // args.batch_size)
 
     global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
@@ -657,24 +373,30 @@ if __name__ == "__main__":
         meta_trial = list()
         # collect a trial of n episodes per task
         for meta_ep in range(int(NUM_TASKS / args.n_episodes_per_trial)):
+            meta_rb = MetaRolloutBuffer(envs, args, device, NUM_TASKS)
+            rnn_state = agent.init_state(NUM_TASKS)
+            prev_action = (
+                torch.tensor(
+                    np.array(
+                        [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
+                    )
+                )
+                .to(device)
+                .unsqueeze(1)
+            )
+            prev_reward = torch.tensor([0] * NUM_TASKS).to(device).view(NUM_TASKS, 1, 1)
 
-            meta_episodes = MetaEpisode(args)
-            meta_episodes.obs[0].copy_(torch.from_numpy(next_obs))
-
-            for meta_step in range(args.max_episode_steps - 1):
+            for meta_step in range(args.max_episode_steps):
                 global_step += 1 * args.num_envs
                 # ALGO LOGIC: action logic
                 with torch.no_grad():
-                    agent_dict = agent.get_action_and_value(
-                        meta_episodes.obs[meta_step].to(device),
-                        meta_episodes.states_actor[meta_step].to(device),
-                        meta_episodes.states_critic[meta_step].to(device),
-                    )
-                    action = agent_dict["action"]
-                    logprob = agent_dict["logprob"].unsqueeze(-1)
-                    value = agent_dict["value"].unsqueeze(-1)
-                    actor_state = agent_dict["actor_state"]
-                    critic_state = agent_dict["critic_state"]
+                    if not torch.is_tensor(obs):
+                        obs = torch.tensor(obs).to(device).float().unsqueeze(1)
+                    # print("OBS SHAPE", obs.shape)
+                    # print("prev_action shape:", prev_action.shape)
+                    # print("prev_reward shape:", prev_reward.shape)
+                    # print("rnn_state shape:", rnn_state.shape)
+                    action, value, log_prob, rnn_state = agent.step(obs, prev_action, prev_reward, rnn_state)
 
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(
@@ -682,16 +404,21 @@ if __name__ == "__main__":
                 )
                 done = np.logical_or(terminated, truncated)
 
-                meta_episodes.add(
-                    next_obs,
-                    actor_state,
-                    critic_state,
-                    action,
-                    logprob,
-                    value.flatten(),
-                    reward,
-                    done,
-                )
+                for tidx in range(NUM_TASKS):
+                    meta_rb.store(
+                        obs[tidx],
+                        action[tidx],
+                        reward[tidx],
+                        prev_action[tidx],
+                        prev_reward[tidx],
+                        done[tidx],
+                        value[tidx],
+                        log_prob[tidx],
+                        tidx,
+                    )
+                obs = next_obs
+                prev_action = action.detach().view(NUM_TASKS, 1, -1)
+                prev_reward = torch.tensor(reward).to(device).view(NUM_TASKS, 1, 1)
 
                 # Only print when at least 1 env is done
                 if "final_info" not in infos:
@@ -704,15 +431,10 @@ if __name__ == "__main__":
                     global_episodic_return.append(info["episode"]["r"])
                     global_episodic_length.append(info["episode"]["l"])
 
+            obs = torch.tensor(obs).to(device).float().unsqueeze(1)
             with torch.no_grad():
-                next_value = agent.get_value(
-                    meta_episodes.obs[-1].to(device),
-                    meta_episodes.states_critic[-1].to(device),
-                )
-            meta_episodes.compute_returns(
-                next_value, args.use_gae, args.gamma, args.gae_lambda
-            )
-            meta_trial.append(meta_episodes)
+                _, value, _, _ = agent.step(obs, prev_action, prev_reward, rnn_state)
+            meta_rb.finish_path(value, done)
 
         if global_step % 500 == 0 and global_episodic_return:
             writer.add_scalar(
@@ -729,118 +451,100 @@ if __name__ == "__main__":
                 f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
             )
 
-
         clipfracs = []
-        minibatch_sampler = MetaBatchSampler(meta_trial, device)
-        advantages = (
-            minibatch_sampler.returns[:-1] - minibatch_sampler.values[:-1]
-        )
-        advantages = (advantages - advantages.mean()) / (
-            advantages.std() + 1e-5
-        )
+        batch, batch_size = meta_rb.get()
+
         for epoch in range(args.update_epochs):
-            minibatches = minibatch_sampler.sample(advantages, 4)
+            obs_batch = batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
+            action_batch = batch["action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
+            value_batch = batch["value"].to(device).view(-1,args.max_episode_steps,1)
+            adv_targ = batch["advantage"].to(device).view(-1,args.max_episode_steps, 1)
+            old_logprob_batch = batch["log_prob"].to(device).view(-1,args.max_episode_steps, 1)
+            reward_batch = batch["reward"].to(device).view(-1,args.max_episode_steps, 1)
+            return_batch = batch["return"].to(device).view(-1,args.max_episode_steps, 1)
+            prev_reward_batch = batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
+            prev_action_batch = batch["prev_action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
+            done_batch = batch["done"].to(device).view(-1, args.max_episode_steps, 1)
 
-            for sample in minibatches:
-                (
-                    obs_batch,
-                    states_actor_batch,
-                    states_critic_batch,
-                    actions_batch,
-                    values_batch,
-                    return_batch,
-                    dones_batch,
-                    old_logprobs_batch,
-                    adv_targ,
-                ) = sample
+            init_rnn_state = agent.init_state(obs_batch.shape[0])
+            pi, newlogprob, entropy, rnn_state = agent.get_action(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, action=prev_action_batch, training=True)
 
-                agent_dict = agent.get_action_and_value(
-                    obs_batch, states_actor_batch, states_critic_batch
-                )
-                newlogprob = agent_dict["logprob"].sum(-1)
-                newvalue = agent_dict["value"]
-                entropy = agent_dict["entropy"]
-                logratio = newlogprob - old_logprobs_batch
-                ratio = torch.exp(logratio)
+            logratio = newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1) - old_logprob_batch
+            ratio = torch.exp(logratio)
 
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [
-                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-                    ]
+            with torch.no_grad():
+                # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                old_approx_kl = (-logratio).mean()
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfracs += [
+                    ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                ]
 
-                pg_loss1 = -adv_targ * ratio
-                pg_loss2 = -adv_targ * torch.clamp(
-                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            pg_loss1 = -adv_targ * ratio
+            pg_loss2 = -adv_targ * torch.clamp(
+                ratio, 1 - args.clip_coef, 1 + args.clip_coef
+            )
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - values_batch) ** 2
-                    v_clipped = values_batch + torch.clamp(
-                        newvalue - values_batch,
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - return_batch) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
+            newvalue, rnn_state = agent.get_value(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, training=True,)
 
-                entropy_loss = entropy.mean()
-                loss = (
-                    pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+            if args.clip_vloss:
+                v_loss_unclipped = (newvalue - return_batch) ** 2
+                v_clipped = value_batch + torch.clamp(
+                    newvalue - value_batch,
+                    -args.clip_coef,
+                    args.clip_coef,
                 )
+                v_loss_clipped = (v_clipped - return_batch) ** 2
+                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                v_loss = 0.5 * v_loss_max.mean()
+            else:
+                v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-                optimizer.step()
+            entropy_loss = entropy.mean()
+            loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef)
 
-                if args.target_kl is not None:
-                    if approx_kl > args.target_kl:
-                        break
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+            optimizer.step()
 
-                y_pred, y_true = (
-                    values_batch.cpu().numpy(),
-                    return_batch.cpu().numpy(),
-                )
-                var_y = np.var(y_true)
-                explained_var = (
-                    np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-                )
+            if args.target_kl is not None:
+                if approx_kl > args.target_kl:
+                    break
 
-                # TRY NOT TO MODIFY: record rewards for plotting purposes
-                writer.add_scalar(
-                    "charts/learning_rate",
-                    optimizer.param_groups[0]["lr"],
-                    global_step,
-                )
-                writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-                writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-                writer.add_scalar(
-                    "losses/entropy", entropy_loss.item(), global_step
-                )
-                writer.add_scalar(
-                    "losses/old_approx_kl", old_approx_kl.item(), global_step
-                )
-                writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-                writer.add_scalar(
-                    "losses/clipfrac", np.mean(clipfracs), global_step
-                )
-                writer.add_scalar(
-                    "losses/explained_variance", explained_var, global_step
-                )
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
+            y_pred, y_true = (
+                value_batch.cpu().numpy(),
+                return_batch.cpu().numpy(),
+            )
+            var_y = np.var(y_true)
+            explained_var = (
+                np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+            )
+
+            # TRY NOT TO MODIFY: record rewards for plotting purposes
+            writer.add_scalar(
+                "charts/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                global_step,
+            )
+            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+            writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+            writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+            writer.add_scalar(
+                "losses/old_approx_kl", old_approx_kl.item(), global_step
+            )
+            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+            writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+            writer.add_scalar(
+                "losses/explained_variance", explained_var, global_step
+            )
+            print("SPS:", int(global_step / (time.time() - start_time)))
+            writer.add_scalar(
+                "charts/SPS",
+                int(global_step / (time.time() - start_time)),
+                global_step,
+            )
 
         if global_step % args.eval_freq == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
@@ -859,6 +563,7 @@ if __name__ == "__main__":
                 + f" return: {eval_returns:.4f}"
             )
             agent.train()
+
         global_step += 1
 
     envs.close()
