@@ -90,16 +90,6 @@ class Batch(NamedTuple):
     dones: ArrayLike
     task_ids: ArrayLike
 
-class TanhNormal(distrax.Transformed):
-    def __init__(self, loc, scale):
-        normal_dist = distrax.Normal(loc, scale)
-        tanh_bijector = distrax.Tanh()
-        super().__init__(distribution=normal_dist, bijector=tanh_bijector)
-
-    def mean(self):
-        return self.bijector.forward(self.distribution.mean())
-
-
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
         return jax.random.uniform(key, shape=shape, minval=-bound, maxval=bound, dtype=dtype)
@@ -129,8 +119,10 @@ class Actor(nn.Module):
         log_sigma = nn.Dense(self.num_actions, kernel_init=uniform_init(1e-3), bias_init=uniform_init(1e-3))(x)
         mu = nn.Dense(self.num_actions, kernel_init=uniform_init(1e-3), bias_init=uniform_init(1e-3))(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        dist = TanhNormal(mu, jnp.exp(log_sigma))
-        return dist
+        return distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
+            distrax.Block(distrax.Tanh(), ndims=1)
+        )
 
 
 @jax.jit
@@ -151,7 +143,8 @@ def get_deterministic_action(
     obs: ArrayLike,
     task_ids: ArrayLike,
 ) -> jax.Array:
-    return actor.apply_fn(actor.params, obs, task_ids).mean()
+    dist = actor.apply_fn(actor.params, obs, task_ids)
+    return jnp.tanh(dist.distribution.loc)
 
 @jax.jit
 def sample_and_log_prob(
@@ -184,8 +177,7 @@ class Critic(nn.Module):
         indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        out = nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(x)
-        return out.squeeze(-1)
+        return nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(x)
 
 
 class VectorCritic(nn.Module):
@@ -203,8 +195,7 @@ class VectorCritic(nn.Module):
             out_axes=0,
             axis_size=self.n_critics,
         )
-        q_values = vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
-        return q_values
+        return vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
 
 
 class CriticTrainState(TrainState):
@@ -276,14 +267,12 @@ class Agent:
     def get_action_train(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, state, task_id, key)
-        actions = jax.device_get(actions)
-        return actions, key
+        return jax.device_get(actions), key
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
         actions = get_deterministic_action(self.actor, state, task_id)
-        actions = jax.device_get(actions)
-        return actions
+        return jax.device_get(actions)
 
     @staticmethod
     @jax.jit
@@ -320,11 +309,10 @@ def update(
     q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(q_values, axis=0).reshape(-1,1) - alpha_val * next_action_log_probs.sum(-1).reshape(-1, 1)
+        min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
         next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
-
         q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
-        return 0.5 * ((q_pred - next_q_value.reshape(1, -1)) ** 2).mean(1).sum(0), q_pred.mean()
+        return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
@@ -337,7 +325,7 @@ def update(
 
     def alpha_loss(params: jax.Array, log_probs: jax.Array):
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
-        return (-log_alpha * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
+        return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
     def update_alpha(_alpha: TrainState, log_probs: jax.Array) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
         alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(_alpha.params, log_probs)
@@ -362,7 +350,7 @@ def update(
 
         q_values = _critic.apply_fn(_critic.params, batch.observations, action_samples, batch.task_ids)
         min_qf_values = jnp.min(q_values, axis=0)
-        return (_alpha_val * log_probs.sum(-1).reshape(-1, 1) - min_qf_values).mean(), (_alpha, _critic, logs)
+        return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (_alpha, _critic, logs)
 
     (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
     actor = actor.apply_gradients(grads=actor_grads)
