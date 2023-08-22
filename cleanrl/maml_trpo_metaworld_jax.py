@@ -163,7 +163,7 @@ class MLPTorso(nn.Module):
 class GaussianPolicy(nn.Module):
     """The Policy network."""
 
-    output_dim: int
+    num_actions: int
     num_layers: int
     hidden_dim: int
 
@@ -174,11 +174,11 @@ class GaussianPolicy(nn.Module):
         mean = MLPTorso(
             num_hidden_layers=self.num_layers,
             hidden_dim=self.hidden_dim,
-            output_dim=self.output_dim,
+            output_dim=self.num_actions,
         )(x)
         # fmt: off
         #                               zeros_init = log(ones_init)
-        log_std = self.param("log_std", nn.initializers.zeros_init(), (self.output_dim,))
+        log_std = self.param("log_std", nn.initializers.zeros_init(), (self.num_actions,))
         log_std = jnp.maximum(log_std, self.LOG_STD_MIN)
         # fmt: on
         log_std = jnp.broadcast_to(log_std, mean.shape)
@@ -201,7 +201,7 @@ class MetaVectorPolicy(nn.Module):
             axis_size=self.n_tasks,
         )
         mean, log_std = vmap_policy(
-            output_dim=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
+            num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
         )(state)
         return distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
 
@@ -213,7 +213,7 @@ class MetaVectorPolicy(nn.Module):
         rng: jax.random.PRNGKeyArray,
         init_args: list,
     ) -> FrozenDict:
-        return GaussianPolicy(output_dim=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(
+        return GaussianPolicy(num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(
             rng, *init_args
         )
 
@@ -252,8 +252,6 @@ class MetaTrainState(TrainState):
 # MAMLTRPO
 @jax.jit
 def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
-    assert rollouts.log_probs is not None and rollouts.means is not None and rollouts.stds is not None
-
     def inner_opt_objective(_theta: FrozenDict):
         log_probs = jnp.expand_dims(policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions), -1)
         return -(log_probs * rollouts.advantages).mean()
@@ -362,7 +360,7 @@ def outer_step(
 # baseline, rather than a neural network used as a learned value function.
 #
 # The garage MAML implementation for Metaworld did use a Gaussian MLP Baseline, however,
-# after it does not seem to perform as well as the original LinearFeatureBaseline on the current iteration of
+# it does not seem to perform as well as the original LinearFeatureBaseline on the current iteration of
 # Metaworld at least and is unable to reproduce the original MAML results, while the LinearFeatureBaseline can.
 
 
@@ -426,9 +424,9 @@ class MAMLTRPO:
         backtrack_ratio: float,
         max_backtrack_iters: int,
     ):
-        baseline_init_key, policy_init_key = jax.random.split(init_key)
-
         self.num_tasks = envs.unwrapped.num_envs
+
+        self.inner_lr = inner_lr
 
         self.network_args = {
             "num_layers": num_layers,
@@ -436,11 +434,9 @@ class MAMLTRPO:
             "num_actions": np.prod(envs.single_action_space.shape),
         }
 
-        self.inner_lr = inner_lr
-
         # Init general parameters theta
         self.policy = None
-        theta = MetaVectorPolicy.init_single(**self.network_args, rng=policy_init_key, init_args=[init_obs])
+        theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
         self.init_multitask_policy(self.num_tasks, theta)
 
         self.train_state = MetaTrainState.create(
@@ -450,14 +446,14 @@ class MAMLTRPO:
             tx=optax.identity(),  # TRPO optimiser's in outer_step
         )
 
+        # Baseline
+        self.fit_baseline = LinearFeatureBaseline.fit_baseline
+
         # TRPO
         self.delta = delta
         self.cg_iters = cg_iters
         self.backtrack_ratio = backtrack_ratio
         self.max_backtrack_iters = max_backtrack_iters
-
-        # Baseline
-        self.fit_baseline = LinearFeatureBaseline.fit_baseline
 
     def init_multitask_policy(self, num_tasks: int, params: FrozenDict) -> None:
         self.num_tasks = num_tasks
@@ -481,13 +477,13 @@ class MAMLTRPO:
 
     def step(self, all_rollouts: Rollout) -> dict:
         self.train_state, logs = outer_step(
-            self.train_state,
-            all_rollouts,
-            self.num_tasks,
-            self.delta,
-            self.cg_iters,
-            self.backtrack_ratio,
-            self.max_backtrack_iters,
+            train_state=self.train_state,
+            all_rollouts=all_rollouts,
+            num_tasks=self.num_tasks,
+            delta=self.delta,
+            cg_iters=self.cg_iters,
+            backtrack_ratio=self.backtrack_ratio,
+            max_backtrack_iters=self.max_backtrack_iters,
         )
         return logs
 

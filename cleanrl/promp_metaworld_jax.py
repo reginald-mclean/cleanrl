@@ -55,7 +55,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10", help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=15_000_000,
-        help="total number of meta gradient steps")
+        help="total number timesteps to collect from the environment")
     parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -244,32 +244,20 @@ class MetaTrainState(TrainState):
     inner_train_state: TrainState
 
 
-@partial(jax.jit, static_argnames=("return_kl",))
-def inner_step(
-    policy: TrainState, rollouts: Rollout, return_kl: bool = False
-) -> Tuple[TrainState, Optional[jax.Array]]:
-    assert rollouts.log_probs is not None and rollouts.means is not None and rollouts.stds is not None
+@jax.jit
+def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
+    assert rollouts.log_probs is not None
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
-        theta_dist = policy.apply_fn(_theta, rollouts.observations)
-        theta_log_probs = jnp.expand_dims(theta_dist.log_prob(rollouts.actions), -1)
-
-        if return_kl:
-            kl = (
-                distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
-                .kl_divergence(theta_dist)
-                .mean(axis=1)  # Mean per rollout, not per task
-            )
-        else:
-            kl = None
+        theta_log_probs = jnp.expand_dims(policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions), -1)
 
         ratio = jnp.exp(theta_log_probs - rollouts.log_probs)
-        return -(ratio * rollouts.advantages).mean(), kl
+        return -(ratio * rollouts.advantages).mean()
 
-    grads, kl = jax.grad(inner_opt_objective, has_aux=True)(policy.params)
+    grads = jax.grad(inner_opt_objective)(policy.params)
     updated_policy = policy.apply_gradients(grads=grads)  # Inner gradient step
 
-    return updated_policy, kl
+    return updated_policy
 
 
 @partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks"))
@@ -289,8 +277,18 @@ def outer_step(
         # Adaptation steps using J^LR to go from theta to theta^\prime
         for i in range(len(all_rollouts) - 1):
             rollouts = all_rollouts[i]
-            inner_train_state, kl = inner_step(inner_train_state, rollouts, return_kl=True)
+
+            # Compute inner KL
+            theta_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
+            kl = (
+                distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
+                .kl_divergence(theta_dist)
+                .mean(axis=1)  # Mean per rollout, not per task
+            )
             kls.append(kl)
+
+            # Adapt
+            inner_train_state = inner_step(inner_train_state, rollouts)
 
         # Inner Train State now has theta^\prime
         # Compute J^Clip, Equation 11
@@ -380,6 +378,7 @@ class LinearFeatureBaseline:
         return baseline
 
 
+# Wrapper
 class ProMP:
     def __init__(
         self,
@@ -441,11 +440,16 @@ class ProMP:
             )
 
     def adapt(self, rollouts: Rollout) -> None:
-        self.policy, _ = inner_step(self.policy, rollouts)
+        self.policy = inner_step(self.policy, rollouts)
 
     def step(self, all_rollouts: Rollout) -> dict:
         self.train_state, logs = outer_step(
-            self.train_state, all_rollouts, self._eta, self._clip_eps, self._num_grad_steps, self.num_tasks
+            train_state=self.train_state,
+            all_rollouts=all_rollouts,
+            num_tasks=self.num_tasks,
+            eta=self._eta,
+            clip_eps=self._clip_eps,
+            num_grad_steps=self._num_grad_steps,
         )
         return logs
 
