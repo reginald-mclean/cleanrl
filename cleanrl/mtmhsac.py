@@ -123,7 +123,6 @@ class Actor(nn.Module):
         self.fc_logstd = nn.Linear(400, np.prod(env.single_action_space.shape))
 
     def forward(self, x):
-        x.shape[0]
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
 

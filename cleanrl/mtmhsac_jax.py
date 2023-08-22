@@ -144,7 +144,7 @@ def get_deterministic_action(
     task_ids: ArrayLike,
 ) -> jax.Array:
     dist = actor.apply_fn(actor.params, obs, task_ids)
-    return jnp.tanh(dist.distribution.loc)
+    return jnp.tanh(dist.distribution.mean())
 
 @jax.jit
 def sample_and_log_prob(
