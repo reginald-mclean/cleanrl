@@ -551,7 +551,7 @@ if __name__ == "__main__":
             obs = torch.tensor(obs).to(device).float().unsqueeze(1)
             with torch.no_grad():
                 _, value, _, _ = agent.step(obs, prev_action, prev_reward, rnn_state)
-            meta_rb.finish_path(value, done)
+            meta_rb.finish_path(value.cpu(), done)
 
         if global_step % 500 == 0 and global_episodic_return:
             print(
