@@ -630,7 +630,7 @@ if __name__ == "__main__":
                 for k, v in eval_metrics.items():
                     writer.add_scalar(k, v, total_steps)
                 print(
-                    f"global_step={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
+                    f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                     + f" return: {eval_returns:.4f}"
                 )
 
