@@ -79,8 +79,11 @@ def parse_args():
     return args
 
 
-def split_obs_task_id(obs: Union[jax.Array, npt.NDArray], num_tasks: int) -> Tuple[ArrayLike, ArrayLike]:
+def split_obs_task_id(
+    obs: Union[jax.Array, npt.NDArray], num_tasks: int
+) -> Tuple[ArrayLike, ArrayLike]:
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
+
 
 class Batch(NamedTuple):
     observations: ArrayLike
@@ -90,15 +93,20 @@ class Batch(NamedTuple):
     dones: ArrayLike
     task_ids: ArrayLike
 
+
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
-        return jax.random.uniform(key, shape=shape, minval=-bound, maxval=bound, dtype=dtype)
+        return jax.random.uniform(
+            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
+        )
+
     return _init
+
 
 class Actor(nn.Module):
     num_actions: int
     num_tasks: int
-    hidden_dims: int = "256,256,256"
+    hidden_dims: int = "400,400"
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
@@ -107,21 +115,34 @@ class Actor(nn.Module):
     def __call__(self, x: jax.Array, task_idx):
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
-                x = nn.Dense(h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
-                         kernel_init=nn.initializers.he_uniform(),
-                         bias_init=nn.initializers.constant(0.1))(x)
-                x = nn.relu(x)
+            x = nn.Dense(
+                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                kernel_init=nn.initializers.he_uniform(),
+                bias_init=nn.initializers.constant(0.1),
+            )(x)
+            x = nn.relu(x)
 
         # extract the task ids from the one-hot encodings of the observations
-        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
+        indices = (
+            jnp.arange(hidden_lst[-1])[None, :]
+            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
+        )
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        log_sigma = nn.Dense(self.num_actions, kernel_init=uniform_init(1e-3), bias_init=uniform_init(1e-3))(x)
-        mu = nn.Dense(self.num_actions, kernel_init=uniform_init(1e-3), bias_init=uniform_init(1e-3))(x)
+        log_sigma = nn.Dense(
+            self.num_actions,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(x)
+        mu = nn.Dense(
+            self.num_actions,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return distrax.Transformed(
             distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
-            distrax.Block(distrax.Tanh(), ndims=1)
+            distrax.Block(distrax.Tanh(), ndims=1),
         )
 
 
@@ -137,6 +158,7 @@ def sample_action(
     action = dist.sample(seed=action_key)
     return action, key
 
+
 @jax.jit
 def get_deterministic_action(
     actor: TrainState,
@@ -145,6 +167,7 @@ def get_deterministic_action(
 ) -> jax.Array:
     dist = actor.apply_fn(actor.params, obs, task_ids)
     return jnp.tanh(dist.distribution.mean())
+
 
 @jax.jit
 def sample_and_log_prob(
@@ -169,15 +192,22 @@ class Critic(nn.Module):
         x = jnp.hstack([state, action])
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
-                x = nn.Dense(h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
-                        kernel_init=nn.initializers.he_uniform(),
-                        bias_init=nn.initializers.constant(0.1),)(x)
-                x = nn.relu(x)
+            x = nn.Dense(
+                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                kernel_init=nn.initializers.he_uniform(),
+                bias_init=nn.initializers.constant(0.1),
+            )(x)
+            x = nn.relu(x)
         # extract the task ids from the one-hot encodings of the observations
-        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
+        indices = (
+            jnp.arange(hidden_lst[-1])[None, :]
+            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
+        )
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        return nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(x)
+        return nn.Dense(
+            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
+        )(x)
 
 
 class VectorCritic(nn.Module):
@@ -229,7 +259,9 @@ class Agent:
         self._gamma = gamma
 
         just_obs, task_id = jax.device_put(split_obs_task_id(init_obs, num_tasks))
-        random_action = jnp.array([self._action_space.sample() for _ in range(init_obs.shape[0])])
+        random_action = jnp.array(
+            [self._action_space.sample() for _ in range(init_obs.shape[0])]
+        )
 
         def _make_optimizer(lr: float, max_grad_norm: float = 0.0):
             optim = optax.adam(learning_rate=lr)
@@ -240,7 +272,11 @@ class Agent:
                 )
             return optim
 
-        actor_network = Actor(num_actions=int(np.prod(self._action_space.shape)), num_tasks=num_tasks, hidden_dims=args.actor_network)
+        actor_network = Actor(
+            num_actions=int(np.prod(self._action_space.shape)),
+            num_tasks=num_tasks,
+            hidden_dims=args.actor_network,
+        )
         key, actor_init_key = jax.random.split(init_key)
         self.actor = TrainState.create(
             apply_fn=actor_network.apply,
@@ -249,22 +285,30 @@ class Agent:
         )
 
         _, qf_init_key = jax.random.split(key, 2)
-        vector_critic_net = VectorCritic(num_tasks=num_tasks, hidden_dims=args.critic_network)
+        vector_critic_net = VectorCritic(
+            num_tasks=num_tasks, hidden_dims=args.critic_network
+        )
         self.critic = CriticTrainState.create(
             apply_fn=vector_critic_net.apply,
-            params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
-            target_params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
+            params=vector_critic_net.init(
+                qf_init_key, just_obs, random_action, task_id
+            ),
+            target_params=vector_critic_net.init(
+                qf_init_key, just_obs, random_action, task_id
+            ),
             tx=_make_optimizer(q_lr, clip_grad_norm),
         )
 
         self.alpha_train_state = TrainState.create(
             apply_fn=get_alpha,
-            params=jnp.ones(NUM_TASKS),  # Log alpha
+            params=jnp.zeros(NUM_TASKS),  # Log alpha
             tx=_make_optimizer(q_lr, max_grad_norm=0.0),
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
-    def get_action_train(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
+    def get_action_train(
+        self, obs: np.ndarray, key: jax.random.PRNGKeyArray
+    ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, state, task_id, key)
         return jax.device_get(actions), key
@@ -278,7 +322,9 @@ class Agent:
     @jax.jit
     def soft_update(tau: float, critic_state: CriticTrainState) -> CriticTrainState:
         qf_state = critic_state.replace(
-            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, tau)
+            target_params=optax.incremental_update(
+                critic_state.params, critic_state.target_params, tau
+            )
         )
         return qf_state
 
@@ -293,6 +339,7 @@ class Agent:
             "target_entropy": self.target_entropy,
         }
 
+
 @partial(jax.jit, static_argnames=("gamma", "target_entropy"))
 def update(
     actor: TrainState,
@@ -302,33 +349,50 @@ def update(
     target_entropy: float,
     gamma: float,
     key: jax.random.PRNGKeyArray,
-) -> Tuple[Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray]:
+) -> Tuple[
+    Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray
+]:
     next_actions, next_action_log_probs, key = sample_and_log_prob(
         actor, actor.params, batch.next_observations, batch.task_ids, key
     )
-    q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
+    q_values = critic.apply_fn(
+        critic.target_params, batch.next_observations, next_actions, batch.task_ids
+    )
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
-        next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
-        q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
+        min_qf_next_target = jnp.min(
+            q_values, axis=0
+        ) - alpha_val * next_action_log_probs.reshape(-1, 1)
+        next_q_value = jax.lax.stop_gradient(
+            batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
+        )
+        q_pred = critic.apply_fn(
+            params, batch.observations, batch.actions, batch.task_ids
+        )
         return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
     ) -> Tuple[CriticTrainState, dict]:
-        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(critic_loss, has_aux=True)(
-            _critic.params, alpha_val
-        )
+        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(
+            critic_loss, has_aux=True
+        )(_critic.params, alpha_val)
         _critic = _critic.apply_gradients(grads=critic_grads)
-        return _critic, {"losses/qf_values": qf_values, "losses/qf_loss": critic_loss_value}
+        return _critic, {
+            "losses/qf_values": qf_values,
+            "losses/qf_loss": critic_loss_value,
+        }
 
     def alpha_loss(params: jax.Array, log_probs: jax.Array):
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
         return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
-    def update_alpha(_alpha: TrainState, log_probs: jax.Array) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
-        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(_alpha.params, log_probs)
+    def update_alpha(
+        _alpha: TrainState, log_probs: jax.Array
+    ) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
+        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(
+            _alpha.params, log_probs
+        )
         _alpha = _alpha.apply_gradients(grads=alpha_grads)
         alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
         return (
@@ -348,11 +412,19 @@ def update(
         _critic, critic_logs = update_critic(critic, _alpha_val)
         logs = {**alpha_logs, **critic_logs}
 
-        q_values = _critic.apply_fn(_critic.params, batch.observations, action_samples, batch.task_ids)
+        q_values = _critic.apply_fn(
+            _critic.params, batch.observations, action_samples, batch.task_ids
+        )
         min_qf_values = jnp.min(q_values, axis=0)
-        return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (_alpha, _critic, logs)
+        return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (
+            _alpha,
+            _critic,
+            logs,
+        )
 
-    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
+    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(
+        actor_loss, has_aux=True
+    )(actor.params)
     actor = actor.apply_gradients(grads=actor_grads)
 
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
@@ -377,7 +449,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     if args.save_model:  # Orbax checkpoints
@@ -402,13 +475,21 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
-    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
-    eval_envs = make_eval_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
+    use_one_hot_wrapper = (
+        True if "MT10" in args.env_id or "MT50" in args.env_id else False
+    )
+    envs = make_envs(
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+    )
+    eval_envs = make_eval_envs(
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+    )
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    assert isinstance(
+        envs.single_action_space, gym.spaces.Box
+    ), "only continuous action space is supported"
 
     # agent setup
     rb = MultiTaskReplayBuffer(
@@ -444,7 +525,9 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
+            actions = np.array(
+                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
+            )
         else:
             actions, key = agent.get_action_train(obs, key)
 
@@ -473,7 +556,9 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
+            print(
+                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
+            )
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),
@@ -491,7 +576,14 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
             observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
             next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-            batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
+            batch = Batch(
+                observations,
+                data.actions,
+                data.rewards,
+                next_observations,
+                data.dones,
+                task_ids,
+            )
 
             # Update agent
             (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
@@ -514,12 +606,18 @@ if __name__ == "__main__":
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
                 print("SPS:", int(total_steps / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(total_steps / (time.time() - start_time)), total_steps)
+                writer.add_scalar(
+                    "charts/SPS",
+                    int(total_steps / (time.time() - start_time)),
+                    total_steps,
+                )
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 eval_success_rate, eval_returns, eval_success_per_task = evaluation(
-                    agent=agent, eval_envs=eval_envs, num_episodes=args.evaluation_num_episodes,
+                    agent=agent,
+                    eval_envs=eval_envs,
+                    num_episodes=args.evaluation_num_episodes,
                 )
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
@@ -543,7 +641,10 @@ if __name__ == "__main__":
                     ckpt["global_step"] = global_step
                     save_args = orbax_utils.save_args_from_target(ckpt)
                     ckpt_manager.save(
-                        step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=eval_metrics
+                        step=global_step,
+                        items=ckpt,
+                        save_kwargs={"save_args": save_args},
+                        metrics=eval_metrics,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
 
