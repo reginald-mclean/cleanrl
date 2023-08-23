@@ -438,7 +438,7 @@ class MetaRolloutBuffer:
     def empty_buffer(self):
         for key, val in self.rollout_data.items():
             self.rollout_data[key] = torch.zeros_like(val)
-        self.curr_size = 0
+        self.ptr = 0
 
     def finish_path(self, last_value, last_termination):
         task_ids = np.random.permutation(np.arange(0, self.num_tasks))

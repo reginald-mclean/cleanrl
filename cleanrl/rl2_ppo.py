@@ -41,7 +41,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=2, help="number of episodes sampled per trial/meta-batch")
+    parser.add_argument("--n-episodes-per-trial", type=int, default=30, help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--max-episode-steps", type=int, default=500, help="maximum number of timesteps in one episode during training")
 
@@ -54,19 +54,13 @@ def parse_args():
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=10,
-        help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=10000,
-        help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=32,
-        help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=15,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -76,21 +70,19 @@ def parse_args():
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=2e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.0,
+    parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=2,
-        help="how many updates to do before evaluating the agent")
+
+    parser.add_argument("--eval-freq", type=int, default=100_000,
+        help="how many steps to do before evaluating the agent")
     parser.add_argument("--evaluation-num-episodes", type=int, default=10,
         help="the number episodes to run per evaluation")
 
     args = parser.parse_args()
-
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
     # fmt: on
     return args
 
@@ -259,8 +251,10 @@ def rl2_evaluation(
 ):
     obs, _ = eval_envs.reset()
     NUM_TASKS = eval_envs.num_envs
+
     successes = np.zeros(NUM_TASKS)
     episodic_returns = [[] for _ in range(NUM_TASKS)]
+
     start_time = time.time()
     rnn_state = agent.init_state(NUM_TASKS)
     prev_action = (
@@ -289,8 +283,7 @@ def rl2_evaluation(
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                episodic_returns[i].append(info["episode"]["r"])
-                # Discard any extra episodes from envs that ran ahead
+                episodic_returns[i].append(float(info["episode"]["r"][0]))
                 if len(episodic_returns[i]) <= num_episodes:
                     successes[i] += int(info["success"])
 
@@ -298,7 +291,94 @@ def rl2_evaluation(
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
 
-    return (successes / num_episodes).mean(), np.mean(episodic_returns)
+    success_rate_per_task = successes / num_episodes
+    mean_success_rate = np.mean(success_rate_per_task)
+    mean_returns = np.mean(episodic_returns)
+
+    return mean_success_rate, mean_returns, success_rate_per_task
+
+def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps, args):
+    clipfracs = []
+    batch, batch_size = meta_rb.get()
+
+    for epoch in range(args.update_epochs):
+        obs_batch = batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
+        action_batch = batch["action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
+        value_batch = batch["value"].to(device).view(-1,args.max_episode_steps,1)
+        advantage_batch = batch["advantage"].to(device).view(-1,args.max_episode_steps, 1)
+        old_logprob_batch = batch["log_prob"].to(device).view(-1,args.max_episode_steps, 1)
+        return_batch = batch["return"].to(device).view(-1,args.max_episode_steps, 1)
+        prev_reward_batch = batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
+        prev_action_batch = batch["prev_action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
+
+        init_rnn_state = agent.init_state(obs_batch.shape[0])
+        pi, newlogprob, entropy, rnn_state = agent.get_action(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, action=action_batch, training=True)
+
+        logratio = newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1) - old_logprob_batch
+        ratio = torch.exp(logratio)
+
+        with torch.no_grad():
+            # calculate approx_kl http://joschu.net/blog/kl-approx.html
+            old_approx_kl = (-logratio).mean()
+            approx_kl = ((ratio - 1) - logratio).mean()
+            clipfracs += [
+                ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+            ]
+
+        if args.norm_adv:
+            advantage_batch = (advantage_batch - advantage_batch.mean()) / (advantage_batch.std() + 1e-8)
+
+        pg_loss1 = -advantage_batch * ratio
+        pg_loss2 = -advantage_batch * torch.clamp(
+            ratio, 1 - args.clip_coef, 1 + args.clip_coef
+        )
+        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+        newvalue, rnn_state = agent.get_value(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, training=True,)
+
+        if args.clip_vloss:
+            v_loss_unclipped = (newvalue - return_batch) ** 2
+            v_clipped = value_batch + torch.clamp(
+                newvalue - value_batch,
+                -args.clip_coef,
+                args.clip_coef,
+            )
+            v_loss_clipped = (v_clipped - return_batch) ** 2
+            v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+            v_loss = 0.5 * v_loss_max.mean()
+        else:
+            v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
+
+        entropy_loss = entropy.mean()
+        loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef)
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+        optimizer.step()
+
+        if args.target_kl is not None:
+            if approx_kl > args.target_kl:
+                break
+
+        y_pred, y_true = (
+            value_batch.cpu().numpy(),
+            return_batch.cpu().numpy(),
+        )
+        var_y = np.var(y_true)
+        explained_var = (
+            np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+        )
+        return {
+            "charts/learning_rate": optimizer.param_groups[0]["lr"],
+            "losses/value_loss": v_loss.item(),
+            "losses/policy_loss": pg_loss.item(),
+            "losses/entropy": entropy_loss.item(),
+            "losses/old_approx_kl": old_approx_kl.item(),
+            "losses/approx_kl": approx_kl.item(),
+            "losses/clipfrac": np.mean(clipfracs),
+            "losses/explained_variance": explained_var
+        }
 
 
 if __name__ == "__main__":
@@ -355,25 +435,19 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
     start_time = time.time()
     obs, _ = envs.reset(seed=args.seed)
-    num_updates = int(args.total_timesteps // args.batch_size)
 
     global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
     global_episodic_length = deque([], maxlen=20 * NUM_TASKS)
 
-    for update in range(1, num_updates + 1):
-        # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+    meta_rb = MetaRolloutBuffer(envs, args, device, NUM_TASKS)
+    total_steps = 0
 
-        meta_trial = list()
+    for global_step in range(int(args.total_timesteps // args.n_episodes_per_trial)):
         # collect a trial of n episodes per task
-        for meta_ep in range(int(NUM_TASKS / args.n_episodes_per_trial)):
-            meta_rb = MetaRolloutBuffer(envs, args, device, NUM_TASKS)
+        for meta_ep in range(args.n_episodes_per_trial // NUM_TASKS):
+            # RL^2 stuff
             rnn_state = agent.init_state(NUM_TASKS)
             prev_action = (
                 torch.tensor(
@@ -387,7 +461,7 @@ if __name__ == "__main__":
             prev_reward = torch.tensor([0] * NUM_TASKS).to(device).view(NUM_TASKS, 1, 1)
 
             for meta_step in range(args.max_episode_steps):
-                global_step += 1 * args.num_envs
+                total_steps += NUM_TASKS
                 # ALGO LOGIC: action logic
                 with torch.no_grad():
                     if not torch.is_tensor(obs):
@@ -436,135 +510,60 @@ if __name__ == "__main__":
                 _, value, _, _ = agent.step(obs, prev_action, prev_reward, rnn_state)
             meta_rb.finish_path(value, done)
 
+
         if global_step % 500 == 0 and global_episodic_return:
+            print(
+                f"global_step={total_steps}, mean_episodic_return={np.mean(global_episodic_return)}"
+            )
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(global_episodic_return),
-                global_step,
+                total_steps,
             )
             writer.add_scalar(
                 "charts/mean_episodic_length",
                 np.mean(global_episodic_length),
-                global_step,
-            )
-            print(
-                f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
+                total_steps,
             )
 
-        clipfracs = []
-        batch, batch_size = meta_rb.get()
+        logs = update_rl2_ppo(agent, meta_rb, device, total_steps, args)
+        meta_rb.reset()
 
-        for epoch in range(args.update_epochs):
-            obs_batch = batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
-            action_batch = batch["action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
-            value_batch = batch["value"].to(device).view(-1,args.max_episode_steps,1)
-            adv_targ = batch["advantage"].to(device).view(-1,args.max_episode_steps, 1)
-            old_logprob_batch = batch["log_prob"].to(device).view(-1,args.max_episode_steps, 1)
-            reward_batch = batch["reward"].to(device).view(-1,args.max_episode_steps, 1)
-            return_batch = batch["return"].to(device).view(-1,args.max_episode_steps, 1)
-            prev_reward_batch = batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
-            prev_action_batch = batch["prev_action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
-            done_batch = batch["done"].to(device).view(-1, args.max_episode_steps, 1)
-
-            init_rnn_state = agent.init_state(obs_batch.shape[0])
-            pi, newlogprob, entropy, rnn_state = agent.get_action(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, action=prev_action_batch, training=True)
-
-            logratio = newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1) - old_logprob_batch
-            ratio = torch.exp(logratio)
-
-            with torch.no_grad():
-                # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                old_approx_kl = (-logratio).mean()
-                approx_kl = ((ratio - 1) - logratio).mean()
-                clipfracs += [
-                    ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-                ]
-
-            pg_loss1 = -adv_targ * ratio
-            pg_loss2 = -adv_targ * torch.clamp(
-                ratio, 1 - args.clip_coef, 1 + args.clip_coef
-            )
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-            newvalue, rnn_state = agent.get_value(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, training=True,)
-
-            if args.clip_vloss:
-                v_loss_unclipped = (newvalue - return_batch) ** 2
-                v_clipped = value_batch + torch.clamp(
-                    newvalue - value_batch,
-                    -args.clip_coef,
-                    args.clip_coef,
-                )
-                v_loss_clipped = (v_clipped - return_batch) ** 2
-                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = 0.5 * v_loss_max.mean()
-            else:
-                v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
-
-            entropy_loss = entropy.mean()
-            loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef)
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-            optimizer.step()
-
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    break
-
-            y_pred, y_true = (
-                value_batch.cpu().numpy(),
-                return_batch.cpu().numpy(),
-            )
-            var_y = np.var(y_true)
-            explained_var = (
-                np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-            )
-
-            # TRY NOT TO MODIFY: record rewards for plotting purposes
-            writer.add_scalar(
-                "charts/learning_rate",
-                optimizer.param_groups[0]["lr"],
-                global_step,
-            )
-            writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-            writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-            writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-            writer.add_scalar(
-                "losses/old_approx_kl", old_approx_kl.item(), global_step
-            )
-            writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-            writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-            writer.add_scalar(
-                "losses/explained_variance", explained_var, global_step
-            )
-            print("SPS:", int(global_step / (time.time() - start_time)))
+        if global_step % 100 == 0:
+            for _key, value in logs.items():
+                    writer.add_scalar(_key, value, total_steps)
+            print("SPS:", int(total_steps / (time.time() - start_time)))
             writer.add_scalar(
                 "charts/SPS",
-                int(global_step / (time.time() - start_time)),
-                global_step,
+                int(total_steps / (time.time() - start_time)),
+                total_steps,
             )
 
-        if global_step % args.eval_freq == 0 and global_step > 0:
-            print(f"Evaluating... at global_step={global_step}")
+        if total_steps % args.eval_freq == 0 and total_steps > 0:
+            print(f"Evaluating... at total_steps={total_steps}")
             agent.eval()
-            eval_success_rate, eval_returns = rl2_evaluation(
-                args, agent, eval_envs, args.evaluation_num_episodes, device
+            eval_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
+                args,
+                agent,
+                eval_envs,
+                args.evaluation_num_episodes,
+                device
             )
-            writer.add_scalar(
-                "charts/mean_success_rate", eval_success_rate, global_step
-            )
-            writer.add_scalar(
-                "charts/mean_evaluation_return", eval_returns, global_step
-            )
+            eval_metrics = {
+                "charts/mean_success_rate": float(eval_success_rate),
+                "charts/mean_evaluation_return": float(eval_returns),
+            **{
+                f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                for i, (env_name, _) in enumerate(benchmark.test_classes.items())
+            }}
+
+            for k, v in eval_metrics.items():
+                writer.add_scalar(k, v, total_steps)
             print(
-                f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
             agent.train()
-
-        global_step += 1
 
     envs.close()
     writer.close()
