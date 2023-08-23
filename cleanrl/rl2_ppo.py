@@ -130,7 +130,11 @@ class Actor(nn.Module):
         probs = torch.distributions.Normal(mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(-1).view(*x.shape[:-1], 1), probs.entropy().sum(-1).view(*x.shape[:-1], 1)
+        return (
+            action,
+            probs.log_prob(action).sum(-1).view(*x.shape[:-1], 1),
+            probs.entropy().sum(-1).view(*x.shape[:-1], 1),
+        )
 
 
 class Agent(nn.Module):
@@ -187,7 +191,7 @@ class Agent(nn.Module):
             obs, prev_action, prev_reward, rnn_state, training
         )
 
-        action, log_prob, entropy  = self.actor(rnn_out, action)
+        action, log_prob, entropy = self.actor(rnn_out, action)
 
         return action, log_prob, entropy, rnn_state
 
@@ -197,7 +201,11 @@ class Agent(nn.Module):
                 obs, prev_action, prev_reward, rnn_state
             )
 
-            action, log_prob, entropy,  = self.actor(rnn_out)
+            (
+                action,
+                log_prob,
+                entropy,
+            ) = self.actor(rnn_out)
             value = self.critic(rnn_out)
 
         return action, value, log_prob, rnn_state
@@ -259,9 +267,7 @@ def rl2_evaluation(
     rnn_state = agent.init_state(NUM_TASKS)
     prev_action = (
         torch.tensor(
-            np.array(
-                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
-            )
+            np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
         )
         .to(device)
         .unsqueeze(1)
@@ -271,7 +277,9 @@ def rl2_evaluation(
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
         with torch.no_grad():
             obs = torch.tensor(obs).to(device).float().unsqueeze(1)
-            action, value, log_prob, rnn_state = agent.step(obs, prev_action, prev_reward, rnn_state)
+            action, value, log_prob, rnn_state = agent.step(
+                obs, prev_action, prev_reward, rnn_state
+            )
 
         obs, reward, _, _, infos = eval_envs.step(action.cpu().numpy())
 
@@ -297,36 +305,65 @@ def rl2_evaluation(
 
     return mean_success_rate, mean_returns, success_rate_per_task
 
+
 def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps, args):
     clipfracs = []
     batch, batch_size = meta_rb.get()
 
     for epoch in range(args.update_epochs):
-        obs_batch = batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
-        action_batch = batch["action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
-        value_batch = batch["value"].to(device).view(-1,args.max_episode_steps,1)
-        advantage_batch = batch["advantage"].to(device).view(-1,args.max_episode_steps, 1)
-        old_logprob_batch = batch["log_prob"].to(device).view(-1,args.max_episode_steps, 1)
-        return_batch = batch["return"].to(device).view(-1,args.max_episode_steps, 1)
-        prev_reward_batch = batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
-        prev_action_batch = batch["prev_action"].to(device).view(-1, args.max_episode_steps, batch["action"].shape[-1])
+        obs_batch = (
+            batch["obs"]
+            .to(device)
+            .view(-1, args.max_episode_steps, batch["obs"].shape[-1])
+        )
+        action_batch = (
+            batch["action"]
+            .to(device)
+            .view(-1, args.max_episode_steps, batch["action"].shape[-1])
+        )
+        value_batch = batch["value"].to(device).view(-1, args.max_episode_steps, 1)
+        advantage_batch = (
+            batch["advantage"].to(device).view(-1, args.max_episode_steps, 1)
+        )
+        old_logprob_batch = (
+            batch["log_prob"].to(device).view(-1, args.max_episode_steps, 1)
+        )
+        return_batch = batch["return"].to(device).view(-1, args.max_episode_steps, 1)
+        prev_reward_batch = (
+            batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
+        )
+        prev_action_batch = (
+            batch["prev_action"]
+            .to(device)
+            .view(-1, args.max_episode_steps, batch["action"].shape[-1])
+        )
 
         init_rnn_state = agent.init_state(obs_batch.shape[0])
-        pi, newlogprob, entropy, rnn_state = agent.get_action(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, action=action_batch, training=True)
+        pi, newlogprob, entropy, rnn_state = agent.get_action(
+            obs_batch,
+            prev_action_batch,
+            prev_reward_batch,
+            init_rnn_state,
+            action=action_batch,
+            training=True,
+        )
 
-        logratio = newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1) - old_logprob_batch
+        logratio = (
+            newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1)
+            - old_logprob_batch
+        )
         ratio = torch.exp(logratio)
 
         with torch.no_grad():
             # calculate approx_kl http://joschu.net/blog/kl-approx.html
             old_approx_kl = (-logratio).mean()
             approx_kl = ((ratio - 1) - logratio).mean()
-            clipfracs += [
-                ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-            ]
+            clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
         if args.norm_adv:
-            advantage_batch = (advantage_batch - advantage_batch.mean()) / (advantage_batch.std() + 1e-8)
+            advantage_batch = (advantage_batch - advantage_batch.mean()) / (
+                advantage_batch.std() + 1e-8
+            )
 
         pg_loss1 = -advantage_batch * ratio
         pg_loss2 = -advantage_batch * torch.clamp(
@@ -334,7 +371,13 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
         )
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-        newvalue, rnn_state = agent.get_value(obs_batch, prev_action_batch, prev_reward_batch, init_rnn_state, training=True,)
+        newvalue, rnn_state = agent.get_value(
+            obs_batch,
+            prev_action_batch,
+            prev_reward_batch,
+            init_rnn_state,
+            training=True,
+        )
 
         if args.clip_vloss:
             v_loss_unclipped = (newvalue - return_batch) ** 2
@@ -350,7 +393,7 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
             v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
 
         entropy_loss = entropy.mean()
-        loss = (pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef)
+        loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
         optimizer.zero_grad()
         loss.backward()
@@ -366,9 +409,7 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
             return_batch.cpu().numpy(),
         )
         var_y = np.var(y_true)
-        explained_var = (
-            np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        )
+        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         return {
             "charts/learning_rate": optimizer.param_groups[0]["lr"],
             "losses/value_loss": v_loss.item(),
@@ -377,7 +418,7 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
             "losses/old_approx_kl": old_approx_kl.item(),
             "losses/approx_kl": approx_kl.item(),
             "losses/clipfrac": np.mean(clipfracs),
-            "losses/explained_variance": explained_var
+            "losses/explained_variance": explained_var,
         }
 
 
@@ -470,7 +511,9 @@ if __name__ == "__main__":
                     # print("prev_action shape:", prev_action.shape)
                     # print("prev_reward shape:", prev_reward.shape)
                     # print("rnn_state shape:", rnn_state.shape)
-                    action, value, log_prob, rnn_state = agent.step(obs, prev_action, prev_reward, rnn_state)
+                    action, value, log_prob, rnn_state = agent.step(
+                        obs, prev_action, prev_reward, rnn_state
+                    )
 
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(
@@ -510,7 +553,6 @@ if __name__ == "__main__":
                 _, value, _, _ = agent.step(obs, prev_action, prev_reward, rnn_state)
             meta_rb.finish_path(value, done)
 
-
         if global_step % 500 == 0 and global_episodic_return:
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(global_episodic_return)}"
@@ -531,7 +573,7 @@ if __name__ == "__main__":
 
         if global_step % 100 == 0:
             for _key, value in logs.items():
-                    writer.add_scalar(_key, value, total_steps)
+                writer.add_scalar(_key, value, total_steps)
             print("SPS:", int(total_steps / (time.time() - start_time)))
             writer.add_scalar(
                 "charts/SPS",
@@ -543,19 +585,16 @@ if __name__ == "__main__":
             print(f"Evaluating... at total_steps={total_steps}")
             agent.eval()
             eval_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args,
-                agent,
-                eval_envs,
-                args.evaluation_num_episodes,
-                device
+                args, agent, eval_envs, args.evaluation_num_episodes, device
             )
             eval_metrics = {
                 "charts/mean_success_rate": float(eval_success_rate),
                 "charts/mean_evaluation_return": float(eval_returns),
-            **{
-                f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-                for i, (env_name, _) in enumerate(benchmark.test_classes.items())
-            }}
+                **{
+                    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                    for i, (env_name, _) in enumerate(benchmark.test_classes.items())
+                },
+            }
 
             for k, v in eval_metrics.items():
                 writer.add_scalar(k, v, total_steps)
