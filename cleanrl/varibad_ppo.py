@@ -20,6 +20,8 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 import metaworld
 
+device = torch.device("cuda" if torch.cuda.is_available()  else "cpu")
+
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -285,7 +287,7 @@ class DiagGaussian(nn.Module):
 
         self.fc_mean = init_(nn.Linear(num_inputs, num_outputs))
         self.fc_mean = self.fc_mean.double()
-        self.logstd = nn.Parameter(np.log(torch.zeros(num_outputs) + init_std)).to('cuda:0').double()
+        self.logstd = nn.Parameter(np.log(torch.zeros(num_outputs) + init_std)).to(device).double()
         self.norm_actions_pre_sampling = norm_actions_pre_sampling
         self.min_std = torch.tensor([1e-6]).to(device)
         self.fixedNormal = torch.distributions.Normal
@@ -457,7 +459,6 @@ class Agent(nn.Module):
         return h
 
     def forward(self, state, latent, belief, task):
-        device = 'cuda:0'
         # handle inputs (normalise + embed)
 
         if self.pass_state_to_policy:
@@ -502,7 +503,7 @@ class Agent(nn.Module):
         """
         Returns the (raw) actions and their value.
         """
-        value, actor_features = self.forward(state=state.double().to('cuda:0'), latent=latent.double().to('cuda:0'), belief=belief, task=task)
+        value, actor_features = self.forward(state=state.double().to(device), latent=latent.double().to(device), belief=belief, task=task)
         dist = self.dist(actor_features)
         if deterministic:
             action = dist.mean
@@ -527,21 +528,23 @@ class Agent(nn.Module):
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
-    def update_rms(self, args, policy_storage):
+    def update_rms(self, args, prev_state, latent_samples, latent_mean, latent_logvar):
         """ Update normalisation parameters for inputs with current data """
         if self.pass_state_to_policy and self.norm_state:
-            self.state_rms.update(policy_storage.prev_state[:-1])
+            self.state_rms.update(prev_state[:-1])
         if self.pass_latent_to_policy and self.norm_latent:
+            print(latent_samples.size())
+            print(latent_samples[:-1][0])
             latent = get_latent_for_policy(args,
-                                               torch.cat(policy_storage.latent_samples[:-1]),
-                                               torch.cat(policy_storage.latent_mean[:-1]),
-                                               torch.cat(policy_storage.latent_logvar[:-1])
+                                               torch.cat(latent_samples[:-1]),
+                                               torch.cat(latent_mean[:-1]),
+                                               torch.cat(latent_logvar[:-1])
                                                )
             self.latent_rms.update(latent)
         if self.pass_belief_to_policy and self.norm_belief:
-            self.belief_rms.update(policy_storage.beliefs[:-1])
+            self.belief_rms.update(beliefs[:-1])
         if self.pass_task_to_policy and self.norm_task:
-            self.task_rms.update(policy_storage.tasks[:-1])
+            self.task_rms.update(tasks[:-1])
 
     def evaluate_actions(self, state, latent, belief, task, action):
         value, actor_features = self.forward(state, latent, belief, task)
@@ -651,7 +654,7 @@ class RNNEncoder(nn.Module):
         return hidden_state
 
     def prior(self, batch_size, sample=True):
-        hidden_state = torch.zeros((1, batch_size, self.hidden_size), requires_grad=True).to('cuda:0')
+        hidden_state = torch.zeros((1, batch_size, self.hidden_size), requires_grad=True).to(device)
         h = hidden_state
         for i in range(len(self.fc_after_gru)):
             h = F.relu(self.fc_after_gru[i](h))
@@ -1136,7 +1139,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+
     benchmark = None
     if args.env_id == 'ML1':
         benchmark = metaworld.ML1(env_name=args.env_name, seed=args.seed)
@@ -1169,7 +1172,6 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.policy_learning_rate, eps=args.policy_eps)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -1225,6 +1227,9 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        prev_obs, _ = envs.reset()
+        prev_obs = torch.from_numpy(prev_obs)
+        prev_obs_storage[0].copy_(prev_obs)
         with (torch.no_grad()):
             prev_obs_batch, next_obs_batch, act_batch, rew_batch, lens_batch = vae.storage.get_running_batch()
             all_latent_samples, all_latent_means, all_latent_logvars, \
@@ -1236,10 +1241,15 @@ if __name__ == "__main__":
             latent_mean = (torch.stack([all_latent_means[lens_batch[i]][i] for i in range(len(lens_batch))])).to(device)
             latent_logvars = (torch.stack([all_latent_logvars[lens_batch[i]][i] for i in range(len(lens_batch))])).to(device)
             hidden_state = (torch.stack([all_hidden_states[lens_batch[i]][i] for i in range(len(lens_batch))])).to(device)
+        assert len(latent_mean_storage) == 0, 'make sure to empty the buffers'
+        hidden_state_storage[0].copy_(hidden_state)
+        latent_mean_storage.append(latent_mean.clone())
+        latent_logvars_storage.append(latent_logvars.clone())
+        latent_sample_storage.append(latent_sample.clone())
 
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
-            obs[step] = prev_obs
+            prev_obs_storage[step] = prev_obs
             dones[step] = next_done
 
             latent_sample_storage.append(latent_sample.detach().clone())
@@ -1276,16 +1286,29 @@ if __name__ == "__main__":
                 r = rewards[step].reshape(10, 1)
                 r = r.squeeze(0)
 
-                latent_sample, latent_mean, latent_logvar, hidden_state = vae.encoder(actions=action.float(),
+                latent_sample, latent_mean, latent_logvars, hidden_state = vae.encoder(actions=action.float(),
                                                                                       states=next_obs,
                                                                                       rewards=r,
                                                                                       hidden_state=hidden_state.cpu(),
                                                                                       return_prior=False)
+
             vae.storage.insert(prev_obs.clone(),
                                actions[step].detach().clone(),
                                next_obs.clone(), r.clone(),
                                done, None
                                )
+            next_obs_storage[step] = next_obs.clone()
+            done_indices = np.argwhere(done.flatten()).flatten()
+            if len(done_indices) > 0:
+                for i in done_indices:
+                    new_ob, _ = envs.envs[i].reset()
+                    next_obs[i] = torch.from_numpy(new_ob)
+
+
+            latent_sample_storage[step] = latent_sample.clone()
+            latent_mean_storage[step] = latent_mean.clone()
+            latent_logvars_storage[step] = latent_logvars.clone()
+
 
             # Only print when at least 1 env is done
             if "final_info" not in infos:
@@ -1304,6 +1327,7 @@ if __name__ == "__main__":
             # update policy and vae
             if update >= args.pretrain_len and update > 0:
                 # bootstrap value if not done
+
                 with torch.no_grad():  # state, latent, belief, task
                     next_value, action, logprob, entropy = agent.act(next_obs, latent, belief, task)
                     next_value = torch.squeeze(next_value)
@@ -1321,12 +1345,15 @@ if __name__ == "__main__":
                     returns = advantages + values
 
                 # flatten the batch
-                b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+                b_obs = prev_obs_storage.reshape((-1,) + envs.single_observation_space.shape)
                 b_logprobs = logprobs.reshape(-1)
                 b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
                 b_advantages = advantages.reshape(-1)
                 b_returns = returns.reshape(-1)
                 b_values = values.reshape(-1)
+
+                agent.update_rms(args=args, prev_state=prev_obs_storage, latent_mean=all_latent_means,
+                                 latent_samples=all_latent_samples, latent_logvar=all_latent_logvars)
 
                 # Optimizing the policy and value network
                 b_inds = np.arange(args.batch_size)
@@ -1405,6 +1432,12 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/explained_variance", explained_var, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
+        prev_obs_storage[0].copy_(prev_obs_storage[-1])
+        hidden_state_storage[0].copy_(hidden_state_storage[-1])
+        dones[0].copy_(dones[-1])
+        latent_sample_storage = []
+        latent_mean_storage = []
+        latent_logvars_storage = []
+        action_log_probs = 0
     envs.close()
     writer.close()
