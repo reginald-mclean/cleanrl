@@ -41,7 +41,8 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=30, help="number of episodes sampled per trial/meta-batch")
+    parser.add_argument("--n-episodes-per-trial", type=int, default=30,
+                        help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--encoder-hidden-size", type=int, default=128)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -165,7 +166,6 @@ class Agent(nn.Module):
         ).to(self.device)
 
     def recurrent_state(self, obs, rnn_state, training=False):
-        # observation encoding
         obs_enc = self.obs_enc(obs)
         rnn_out, rnn_state_out = self.rnn(obs_enc, rnn_state)
         if not training:
@@ -268,8 +268,8 @@ def rl2_evaluation(
                 if info is None:
                     continue
                 # reset states of finished episodes
-                _state= agent.rnn_state[:, i:i+1]
-                agent.rnn_state[:, i:i+1] = torch.randn_like(_state)
+                _state = agent.rnn_state[:, i : i + 1]
+                agent.rnn_state[:, i : i + 1] = torch.randn_like(_state)
                 episodic_returns[i].append(float(info["episode"]["r"][0]))
                 if len(episodic_returns[i]) <= num_episodes:
                     successes[i] += int(info["success"])
@@ -287,31 +287,24 @@ def rl2_evaluation(
 
 def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps, args):
     clipfracs = []
-    batch, batch_size = meta_rb.get()
+    batch, batch_size = meta_rb.sample()
     # TODO: Should meta trial only contain episodes from the same task?
+    obs_batch = (
+        batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
+    )
+    action_batch = (
+        batch["action"]
+        .to(device)
+        .view(-1, args.max_episode_steps, batch["action"].shape[-1])
+    )
+    value_batch = batch["value"].to(device).view(-1, args.max_episode_steps, 1)
+    advantage_batch = batch["advantage"].to(device).view(-1, args.max_episode_steps, 1)
+    old_logprob_batch = batch["log_prob"].to(device).view(-1, args.max_episode_steps, 1)
+    return_batch = batch["return"].to(device).view(-1, args.max_episode_steps, 1)
 
     for epoch in range(args.update_epochs):
-        obs_batch = (
-            batch["obs"]
-            .to(device)
-            .view(-1, args.max_episode_steps, batch["obs"].shape[-1])
-        )
-        action_batch = (
-            batch["action"]
-            .to(device)
-            .view(-1, args.max_episode_steps, batch["action"].shape[-1])
-        )
-        value_batch = batch["value"].to(device).view(-1, args.max_episode_steps, 1)
-        advantage_batch = (
-            batch["advantage"].to(device).view(-1, args.max_episode_steps, 1)
-        )
-        old_logprob_batch = (
-            batch["log_prob"].to(device).view(-1, args.max_episode_steps, 1)
-        )
-        return_batch = batch["return"].to(device).view(-1, args.max_episode_steps, 1)
-
         agent.init_state(obs_batch.shape[0])
-        pi, newlogprob, entropy = agent.get_action_and_log_prob(
+        _, newlogprob, entropy = agent.get_action_and_log_prob(
             obs_batch,
             action=action_batch,
             training=True,
@@ -368,6 +361,7 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
 
         if args.target_kl is not None:
             if approx_kl > args.target_kl:
+                print("BREAK KL")
                 break
 
         y_pred, y_true = (
@@ -377,7 +371,6 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         return {
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
             "losses/value_loss": v_loss.item(),
             "losses/policy_loss": pg_loss.item(),
             "losses/entropy": entropy_loss.item(),
@@ -499,17 +492,16 @@ if __name__ == "__main__":
                     torch.tensor(obs).to(device).float().unsqueeze(1)
                 )
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            meta_rb.finish_path(
+            meta_rb.finish_meta_trial(
                 value.cpu(), torch.tensor(done, dtype=torch.float32).unsqueeze(-1)
             )
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(
-                f"global_step={total_steps}, mean_episodic_return={np.mean(global_episodic_return)}"
-            )
+            mean_ep_return = np.mean(global_episodic_return)
+            print(f"global_step={total_steps}, mean_episodic_return={mean_ep_return}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
-                np.mean(global_episodic_return),
+                mean_ep_return,
                 total_steps,
             )
             writer.add_scalar(
