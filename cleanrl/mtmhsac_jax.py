@@ -72,8 +72,8 @@ def parse_args():
         help="the frequency of updates for the target nerworks")
     parser.add_argument("--clip-grad-norm", type=float, default=1.0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
-    parser.add_argument("--actor-network", type=str, default="400,400", help="The architecture of the actor network")
-    parser.add_argument("--critic-network", type=str, default="400,400", help="The architecture of the critic network")
+    parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
+    parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -106,7 +106,7 @@ def uniform_init(bound: float):
 class Actor(nn.Module):
     num_actions: int
     num_tasks: int
-    hidden_dims: int = "400,400"
+    hidden_dims: int = "400,400,400"
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
@@ -184,7 +184,7 @@ def sample_and_log_prob(
 
 
 class Critic(nn.Module):
-    hidden_dims: int = "400,400"
+    hidden_dims: int = "400,400,400"
     num_tasks: int = 1
 
     @nn.compact

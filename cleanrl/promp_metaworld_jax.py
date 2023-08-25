@@ -70,10 +70,13 @@ def parse_args():
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
-    parser.add_argument("--meta-lr", type=float, default=1e-3, help="the meta-policy gradient step size")
-    parser.add_argument("--num-promp-steps", type=int, default=5, help="the number of ProMP steps without re-sampling")
-    parser.add_argument("--clip-eps", type=float, default=0.3, help="clipping range")
-    parser.add_argument("--inner-kl-penalty", type=float, default=5e-4, help="kl penalty parameter eta")
+    parser.add_argument("--meta-lr", type=float, default=3e-4, help="the meta-policy gradient step size")
+    parser.add_argument("--num-promp-steps", type=int, default=10, help="the number of ProMP steps without re-sampling")
+    parser.add_argument("--clip-eps", type=float, default=0.2, help="clipping range")
+    parser.add_argument("--inner-kl-penalty", type=float, default=1e-2, help="kl penalty parameter eta")
+    parser.add_argument("--target-outer-kl", type=float, default=0.01,
+        help=("upper bound for the KL divergence between post update policy pi_\\theta' and pi_\\theta_old."
+        " Can be thought of as the delta parameter in TRPO."))
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
         help="number of inner / adaptation gradient steps")
 
@@ -250,7 +253,6 @@ def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
 
     def inner_opt_objective(_theta: FrozenDict):  # J^LR, Equation 12
         theta_log_probs = jnp.expand_dims(policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions), -1)
-
         ratio = jnp.exp(theta_log_probs - rollouts.log_probs)
         return -(ratio * rollouts.advantages).mean()
 
@@ -260,7 +262,7 @@ def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
     return updated_policy
 
 
-@partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks"))
+@partial(jax.jit, static_argnames=("eta", "clip_eps", "num_grad_steps", "num_tasks", "target_outer_kl"))
 def outer_step(
     train_state: MetaTrainState,
     all_rollouts: List[Rollout],
@@ -268,6 +270,7 @@ def outer_step(
     clip_eps: float,
     num_grad_steps: int,
     num_tasks: int,
+    target_outer_kl: Optional[float] = None,
 ) -> Tuple[MetaTrainState, dict]:
     def promp_loss(theta: FrozenDict):
         vec_theta = MetaVectorPolicy.expand_params(theta, num_tasks)
@@ -307,24 +310,42 @@ def outer_step(
 
         # KLs is a list of len(num_inner_gradient_steps), where each element is of shape (num_tasks,)
         # Mean over tasks for each step (axis=1) and then weight by eta, and then mean over everything.
-        mean_kl = jnp.mean(eta * jnp.stack(kls).mean(axis=1))
+        inner_kl = jnp.stack(kls).mean(axis=1)
+        mean_kl = jnp.mean(eta * inner_kl)
 
-        return mean_obj + mean_kl, mean_kl
+        outer_kl = new_param_dist.kl_divergence(theta_dist)
 
-    # Update theta
-    loss_before = None
-    for i in range(num_grad_steps):
-        (loss, inner_kl), grads = jax.value_and_grad(promp_loss, has_aux=True)(train_state.params)
-        if loss_before is None:
-            loss_before = loss
-        train_state = train_state.apply_gradients(grads=grads)
+        return mean_obj + mean_kl, (inner_kl.mean(), outer_kl.mean())
 
-    (loss_after, inner_kl) = promp_loss(train_state.params)
+    loss_before = promp_loss(train_state.params)[0]
 
-    return train_state, {
+    # fmt: off
+    if target_outer_kl is not None:
+        # Early stopping if an UB for the outer KL is provided
+        def _cond_fn(val):
+            step, _, outer_kl = val
+            return (outer_kl < (target_outer_kl * 1.5)) & (step < num_grad_steps)
+    else:
+        def _cond_fn(val):
+            return val[0] < num_grad_steps
+
+    def _body_fn(val):
+        step, state, _ = val
+        (_, (_, outer_kl)), grads = jax.value_and_grad(promp_loss, has_aux=True)(state.params)
+        state = state.apply_gradients(grads=grads)
+        return step + 1, state, outer_kl
+
+    steps, new_train_state, _, = jax.lax.while_loop(_cond_fn, _body_fn, init_val=(0, train_state, 0.0))
+    # fmt: on
+
+    loss_after, (inner_kl, outer_kl) = promp_loss(new_train_state.params)
+
+    return new_train_state, {
         "losses/loss_before": jnp.mean(loss_before),
         "losses/loss_after": jnp.mean(loss_after),
+        "losses/num_updates": steps,
         "losses/kl_inner": inner_kl,
+        "losses/kl_outer": outer_kl,
     }
 
 
@@ -391,6 +412,7 @@ class ProMP:
         eta: float,
         clip_eps: float,
         num_grad_steps: int,
+        target_outer_kl: float,
     ):
         self.num_tasks = envs.unwrapped.num_envs
 
@@ -422,6 +444,9 @@ class ProMP:
         self._clip_eps = clip_eps
         self._num_grad_steps = num_grad_steps
 
+        assert target_outer_kl > 0, "target_outer_kl must be positive"
+        self._target_outer_kl = target_outer_kl
+
     def init_multitask_policy(self, num_tasks: int, params: FrozenDict) -> None:
         self.num_tasks = num_tasks
 
@@ -450,6 +475,7 @@ class ProMP:
             eta=self._eta,
             clip_eps=self._clip_eps,
             num_grad_steps=self._num_grad_steps,
+            target_outer_kl=self._target_outer_kl,
         )
         return logs
 
@@ -543,6 +569,7 @@ if __name__ == "__main__":
         eta=args.inner_kl_penalty,
         clip_eps=args.clip_eps,
         num_grad_steps=args.num_promp_steps,
+        target_outer_kl=args.target_outer_kl,
     )
 
     network_args = {
