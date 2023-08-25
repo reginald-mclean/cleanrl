@@ -43,7 +43,10 @@ def parse_args():
     # RL^2 arguments
     parser.add_argument("--n-episodes-per-trial", type=int, default=30, help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
-    parser.add_argument("--max-episode-steps", type=int, default=500, help="maximum number of timesteps in one episode during training")
+    parser.add_argument("--encoder-hidden-size", type=int, default=128)
+    parser.add_argument("--recurrent-num-layers", type=int, default=1)
+    parser.add_argument("--max-episode-steps", type=int, default=200,
+                        help="maximum number of timesteps in one episode during training")
 
     parser.add_argument("--use-gae", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
 
@@ -140,66 +143,52 @@ class Actor(nn.Module):
 class Agent(nn.Module):
     def __init__(self, envs, args, device):
         super().__init__()
+        self.args = args
         self.actor = Actor(envs, args)
         self.critic = Critic(envs, args)
         self.device = device
-        self.recurrent_state_size = args.recurrent_state_size
+
         obs_dim = np.array(envs.single_observation_space.shape).prod()
-        obs_enc_dim = 128
-        act_dim = np.prod(envs.single_action_space.shape)
-        rnn_input = obs_enc_dim + 1 + act_dim
-        self.rnn = nn.GRU(rnn_input, self.recurrent_state_size, batch_first=True).to(
-            device
-        )
-        self.obs_enc = nn.Linear(obs_dim, obs_enc_dim).to(device)
+        self.obs_enc = nn.Linear(obs_dim, args.encoder_hidden_size).to(device)
+
+        self.recurrent_state_size = args.recurrent_state_size
+        self.rnn = nn.GRU(
+            args.encoder_hidden_size,
+            self.recurrent_state_size,
+            batch_first=True,
+            num_layers=args.recurrent_num_layers,
+        ).to(device)
 
     def init_state(self, batch_size):
-        return torch.zeros(1, batch_size, self.recurrent_state_size).to(self.device)
+        self.rnn_state = torch.randn(
+            self.args.recurrent_num_layers, batch_size, self.recurrent_state_size
+        ).to(self.device)
 
-    def recurrent_state(self, obs, prev_action, prev_reward, rnn_state, training=False):
+    def recurrent_state(self, obs, rnn_state, training=False):
         # observation encoding
         obs_enc = self.obs_enc(obs)
-
-        # Concat the encodings with previous reward
-        rnn_input = torch.cat([obs_enc, prev_action, prev_reward], dim=-1).float()
-
-        if training:
-            # Input rnn: (batch size, sequence length, features)
-            rnn_out, rnn_state_out = self.rnn(rnn_input, rnn_state)
-        else:
-            # Input rnn: (1, 1, features)
-            # Alternative to training bool: len(rnn_input) == 2 do the unsqueezing.
-
-            # rnn_input = rnn_input.unsqueeze(1)
-            rnn_out, rnn_state_out = self.rnn(rnn_input, rnn_state)
+        rnn_out, rnn_state_out = self.rnn(obs_enc, rnn_state)
+        if not training:
             rnn_out = rnn_out.squeeze(1)
-            # Output rnn: (1, features)
-
         return rnn_out, rnn_state_out
 
-    def get_value(self, obs, prev_action, prev_reward, rnn_state, training=False):
-        rnn_out, rnn_state = self.recurrent_state(
-            obs, prev_action, prev_reward, rnn_state, training
-        )
+    def get_value(self, obs, training=False):
+        rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state, training)
+        return self.critic(rnn_out)
 
-        return self.critic(rnn_out), rnn_state
-
-    def get_action(
-        self, obs, prev_action, prev_reward, rnn_state, action=None, training=False
-    ):
-        rnn_out, rnn_state = self.recurrent_state(
-            obs, prev_action, prev_reward, rnn_state, training
-        )
-
+    def get_action_and_log_prob(self, obs, action=None, training=False):
+        rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state, training)
         action, log_prob, entropy = self.actor(rnn_out, action)
+        return action, log_prob, entropy
 
-        return action, log_prob, entropy, rnn_state
-
-    def step(self, obs, prev_action, prev_reward, rnn_state):
+    def get_action(self, obs):
         with torch.no_grad():
-            rnn_out, rnn_state = self.recurrent_state(
-                obs, prev_action, prev_reward, rnn_state
-            )
+            rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state)
+            return self.actor(rnn_out)[0]
+
+    def step(self, obs):
+        with torch.no_grad():
+            rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state)
 
             (
                 action,
@@ -208,7 +197,7 @@ class Agent(nn.Module):
             ) = self.actor(rnn_out)
             value = self.critic(rnn_out)
 
-        return action, value, log_prob, rnn_state
+        return action, value, log_prob
 
 
 def _make_envs_common(
@@ -264,33 +253,23 @@ def rl2_evaluation(
     episodic_returns = [[] for _ in range(NUM_TASKS)]
 
     start_time = time.time()
-    rnn_state = agent.init_state(NUM_TASKS)
-    prev_action = (
-        torch.tensor(
-            np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
-        )
-        .to(device)
-        .unsqueeze(1)
-    )
-    prev_reward = torch.tensor([0] * NUM_TASKS).to(device).view(NUM_TASKS, 1, 1)
+    agent.init_state(NUM_TASKS)
 
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
         with torch.no_grad():
             obs = torch.tensor(obs).to(device).float().unsqueeze(1)
-            action, value, log_prob, rnn_state = agent.step(
-                obs, prev_action, prev_reward, rnn_state
-            )
+            action = agent.get_action(obs)
 
         obs, reward, _, _, infos = eval_envs.step(action.cpu().numpy())
-
-        prev_action = action.detach().view(NUM_TASKS, 1, -1)
-        prev_reward = torch.tensor(reward).to(device).view(NUM_TASKS, 1, 1)
 
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
                 # Skip the envs that are not done
                 if info is None:
                     continue
+                # reset states of finished episodes
+                _state= agent.rnn_state[:, i:i+1]
+                agent.rnn_state[:, i:i+1] = torch.randn_like(_state)
                 episodic_returns[i].append(float(info["episode"]["r"][0]))
                 if len(episodic_returns[i]) <= num_episodes:
                     successes[i] += int(info["success"])
@@ -309,6 +288,7 @@ def rl2_evaluation(
 def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps, args):
     clipfracs = []
     batch, batch_size = meta_rb.get()
+    # TODO: Should meta trial only contain episodes from the same task?
 
     for epoch in range(args.update_epochs):
         obs_batch = (
@@ -329,21 +309,10 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
             batch["log_prob"].to(device).view(-1, args.max_episode_steps, 1)
         )
         return_batch = batch["return"].to(device).view(-1, args.max_episode_steps, 1)
-        prev_reward_batch = (
-            batch["prev_reward"].to(device).view(-1, args.max_episode_steps, 1)
-        )
-        prev_action_batch = (
-            batch["prev_action"]
-            .to(device)
-            .view(-1, args.max_episode_steps, batch["action"].shape[-1])
-        )
 
-        init_rnn_state = agent.init_state(obs_batch.shape[0])
-        pi, newlogprob, entropy, rnn_state = agent.get_action(
+        agent.init_state(obs_batch.shape[0])
+        pi, newlogprob, entropy = agent.get_action_and_log_prob(
             obs_batch,
-            prev_action_batch,
-            prev_reward_batch,
-            init_rnn_state,
             action=action_batch,
             training=True,
         )
@@ -371,11 +340,8 @@ def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps
         )
         pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-        newvalue, rnn_state = agent.get_value(
+        newvalue = agent.get_value(
             obs_batch,
-            prev_action_batch,
-            prev_reward_batch,
-            init_rnn_state,
             training=True,
         )
 
@@ -486,33 +452,20 @@ if __name__ == "__main__":
     total_steps = 0
 
     for global_step in range(int(args.total_timesteps // args.n_episodes_per_trial)):
+        assert args.n_episodes_per_trial > NUM_TASKS
         # collect a trial of n episodes per task
-        for meta_ep in range(args.n_episodes_per_trial // NUM_TASKS):
+        # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
+        num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
+        for meta_ep in range(num_trial_episodes):
             # RL^2 stuff
-            rnn_state = agent.init_state(NUM_TASKS)
-            prev_action = (
-                torch.tensor(
-                    np.array(
-                        [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
-                    )
-                )
-                .to(device)
-                .unsqueeze(1)
-            )
-            prev_reward = torch.tensor([0] * NUM_TASKS).to(device).view(NUM_TASKS, 1, 1)
-
+            # reset hidden state for each meta trial
+            agent.init_state(NUM_TASKS)
             for meta_step in range(args.max_episode_steps):
                 total_steps += NUM_TASKS
                 # ALGO LOGIC: action logic
                 with torch.no_grad():
-                    if not torch.is_tensor(obs):
-                        obs = torch.tensor(obs).to(device).float().unsqueeze(1)
-                    # print("OBS SHAPE", obs.shape)
-                    # print("prev_action shape:", prev_action.shape)
-                    # print("prev_reward shape:", prev_reward.shape)
-                    # print("rnn_state shape:", rnn_state.shape)
-                    action, value, log_prob, rnn_state = agent.step(
-                        obs, prev_action, prev_reward, rnn_state
+                    action, value, log_prob = agent.step(
+                        torch.tensor(obs).to(device).float().unsqueeze(1)
                     )
 
                 # TRY NOT TO MODIFY: execute the game and log data.
@@ -520,22 +473,15 @@ if __name__ == "__main__":
                     action.cpu().numpy()
                 )
                 done = np.logical_or(terminated, truncated)
-
-                for tidx in range(NUM_TASKS):
-                    meta_rb.store(
-                        obs[tidx],
-                        action[tidx],
-                        reward[tidx],
-                        prev_action[tidx],
-                        prev_reward[tidx],
-                        done[tidx],
-                        value[tidx],
-                        log_prob[tidx],
-                        tidx,
-                    )
+                meta_rb.store(
+                    obs,
+                    action,
+                    reward,
+                    done,
+                    value,
+                    log_prob,
+                )
                 obs = next_obs
-                prev_action = action.detach().view(NUM_TASKS, 1, -1)
-                prev_reward = torch.tensor(reward).to(device).view(NUM_TASKS, 1, 1)
 
                 # Only print when at least 1 env is done
                 if "final_info" not in infos:
@@ -548,10 +494,14 @@ if __name__ == "__main__":
                     global_episodic_return.append(info["episode"]["r"])
                     global_episodic_length.append(info["episode"]["l"])
 
-            obs = torch.tensor(obs).to(device).float().unsqueeze(1)
             with torch.no_grad():
-                _, value, _, _ = agent.step(obs, prev_action, prev_reward, rnn_state)
-            meta_rb.finish_path(value.cpu(), done)
+                value = agent.get_value(
+                    torch.tensor(obs).to(device).float().unsqueeze(1)
+                )
+            # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
+            meta_rb.finish_path(
+                value.cpu(), torch.tensor(done, dtype=torch.float32).unsqueeze(-1)
+            )
 
         if global_step % 500 == 0 and global_episodic_return:
             print(

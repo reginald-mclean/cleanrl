@@ -390,7 +390,7 @@ class SyncVectorEnv(VectorEnv):
 
         return True
 
-
+# https://github.com/rlworkgroup/garage/blob/master/src/garage/tf/algos/rl2.py#L22
 class RL2Env(gym.Wrapper):
     """Environment wrapper for RL2.
 
@@ -412,12 +412,18 @@ class RL2Env(gym.Wrapper):
     def step(self, action):
         next_state, reward, terminate, truncate, info = self.env.step(action)
         next_state = np.concatenate([
-            next_state, action, [reward], [terminate or truncate]
-        ])
+            next_state, self.prev_action, self.prev_reward, self.prev_done
+            ])
+        self.prev_action = action.copy()
+        self.prev_reward = np.array([reward])
+        self.prev_done = np.array([np.logical_or(terminate,  truncate)], dtype=np.float32)
         return next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
-        obs = np.concatenate([obs, np.zeros(self.env.action_space.shape), [0], [0]])
+        self.prev_action = np.zeros(self.env.action_space.shape)
+        self.prev_reward = np.zeros((1))
+        self.prev_done = np.zeros((1))
+        obs = np.concatenate([obs, self.prev_action, self.prev_reward, self.prev_done])
 
         return obs, info
