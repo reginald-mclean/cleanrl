@@ -390,18 +390,15 @@ class MetaRolloutBuffer:
         self.gae_lambda = args.gae_lambda
         self.device = device
         self.num_tasks = num_tasks
-
         self.rollout_data = {
-            "obs": torch.zeros((num_tasks, self.meta_episode_steps, *envs.single_observation_space.shape)),
-            "action": torch.zeros((num_tasks, self.meta_episode_steps, *envs.single_action_space.shape)),
-            "value": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "advantage": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "log_prob": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "reward": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "return": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "prev_reward": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
-            "prev_action": torch.zeros((num_tasks, self.meta_episode_steps, *envs.single_action_space.shape)),
-            "done": torch.zeros((num_tasks, self.meta_episode_steps, 1)),
+            "obs": torch.zeros((self.meta_episode_steps, num_tasks, *envs.single_observation_space.shape)),
+            "action": torch.zeros((self.meta_episode_steps, num_tasks, *envs.single_action_space.shape)),
+            "value": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "advantage": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "log_prob": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "reward": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "return": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "done": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
         }
         self.trial_episodes = []
         self.ptr = 0
@@ -412,24 +409,18 @@ class MetaRolloutBuffer:
         obs,
         action,
         reward,
-        prev_action,
-        prev_reward,
         term,
         value,
         log_prob,
-        task_idx,
     ):
         assert self.ptr <= self.meta_episode_steps
-        self.rollout_data["obs"][task_idx, self.ptr] = obs
-        self.rollout_data["action"][task_idx, self.ptr] = action
-        self.rollout_data["reward"][task_idx, self.ptr] = torch.tensor(reward).to(self.device)
-        self.rollout_data["done"][task_idx, self.ptr] = torch.tensor(term).to(self.device)
-        self.rollout_data["prev_action"][task_idx, self.ptr] = prev_action
-        self.rollout_data["prev_reward"][task_idx, self.ptr] = prev_reward
-        self.rollout_data["value"][task_idx, self.ptr] = value
-        self.rollout_data["log_prob"][task_idx, self.ptr] = log_prob
-        if task_idx == self.num_tasks -1:
-            self.ptr += 1
+        self.rollout_data["obs"][self.ptr] = torch.tensor(obs)
+        self.rollout_data["action"][self.ptr] = action
+        self.rollout_data["reward"][self.ptr] = torch.tensor(reward).unsqueeze(-1)
+        self.rollout_data["done"][self.ptr] = torch.tensor(term).unsqueeze(-1)
+        self.rollout_data["value"][self.ptr] = value
+        self.rollout_data["log_prob"][self.ptr] = log_prob
+        self.ptr += 1
 
     def reset(self):
         self.empty_buffer()
@@ -440,48 +431,38 @@ class MetaRolloutBuffer:
             self.rollout_data[key] = torch.zeros_like(val)
         self.ptr = 0
 
-    def finish_path(self, last_value, last_termination):
-        task_ids = np.random.permutation(np.arange(0, self.num_tasks))
+    def finish_meta_trial(self, last_value, last_termination):
+        last_gae = 0
+        for t in reversed(range(self.meta_episode_steps)):
+            if t == self.meta_episode_steps - 1:
+                next_non_terminal = 1.0 - last_termination
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - self.rollout_data["done"][t + 1]
+                next_value = self.rollout_data["value"][t + 1]
 
-        for tidx in task_ids:
-            # Calculate advantages
-            prev_advantage = 0
-            for step in reversed(range(self.meta_episode_steps)):
+            delta = (
+                self.rollout_data["reward"][t]
+                + self.gamma * next_value * next_non_terminal
+                - self.rollout_data["value"][t]
+            )
+            self.rollout_data["advantage"][t] = (
+                delta
+                + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            )
+            last_gae = self.rollout_data["advantage"][t]
 
-                # The "value" argument should be 0 if the trajectory ended
-                # because the agent reached a terminal state (died).
-                if step == self.meta_episode_steps - 1:
-                    next_non_terminal = 1.0 - last_termination[tidx]
-                    next_value = last_value[tidx]
-                else:
-                    # Otherwise it should be V(s_t), the value function estimated for the
-                    # last state. This allows us to bootstrap the reward-to-go calculation
-                    # to account. for timesteps beyond the arbitrary episode horizon.
-                    next_non_terminal = 1.0 - self.rollout_data["done"][tidx, step + 1]
-                    next_value = self.rollout_data["value"][tidx, step + 1]
+        self.rollout_data["return"]  = self.rollout_data["advantage"] \
+                + self.rollout_data["value"]
 
-                delta = (
-                    self.rollout_data["reward"][tidx, step]
-                    + self.gamma * next_value * next_non_terminal
-                    - self.rollout_data["value"][tidx, step]
-                )
-                self.rollout_data["advantage"][tidx, step] = (
-                    delta
-                    + self.gamma * self.gae_lambda * next_non_terminal * prev_advantage
-                )
-                prev_advantage = self.rollout_data["advantage"][tidx, step]
-
-            self.rollout_data["return"][tidx]  = self.rollout_data["advantage"][tidx] \
-                    + self.rollout_data["value"][tidx]
-
-            # Add to episode list
-            episode = {k: v.clone() for k, v in self.rollout_data.items()}
-            self.trial_episodes.append(episode)
+        # Add to episode list
+        episode = {k: v.clone() for k, v in self.rollout_data.items()}
+        self.trial_episodes.append(episode)
 
         # Empty episode buffer
         self.empty_buffer()
 
-    def get(self):
+    def sample(self):
         # format the experience to (batch_size, horizon, ...) length
         batch = {
             k: torch.stack([ep[k] for ep in self.trial_episodes]) for k in self.rollout_data.keys()
