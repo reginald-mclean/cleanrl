@@ -11,11 +11,11 @@ import gymnasium as gym
 import numpy as np
 import jax
 import jax.numpy as jnp
+import flax
 import flax.linen as nn
 from typing import Optional, Type, Tuple
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
-from cleanrl_utils.buffers_metaworld import MetaRolloutBuffer
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
 from collections import deque
@@ -42,7 +42,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=30,
+    parser.add_argument("--n-episodes-per-trial", type=int, default=80,
                         help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--encoder-hidden-size", type=int, default=128)
@@ -191,13 +191,13 @@ class RL2ActorCritic(nn.Module):
 
 
 @jax.jit
-def get_action_and_value(
+def get_action_log_prob_and_value(
     agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
 ):
     key, action_key = jax.random.split(key)
     action_dist, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
-    return action, log_prob, value, key
+    return action, log_prob.reshape(-1, 1), value, key
 
 
 @jax.jit
@@ -218,8 +218,8 @@ def _make_envs_common(
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        if terminate_on_success:
-            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env.toggle_terminate_on_success(terminate_on_success)
         env = metaworld_wrappers.RL2Env(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if train:
@@ -227,7 +227,7 @@ def _make_envs_common(
         else:
             tasks = [task for task in benchmark.test_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
-        env.action_space.seed(seed)
+        env.unwrapped.seed(seed)
         return env
 
     if train:
@@ -245,6 +245,18 @@ def _make_envs_common(
 
 make_envs = partial(_make_envs_common, terminate_on_success=False)
 make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+
+
+@flax.struct.dataclass
+class Storage:
+    obs: jnp.array
+    actions: jnp.array
+    logprobs: jnp.array
+    dones: jnp.array
+    values: jnp.array
+    advantages: jnp.array
+    returns: jnp.array
+    rewards: jnp.array
 
 
 def rl2_evaluation(
@@ -295,19 +307,17 @@ def rl2_evaluation(
 def update_rl2_ppo(
     args,
     agent_state: TrainState,
-    meta_rb: MetaRolloutBuffer,
+    storage: Storage,
     key,
 ):
-    batch, batch_size = meta_rb.sample()
-
     @jax.jit
     def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
         carry = jnp.zeros((obs.shape[0], args.recurrent_state_size))
         action_dist, newvalue, carry = agent_state.apply_fn(
-            agent_state.params, obs, carry
+            params, obs, carry
         )
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
-        logratio = newlog_prob[..., None] - logprob
+        logratio = newlog_prob.reshape(-1, 1) - logprob
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
 
@@ -331,13 +341,13 @@ def update_rl2_ppo(
             "approx_kl": jax.lax.stop_gradient(approx_kl),
         }
 
-    obs_batch = batch["obs"].reshape(-1, args.max_episode_steps, batch["obs"].shape[-1])
-    action_batch = batch["action"].reshape(
-        -1, args.max_episode_steps, batch["action"].shape[-1]
+    obs_batch = storage.obs.reshape(-1, args.max_episode_steps, storage.obs.shape[-1])
+    action_batch = storage.actions.reshape(
+        -1, args.max_episode_steps, storage.actions.shape[-1]
     )
-    advantage_batch = batch["advantage"].reshape(-1, args.max_episode_steps, 1)
-    logprob_batch = batch["log_prob"].reshape(-1, args.max_episode_steps, 1)
-    return_batch = batch["return"].reshape(-1, args.max_episode_steps, 1)
+    advantage_batch = storage.advantages.reshape(-1, args.max_episode_steps, 1)
+    logprob_batch = storage.logprobs.reshape(-1, args.max_episode_steps, 1)
+    return_batch = storage.returns.reshape(-1, args.max_episode_steps, 1)
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
@@ -348,8 +358,8 @@ def update_rl2_ppo(
             mb_inds = np.array(b_inds[start:end])
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                obs_batch[mb_inds].reshape(-1, batch["obs"].shape[-1]),
-                action_batch[mb_inds].reshape(-1, batch["action"].shape[-1]),
+                obs_batch[mb_inds].reshape(-1, storage.obs.shape[-1]),
+                action_batch[mb_inds].reshape(-1, storage.actions.shape[-1]),
                 advantage_batch[mb_inds].reshape(-1, 1),
                 logprob_batch[mb_inds].reshape(-1, 1),
                 return_batch[mb_inds].reshape(-1, 1),
@@ -359,6 +369,49 @@ def update_rl2_ppo(
             agent_state = agent_state.apply_gradients(grads=grads)
 
     return agent_state, aux_metrics
+
+
+# @jax.jit
+def compute_gae(
+    agent_state: TrainState,
+    next_obs: np.ndarray,
+    next_done: np.ndarray,
+    storage: Storage,
+    carry: jax.Array,
+):
+    storage = storage.replace(advantages=storage.advantages.at[:].set(0.0))
+    ep_start_idx = (
+        np.arange(
+            args.max_episode_steps, storage.obs.shape[0] + 1, args.max_episode_steps
+        )
+        - 1
+    )
+    for ep in reversed(range((storage.obs.shape[0] // args.max_episode_steps))):
+        lastgaelam = 0
+        for _t in reversed(range(args.max_episode_steps)):
+            t = _t + (ep * args.max_episode_steps)
+            if t in ep_start_idx:
+                nextnonterminal = 1.0 - next_done
+                _, nextvalues, carry = agent_state.apply_fn(
+                    agent_state.params, storage.obs[t], carry
+                )
+            else:
+                nextnonterminal = 1.0 - storage.dones[t + 1]
+                nextvalues = storage.values[t + 1]
+            delta = (
+                storage.rewards[t]
+                + args.gamma * nextvalues * nextnonterminal
+                - storage.values[t]
+            )
+            lastgaelam = (
+                delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            )
+            storage = storage.replace(
+                advantages=storage.advantages.at[t].set(lastgaelam)
+            )
+
+    storage = storage.replace(returns=storage.advantages + storage.values)
+    return storage
 
 
 if __name__ == "__main__":
@@ -390,8 +443,8 @@ if __name__ == "__main__":
 
     if args.env_id == "ML10":
         benchmark = metaworld.ML10(seed=args.seed)
-    elif args.env_id == "ML50":
-        benchmark = metaworld.ML50(seed=args.seed)
+    elif args.env_id == "ML45":
+        benchmark = metaworld.ML45(seed=args.seed)
     else:
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
 
@@ -399,7 +452,11 @@ if __name__ == "__main__":
     envs = make_envs(benchmark, args.seed, args.max_episode_steps, train=True)
     keys = list(benchmark.train_classes.keys())
 
-    eval_envs = make_eval_envs(
+    eval_train_envs = make_eval_envs(
+        benchmark, args.seed, train=True,
+    )
+
+    eval_test_envs = make_eval_envs(
         benchmark, args.seed, train=args.env_id in ["MT10", "MT50"]
     )
 
@@ -424,6 +481,20 @@ if __name__ == "__main__":
         ),
     )
 
+    num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
+
+    trial_length = args.max_episode_steps * num_trial_episodes
+    storage = Storage(
+        obs=jnp.zeros((trial_length, NUM_TASKS, *envs.single_observation_space.shape)),
+        actions=jnp.zeros((trial_length, NUM_TASKS, *envs.single_action_space.shape)),
+        logprobs=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        dones=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        values=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        advantages=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        returns=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        rewards=jnp.zeros((trial_length, NUM_TASKS, 1)),
+    )
+
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
     obs, _ = envs.reset(seed=args.seed)
@@ -431,35 +502,35 @@ if __name__ == "__main__":
     global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
     global_episodic_length = deque([], maxlen=20 * NUM_TASKS)
 
-    meta_rb = MetaRolloutBuffer(envs, args, NUM_TASKS)
     total_steps = 0
 
     for global_step in range(int(args.total_timesteps // args.n_episodes_per_trial)):
         assert args.n_episodes_per_trial > NUM_TASKS
         # collect a trial of n episodes per task
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
-        num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
-        carry = agent.initialize_state(NUM_TASKS)
-        for meta_ep in range(num_trial_episodes):
+        for meta_ep in range(1, num_trial_episodes + 1):
             # RL^2 stuff
             # reset hidden state for each meta trial
+            carry = agent.initialize_state(NUM_TASKS)
             for meta_step in range(args.max_episode_steps):
                 total_steps += NUM_TASKS
-                action, log_prob, value, key = get_action_and_value(
+                action, logprob, value, key = get_action_log_prob_and_value(
                     agent_state, obs, carry, key
                 )
                 action = jax.device_get(action)
-                value = jax.device_get(value)
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
-                done = np.logical_or(terminated, truncated)
-                meta_rb.store(
-                    obs,
-                    action,
-                    reward,
-                    done,
-                    value,
-                    log_prob.reshape(-1, 1),
+                done = np.logical_or(terminated, truncated).reshape(-1, 1)
+                _current_step = meta_step * meta_ep
+                storage = storage.replace(
+                    obs=storage.obs.at[_current_step].set(next_obs),
+                    dones=storage.dones.at[_current_step].set(done),
+                    actions=storage.actions.at[_current_step].set(action),
+                    values=storage.values.at[_current_step].set(value),
+                    logprobs=storage.logprobs.at[_current_step].set(logprob),
+                    rewards=storage.rewards.at[_current_step].set(
+                        reward.reshape(-1, 1)
+                    ),
                 )
                 obs = next_obs
 
@@ -474,10 +545,13 @@ if __name__ == "__main__":
                     global_episodic_return.append(info["episode"]["r"])
                     global_episodic_length.append(info["episode"]["l"])
 
-            _, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            meta_rb.finish_meta_trial(
-                value, np.array(done, dtype=np.float32)[..., None]
+            storage = compute_gae(
+                agent_state,
+                next_obs,
+                done,
+                storage,
+                carry,
             )
 
         if global_step % 500 == 0 and global_episodic_return:
@@ -494,9 +568,8 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(args, agent_state, meta_rb, key)
+        agent_state, logs = update_rl2_ppo(args, agent_state, storage, key)
         logs = jax.device_get(logs)
-        meta_rb.reset()
 
         if global_step % 100 == 0:
             for _key, value in logs.items():
@@ -509,24 +582,45 @@ if __name__ == "__main__":
             )
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
-            print(f"Evaluating... at total_steps={total_steps}")
-            eval_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args, agent, agent_state, eval_envs, args.evaluation_num_episodes
+            print(f"Evaluating on test set at total_steps={total_steps}")
+            test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
+                args, agent, agent_state, eval_test_envs, args.evaluation_num_episodes
             )
             eval_metrics = {
-                "charts/mean_success_rate": float(eval_success_rate),
-                "charts/mean_evaluation_return": float(eval_returns),
+                "charts/mean_test_success_rate": float(test_success_rate),
+                "charts/mean_test_return": float(eval_returns),
                 **{
-                    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                    f"charts/{env_name}_test_success_rate": float(
+                        eval_success_per_task[i]
+                    )
                     for i, (env_name, _) in enumerate(benchmark.test_classes.items())
                 },
             }
-
             for k, v in eval_metrics.items():
                 writer.add_scalar(k, v, total_steps)
+
+            print(f"Evaluating on train set at total_steps={total_steps}")
+            train_success_rate, train_returns, train_success_per_task = rl2_evaluation(
+                args, agent, agent_state, eval_train_envs, args.evaluation_num_episodes
+            )
+            train_metrics = {
+                "charts/mean_train_success_rate": float(train_success_rate),
+                "charts/mean_train_return": float(train_returns),
+                **{
+                    f"charts/{env_name}_train_success_rate": float(
+                        train_success_per_task[i]
+                    )
+                    for i, (env_name, _) in enumerate(benchmark.test_classes.items())
+                },
+            }
+            for k, v in train_metrics.items():
+                writer.add_scalar(k, v, total_steps)
+
             print(
-                f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
-                + f" return: {eval_returns:.4f}"
+                f"{total_steps=} {test_success_rate=:.4f} "
+                + f"{eval_returns=:.4f} "
+                + f"{train_success_rate=:.4f} "
+                + f"{train_returns=:.4f}"
             )
 
     envs.close()
