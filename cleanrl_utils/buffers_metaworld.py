@@ -384,21 +384,20 @@ class MultiTaskRolloutBuffer:
                 self._running_rollouts[i] = []
 
 class MetaRolloutBuffer:
-    def __init__(self, envs, args, device, num_tasks) -> None:
+    def __init__(self, envs, args, num_tasks) -> None:
         self.meta_episode_steps = args.max_episode_steps
         self.gamma = args.gamma
         self.gae_lambda = args.gae_lambda
-        self.device = device
         self.num_tasks = num_tasks
         self.rollout_data = {
-            "obs": torch.zeros((self.meta_episode_steps, num_tasks, *envs.single_observation_space.shape)),
-            "action": torch.zeros((self.meta_episode_steps, num_tasks, *envs.single_action_space.shape)),
-            "value": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
-            "advantage": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
-            "log_prob": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
-            "reward": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
-            "return": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
-            "done": torch.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "obs": np.zeros((self.meta_episode_steps, num_tasks, *envs.single_observation_space.shape)),
+            "action": np.zeros((self.meta_episode_steps, num_tasks, *envs.single_action_space.shape)),
+            "value": np.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "advantage": np.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "log_prob": np.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "reward": np.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "return": np.zeros((self.meta_episode_steps, num_tasks, 1)),
+            "done": np.zeros((self.meta_episode_steps, num_tasks, 1)),
         }
         self.trial_episodes = []
         self.ptr = 0
@@ -416,8 +415,8 @@ class MetaRolloutBuffer:
         assert self.ptr <= self.meta_episode_steps
         self.rollout_data["obs"][self.ptr] = torch.tensor(obs)
         self.rollout_data["action"][self.ptr] = action
-        self.rollout_data["reward"][self.ptr] = torch.tensor(reward).unsqueeze(-1)
-        self.rollout_data["done"][self.ptr] = torch.tensor(term).unsqueeze(-1)
+        self.rollout_data["reward"][self.ptr] = np.array(reward)[..., None]
+        self.rollout_data["done"][self.ptr] = np.array(term)[..., None]
         self.rollout_data["value"][self.ptr] = value
         self.rollout_data["log_prob"][self.ptr] = log_prob
         self.ptr += 1
@@ -428,7 +427,7 @@ class MetaRolloutBuffer:
 
     def empty_buffer(self):
         for key, val in self.rollout_data.items():
-            self.rollout_data[key] = torch.zeros_like(val)
+            self.rollout_data[key] = np.zeros_like(val)
         self.ptr = 0
 
     def finish_meta_trial(self, last_value, last_termination):
@@ -455,17 +454,14 @@ class MetaRolloutBuffer:
         self.rollout_data["return"]  = self.rollout_data["advantage"] \
                 + self.rollout_data["value"]
 
-        # Add to episode list
-        episode = {k: v.clone() for k, v in self.rollout_data.items()}
+        episode = {k: v.copy() for k, v in self.rollout_data.items()}
         self.trial_episodes.append(episode)
 
-        # Empty episode buffer
         self.empty_buffer()
 
     def sample(self):
-        # format the experience to (batch_size, horizon, ...) length
         batch = {
-            k: torch.stack([ep[k] for ep in self.trial_episodes]) for k in self.rollout_data.keys()
+            k: np.stack([ep[k] for ep in self.trial_episodes]) for k in self.rollout_data.keys()
         }
 
         return batch, len(self.trial_episodes)
