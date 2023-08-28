@@ -43,7 +43,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="ML10",
+    parser.add_argument("--env-id", type=str, default="ML1",
         help="the id of the environment")
     parser.add_argument("--env-name", type=str, default="reach-v2", help="for ML1 tests, reach/push/pick place")
     parser.add_argument("--total-timesteps", type=int, default=2e7,
@@ -56,13 +56,13 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gamma", type=float, default=0.97,
+    parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.9,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=16,
+    parser.add_argument("--num-minibatches", type=int, default=8,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=32,
+    parser.add_argument("--update-epochs", type=int, default=2,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -100,8 +100,8 @@ def parse_args():
                         help='condition policy on ground-truth task description')
 
     # using separate encoders for the different inputs ("None" uses no encoder)
-    parser.add_argument('--policy-state-embedding-dim', type=int, default=256)
-    parser.add_argument('--policy-latent-embedding-dim', type=int, default=256)
+    parser.add_argument('--policy-state-embedding-dim', type=int, default=64)
+    parser.add_argument('--policy-latent-embedding-dim', type=int, default=64)
     parser.add_argument('--policy-belief-embedding-dim', type=int, default=None)
     parser.add_argument('--policy-task-embedding-dim', type=int, default=None)
 
@@ -117,7 +117,7 @@ def parse_args():
                         help='normalise policy output')
 
     # network
-    parser.add_argument('--policy-layers', nargs='+', default=[400, 400, 400])
+    parser.add_argument('--policy-layers', nargs='+', default=[128, 128, 128])
     parser.add_argument('--policy-activation-function', type=str, default='tanh', help='tanh/relu/leaky-relu')
     parser.add_argument('--policy-initialisation', type=str, default='normc', help='normc/orthogonal')
 
@@ -152,7 +152,7 @@ def parse_args():
                         help='how many frames to pre-collect before training begins (useful to fill VAE buffer)')
     parser.add_argument('--vae-buffer-add-thresh', type=float, default=1,
                         help='probability of adding a new trajectory to buffer')
-    parser.add_argument('--vae-batch-num-trajs', type=int, default=100,
+    parser.add_argument('--vae-batch-num-trajs', type=int, default=15,
                         help='how many trajectories to use for VAE update')
     parser.add_argument('--tbptt-stepsize', type=int, default=None,
                         help='stepsize for truncated backpropagation through time; None uses max (horizon of BAMDP)')
@@ -164,7 +164,7 @@ def parse_args():
                         help='Average ELBO terms (instead of sum)')
     parser.add_argument('--vae-avg-reconstruction-terms', type=bool, default=False,
                         help='Average reconstruction terms (instead of sum)')
-    parser.add_argument('--num-vae-updates', type=int, default=32,
+    parser.add_argument('--num-vae-updates', type=int, default=3,
                         help='how many VAE update steps to take per meta-iteration')
     parser.add_argument('--pretrain-len', type=int, default=0, help='for how many updates to pre-train the VAE')
     parser.add_argument('--kl-weight', type=float, default=1.0, help='weight for the KL term')
@@ -175,20 +175,20 @@ def parse_args():
                         help='split batches up by elbo term (to save memory of if ELBOs are of different length)')
 
     # - encoder
-    parser.add_argument('--action-embedding-size', type=int, default=128)
-    parser.add_argument('--state-embedding-size', type=int, default=128)
-    parser.add_argument('--reward-embedding-size', type=int, default=128)
-    parser.add_argument('--encoder-layers_before-gru', nargs='+', type=int, default=[128, 128])
+    parser.add_argument('--action-embedding-size', type=int, default=16)
+    parser.add_argument('--state-embedding-size', type=int, default=32)
+    parser.add_argument('--reward-embedding-size', type=int, default=16)
+    parser.add_argument('--encoder-layers_before-gru', nargs='+', type=int, default=[])
     parser.add_argument('--encoder-gru_hidden-size', type=int, default=128, help='dimensionality of RNN hidden state')
-    parser.add_argument('--encoder-layers-after-gru', nargs='+', type=int, default=[128, 128])
-    parser.add_argument('--latent-dim', type=int, default=64, help='dimensionality of latent space')
+    parser.add_argument('--encoder-layers-after-gru', nargs='+', type=int, default=[])
+    parser.add_argument('--latent-dim', type=int, default=5, help='dimensionality of latent space')
 
     # - decoder: rewards
     parser.add_argument('--decode-reward', type=bool, default=True, help='use reward decoder')
     parser.add_argument('--rew-loss-coeff', type=float, default=1.0, help='weight for state loss (vs reward loss)')
     parser.add_argument('--input-prev-state', type=bool, default=False, help='use prev state for rew pred')
     parser.add_argument('--input-action', type=bool, default=False, help='use prev action for rew pred')
-    parser.add_argument('--reward-decoder-layers', nargs='+', type=int, default=[128, 64, 32])
+    parser.add_argument('--reward-decoder-layers', nargs='+', type=int, default=[ 64, 32])
     parser.add_argument('--multihead-for-reward', type=bool, default=False,
                         help='one head per reward pred (i.e. per state)')
     parser.add_argument('--rew-pred-type', type=str, default='deterministic',
@@ -504,7 +504,7 @@ class Agent(nn.Module):
             if args.num_envs > 1:
                 return value, action, dist.log_prob(action).sum(dim=1), dist.entropy().sum(1)
             else:
-                return value, action, dist.log_prob(action).sum(), dist.entropy().sum()
+                return value, action.unsqueeze(0), dist.log_prob(action).sum(), dist.entropy().sum()
         else:
             return action
 
@@ -701,6 +701,7 @@ class RNNEncoder(nn.Module):
         ha = self.action_encoder(actions)
         hs = self.state_encoder(states)
         hr = self.reward_encoder(rewards)
+
         h = torch.cat((ha, hs, hr), dim=2).to(device)
         hidden_state = hidden_state.to(device)
         for i in range(len(self.fc_before_gru)):
@@ -1172,16 +1173,18 @@ if __name__ == "__main__":
     elif args.env_id == 'ML10':
         benchmark = metaworld.ML10(seed=args.seed)
         args.num_envs = 10
+
     elif args.env_id == 'ML450':
         benchmark = metaworld.ML45(seed=args.seed)
         args.num_envs = 45
-
     use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
 
     # env setup
     envs = SyncVectorEnv(
         benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
     )
+
+
 
     args.state_dim = envs.single_observation_space.shape[0]
     args.action_space = envs.single_action_space.shape[0]
@@ -1300,7 +1303,7 @@ if __name__ == "__main__":
 
             # TRY NOT TO MODIFY: execute the game and log data.
             reward_normalized = 0
-            next_obs, reward_raw, terminated, truncated, infos = envs.step(action.cpu().numpy())
+            next_obs, reward_raw, terminated, truncated, infos = envs.step(action.cpu().numpy().tolist())
             done = np.logical_or(terminated, truncated)
 
             rewards[step] = torch.tensor(reward_raw).to(device).view(-1)
@@ -1309,8 +1312,9 @@ if __name__ == "__main__":
             with torch.no_grad():
                 if True in done:
                     hidden_state = vae.encoder.reset_hidden(hidden_state.cpu(), torch.tensor(done))
-                r = rewards[step].reshape(10, 1)
-                r = r.squeeze(0)
+                r = rewards[step].reshape(args.num_envs, 1)
+                if args.num_envs != 1:
+                    r = r.squeeze(0)
 
                 latent_sample, latent_mean, latent_logvars, hidden_state = vae.encoder(actions=action.float(),
                                                                                       states=next_obs,
