@@ -4,20 +4,23 @@ import random
 import time
 from distutils.util import strtobool
 
+from flax.training.train_state import TrainState
+
 from cleanrl_utils.wrappers import metaworld_wrappers
 import gymnasium as gym
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from typing import Optional, Type
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from typing import Optional, Type, Tuple
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from cleanrl_utils.buffers_metaworld import MetaRolloutBuffer
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
 from collections import deque
+import distrax
+import optax
 
 
 def parse_args():
@@ -29,8 +32,6 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
-    parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
@@ -45,6 +46,7 @@ def parse_args():
                         help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--encoder-hidden-size", type=int, default=128)
+    parser.add_argument("--mini-batch-size", type=int, default=6)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
@@ -91,113 +93,119 @@ def parse_args():
     return args
 
 
-class Critic(nn.Module):
-    def __init__(self, env, args):
-        super().__init__()
-        self.fc1 = nn.Linear(
-            args.recurrent_state_size,
-            400,
+def uniform_init(bound: float):
+    def _init(key, shape, dtype):
+        return jax.random.uniform(
+            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
         )
-        self.fc2 = nn.Linear(400, 400)
-        self.fc3 = nn.Linear(400, 1)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+    return _init
 
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -5
+class Critic(nn.Module):
+    args: dict
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(
+            self.args.recurrent_state_size,
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
+        )(x)
+
+        x = nn.relu(x)
+        x = nn.Dense(
+            400,
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
+        )(x)
+        x = nn.relu(x)
+        return nn.Dense(
+            1,
+            kernel_init=nn.initializers.orthogonal(1),
+            bias_init=nn.initializers.constant(0.0),
+        )(x)
 
 
 class Actor(nn.Module):
-    def __init__(self, env, args):
-        super().__init__()
-        self.fc1 = nn.Linear(args.recurrent_state_size, 400)
-        self.fc2 = nn.Linear(400, 400)
-        self.fc_mean = nn.Linear(400, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(400, np.prod(env.single_action_space.shape))
+    args: dict
+    action_dim: int
 
-    def forward(self, x, action=None):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        mean = self.fc_mean(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            log_std + 1
-        )  # From SpinUp / Denis Yarats
+    LOG_STD_MIN: float = -20.0
+    LOG_STD_MAX: float = 2.0
 
-        action_std = torch.exp(log_std)
-        probs = torch.distributions.Normal(mean, action_std)
-        if action is None:
-            action = probs.sample()
-        return (
-            action,
-            probs.log_prob(action).sum(-1).view(*x.shape[:-1], 1),
-            probs.entropy().sum(-1).view(*x.shape[:-1], 1),
+    @nn.compact
+    def __call__(self, x: jax.Array):
+        x = nn.Dense(
+            400,
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Dense(
+            400,
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
+        )(x)
+        x = nn.relu(x)
+
+        log_sigma = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(x)
+        mu = nn.Dense(
+            self.action_dim,
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(x)
+        log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
+            distrax.Block(distrax.Tanh(), ndims=1),
         )
 
 
-class Agent(nn.Module):
-    def __init__(self, envs, args, device):
-        super().__init__()
-        self.args = args
-        self.actor = Actor(envs, args)
-        self.critic = Critic(envs, args)
-        self.device = device
+class RL2ActorCritic(nn.Module):
+    envs: gym.Env
+    args: dict
 
-        obs_dim = np.array(envs.single_observation_space.shape).prod()
-        self.obs_enc = nn.Linear(obs_dim, args.encoder_hidden_size).to(device)
+    def initialize_state(self, batch_size):
+        return nn.GRUCell(
+            features=self.args.recurrent_state_size, parent=None
+        ).initialize_carry(
+            jax.random.PRNGKey(0),
+            (batch_size, self.args.encoder_hidden_size),
+        )
 
-        self.recurrent_state_size = args.recurrent_state_size
-        self.rnn = nn.GRU(
-            args.encoder_hidden_size,
-            self.recurrent_state_size,
-            batch_first=True,
-            num_layers=args.recurrent_num_layers,
-        ).to(device)
+    @nn.compact
+    def __call__(self, x, carry) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
+        x = nn.Dense(self.args.encoder_hidden_size)(x)
+        x = nn.relu(x)
+        carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, x)
+        dist = Actor(self.args, np.array(self.envs.single_action_space.shape).prod())(
+            out
+        )
+        value = Critic(self.args)(out)
+        return dist, value, carry
 
-    def init_state(self, batch_size):
-        self.rnn_state = torch.randn(
-            self.args.recurrent_num_layers, batch_size, self.recurrent_state_size
-        ).to(self.device)
 
-    def recurrent_state(self, obs, rnn_state, training=False):
-        obs_enc = self.obs_enc(obs)
-        rnn_out, rnn_state_out = self.rnn(obs_enc, rnn_state)
-        if not training:
-            rnn_out = rnn_out.squeeze(1)
-        return rnn_out, rnn_state_out
+@jax.jit
+def get_action_and_value(
+    agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
+):
+    key, action_key = jax.random.split(key)
+    action_dist, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
+    return action, log_prob, value, key
 
-    def get_value(self, obs, training=False):
-        rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state, training)
-        return self.critic(rnn_out)
 
-    def get_action_and_log_prob(self, obs, action=None, training=False):
-        rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state, training)
-        action, log_prob, entropy = self.actor(rnn_out, action)
-        return action, log_prob, entropy
-
-    def get_action(self, obs):
-        with torch.no_grad():
-            rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state)
-            return self.actor(rnn_out)[0]
-
-    def step(self, obs):
-        with torch.no_grad():
-            rnn_out, self.rnn_state = self.recurrent_state(obs, self.rnn_state)
-
-            (
-                action,
-                log_prob,
-                entropy,
-            ) = self.actor(rnn_out)
-            value = self.critic(rnn_out)
-
-        return action, value, log_prob
+@jax.jit
+def get_deterministic_action(
+    agent_state: TrainState, obs: jax.Array, carry: jax.Array
+) -> jax.Array:
+    action_dist, _, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    return jnp.tanh(action_dist.distribution.mean()), carry
 
 
 def _make_envs_common(
@@ -242,9 +250,9 @@ make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
 def rl2_evaluation(
     args,
     agent,
+    agent_state,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
-    device=torch.device("cpu"),
 ):
     obs, _ = eval_envs.reset()
     NUM_TASKS = eval_envs.num_envs
@@ -253,14 +261,12 @@ def rl2_evaluation(
     episodic_returns = [[] for _ in range(NUM_TASKS)]
 
     start_time = time.time()
-    agent.init_state(NUM_TASKS)
+    carry = agent.initialize_state(NUM_TASKS)
 
     while not all(len(returns) >= num_episodes for returns in episodic_returns):
-        with torch.no_grad():
-            obs = torch.tensor(obs).to(device).float().unsqueeze(1)
-            action = agent.get_action(obs)
-
-        obs, reward, _, _, infos = eval_envs.step(action.cpu().numpy())
+        action, carry = get_deterministic_action(agent_state, obs, carry)
+        action = jax.device_get(action)
+        obs, reward, _, _, infos = eval_envs.step(action)
 
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
@@ -268,8 +274,9 @@ def rl2_evaluation(
                 if info is None:
                     continue
                 # reset states of finished episodes
-                _state = agent.rnn_state[:, i : i + 1]
-                agent.rnn_state[:, i : i + 1] = torch.randn_like(_state)
+                carry = carry.at[:, i : i + 1].set(
+                    np.random.random(carry[:, i : i + 1].shape)
+                )
                 episodic_returns[i].append(float(info["episode"]["r"][0]))
                 if len(episodic_returns[i]) <= num_episodes:
                     successes[i] += int(info["success"])
@@ -285,100 +292,73 @@ def rl2_evaluation(
     return mean_success_rate, mean_returns, success_rate_per_task
 
 
-def update_rl2_ppo(agent: Agent, meta_rb: MetaRolloutBuffer, device, total_steps, args):
-    clipfracs = []
+def update_rl2_ppo(
+    args,
+    agent_state: TrainState,
+    meta_rb: MetaRolloutBuffer,
+    key,
+):
     batch, batch_size = meta_rb.sample()
-    # TODO: Should meta trial only contain episodes from the same task?
-    obs_batch = (
-        batch["obs"].to(device).view(-1, args.max_episode_steps, batch["obs"].shape[-1])
-    )
-    action_batch = (
-        batch["action"]
-        .to(device)
-        .view(-1, args.max_episode_steps, batch["action"].shape[-1])
-    )
-    value_batch = batch["value"].to(device).view(-1, args.max_episode_steps, 1)
-    advantage_batch = batch["advantage"].to(device).view(-1, args.max_episode_steps, 1)
-    old_logprob_batch = batch["log_prob"].to(device).view(-1, args.max_episode_steps, 1)
-    return_batch = batch["return"].to(device).view(-1, args.max_episode_steps, 1)
 
-    for epoch in range(args.update_epochs):
-        agent.init_state(obs_batch.shape[0])
-        _, newlogprob, entropy = agent.get_action_and_log_prob(
-            obs_batch,
-            action=action_batch,
-            training=True,
+    @jax.jit
+    def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
+        carry = jnp.zeros((obs.shape[0], args.recurrent_state_size))
+        action_dist, newvalue, carry = agent_state.apply_fn(
+            agent_state.params, obs, carry
         )
-
-        logratio = (
-            newlogprob.sum(-1).reshape(-1, args.max_episode_steps, 1)
-            - old_logprob_batch
-        )
-        ratio = torch.exp(logratio)
-
-        with torch.no_grad():
-            # calculate approx_kl http://joschu.net/blog/kl-approx.html
-            old_approx_kl = (-logratio).mean()
-            approx_kl = ((ratio - 1) - logratio).mean()
-            clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+        action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
+        logratio = newlog_prob[..., None] - logprob
+        ratio = jnp.exp(logratio)
+        approx_kl = ((ratio - 1) - logratio).mean()
 
         if args.norm_adv:
-            advantage_batch = (advantage_batch - advantage_batch.mean()) / (
-                advantage_batch.std() + 1e-8
-            )
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        pg_loss1 = -advantage_batch * ratio
-        pg_loss2 = -advantage_batch * torch.clamp(
-            ratio, 1 - args.clip_coef, 1 + args.clip_coef
-        )
-        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * jnp.clip(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+        pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
 
-        newvalue = agent.get_value(
-            obs_batch,
-            training=True,
-        )
+        v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
 
-        if args.clip_vloss:
-            v_loss_unclipped = (newvalue - return_batch) ** 2
-            v_clipped = value_batch + torch.clamp(
-                newvalue - value_batch,
-                -args.clip_coef,
-                args.clip_coef,
-            )
-            v_loss_clipped = (v_clipped - return_batch) ** 2
-            v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-            v_loss = 0.5 * v_loss_max.mean()
-        else:
-            v_loss = 0.5 * ((newvalue - return_batch) ** 2).mean()
+        entropy_loss = -newlog_prob.mean()
 
-        entropy_loss = entropy.mean()
-        loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
-        optimizer.step()
-
-        if args.target_kl is not None:
-            if approx_kl > args.target_kl:
-                print("BREAK KL")
-                break
-
-        y_pred, y_true = (
-            value_batch.cpu().numpy(),
-            return_batch.cpu().numpy(),
-        )
-        var_y = np.var(y_true)
-        explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        return {
-            "losses/value_loss": v_loss.item(),
-            "losses/policy_loss": pg_loss.item(),
-            "losses/entropy": entropy_loss.item(),
-            "losses/old_approx_kl": old_approx_kl.item(),
-            "losses/approx_kl": approx_kl.item(),
-            "losses/clipfrac": np.mean(clipfracs),
-            "losses/explained_variance": explained_var,
+        loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+        return loss, {
+            "loss": loss,
+            "pg_loss": pg_loss,
+            "v_loss": v_loss,
+            "entropy_loss": entropy_loss,
+            "approx_kl": jax.lax.stop_gradient(approx_kl),
         }
+
+    obs_batch = batch["obs"].reshape(-1, args.max_episode_steps, batch["obs"].shape[-1])
+    action_batch = batch["action"].reshape(
+        -1, args.max_episode_steps, batch["action"].shape[-1]
+    )
+    advantage_batch = batch["advantage"].reshape(-1, args.max_episode_steps, 1)
+    logprob_batch = batch["log_prob"].reshape(-1, args.max_episode_steps, 1)
+    return_batch = batch["return"].reshape(-1, args.max_episode_steps, 1)
+
+    for epoch in range(args.update_epochs):
+        key, subkey = jax.random.split(key)
+        args.n_episodes_per_trial
+        b_inds = jax.random.permutation(subkey, args.mini_batch_size, independent=True)
+        for start in range(0, args.n_episodes_per_trial, args.mini_batch_size):
+            end = start + args.mini_batch_size
+            mb_inds = np.array(b_inds[start:end])
+            grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
+                agent_state.params,
+                obs_batch[mb_inds].reshape(-1, batch["obs"].shape[-1]),
+                action_batch[mb_inds].reshape(-1, batch["action"].shape[-1]),
+                advantage_batch[mb_inds].reshape(-1, 1),
+                logprob_batch[mb_inds].reshape(-1, 1),
+                return_batch[mb_inds].reshape(-1, 1),
+                subkey,
+            )
+
+            agent_state = agent_state.apply_gradients(grads=grads)
+
+    return agent_state, aux_metrics
 
 
 if __name__ == "__main__":
@@ -406,10 +386,8 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
+    key = jax.random.PRNGKey(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     if args.env_id == "ML10":
         benchmark = metaworld.ML10(seed=args.seed)
     elif args.env_id == "ML50":
@@ -430,9 +408,21 @@ if __name__ == "__main__":
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
+    obs, _ = envs.reset()
 
-    agent = Agent(envs, args, device).to(torch.float32).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    key, agent_init_key = jax.random.split(key)
+    agent = RL2ActorCritic(envs, args)
+    agent.apply = jax.jit(agent.apply)
+    agent_state = TrainState.create(
+        apply_fn=agent.apply,
+        params=agent.init(
+            agent_init_key, obs, jnp.zeros((NUM_TASKS, args.recurrent_state_size))
+        ),
+        tx=optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.adam(learning_rate=args.learning_rate),
+        ),
+    )
 
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
@@ -441,7 +431,7 @@ if __name__ == "__main__":
     global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
     global_episodic_length = deque([], maxlen=20 * NUM_TASKS)
 
-    meta_rb = MetaRolloutBuffer(envs, args, device, NUM_TASKS)
+    meta_rb = MetaRolloutBuffer(envs, args, NUM_TASKS)
     total_steps = 0
 
     for global_step in range(int(args.total_timesteps // args.n_episodes_per_trial)):
@@ -449,22 +439,19 @@ if __name__ == "__main__":
         # collect a trial of n episodes per task
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
         num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
+        carry = agent.initialize_state(NUM_TASKS)
         for meta_ep in range(num_trial_episodes):
             # RL^2 stuff
             # reset hidden state for each meta trial
-            agent.init_state(NUM_TASKS)
             for meta_step in range(args.max_episode_steps):
                 total_steps += NUM_TASKS
-                # ALGO LOGIC: action logic
-                with torch.no_grad():
-                    action, value, log_prob = agent.step(
-                        torch.tensor(obs).to(device).float().unsqueeze(1)
-                    )
-
-                # TRY NOT TO MODIFY: execute the game and log data.
-                next_obs, reward, terminated, truncated, infos = envs.step(
-                    action.cpu().numpy()
+                action, log_prob, value, key = get_action_and_value(
+                    agent_state, obs, carry, key
                 )
+                action = jax.device_get(action)
+                value = jax.device_get(value)
+                # TRY NOT TO MODIFY: execute the game and log data.
+                next_obs, reward, terminated, truncated, infos = envs.step(action)
                 done = np.logical_or(terminated, truncated)
                 meta_rb.store(
                     obs,
@@ -472,7 +459,7 @@ if __name__ == "__main__":
                     reward,
                     done,
                     value,
-                    log_prob,
+                    log_prob.reshape(-1, 1),
                 )
                 obs = next_obs
 
@@ -487,13 +474,10 @@ if __name__ == "__main__":
                     global_episodic_return.append(info["episode"]["r"])
                     global_episodic_length.append(info["episode"]["l"])
 
-            with torch.no_grad():
-                value = agent.get_value(
-                    torch.tensor(obs).to(device).float().unsqueeze(1)
-                )
+            _, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
             meta_rb.finish_meta_trial(
-                value.cpu(), torch.tensor(done, dtype=torch.float32).unsqueeze(-1)
+                value, np.array(done, dtype=np.float32)[..., None]
             )
 
         if global_step % 500 == 0 and global_episodic_return:
@@ -510,7 +494,8 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        logs = update_rl2_ppo(agent, meta_rb, device, total_steps, args)
+        agent_state, logs = update_rl2_ppo(args, agent_state, meta_rb, key)
+        logs = jax.device_get(logs)
         meta_rb.reset()
 
         if global_step % 100 == 0:
@@ -525,9 +510,8 @@ if __name__ == "__main__":
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
             print(f"Evaluating... at total_steps={total_steps}")
-            agent.eval()
             eval_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args, agent, eval_envs, args.evaluation_num_episodes, device
+                args, agent, agent_state, eval_envs, args.evaluation_num_episodes
             )
             eval_metrics = {
                 "charts/mean_success_rate": float(eval_success_rate),
@@ -544,7 +528,6 @@ if __name__ == "__main__":
                 f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
-            agent.train()
 
     envs.close()
     writer.close()
