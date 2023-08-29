@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import flax
 import flax.linen as nn
-from typing import Optional, Type, Tuple
+from typing import Optional, Type, Tuple, List
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
@@ -307,15 +307,13 @@ def rl2_evaluation(
 def update_rl2_ppo(
     args,
     agent_state: TrainState,
-    storage: Storage,
+    storage_list: List[Storage],
     key,
 ):
     @jax.jit
     def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
         carry = jnp.zeros((obs.shape[0], args.recurrent_state_size))
-        action_dist, newvalue, carry = agent_state.apply_fn(
-            params, obs, carry
-        )
+        action_dist, newvalue, carry = agent_state.apply_fn(params, obs, carry)
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
         logratio = newlog_prob.reshape(-1, 1) - logprob
         ratio = jnp.exp(logratio)
@@ -341,13 +339,21 @@ def update_rl2_ppo(
             "approx_kl": jax.lax.stop_gradient(approx_kl),
         }
 
-    obs_batch = storage.obs.reshape(-1, args.max_episode_steps, storage.obs.shape[-1])
-    action_batch = storage.actions.reshape(
-        -1, args.max_episode_steps, storage.actions.shape[-1]
-    )
-    advantage_batch = storage.advantages.reshape(-1, args.max_episode_steps, 1)
-    logprob_batch = storage.logprobs.reshape(-1, args.max_episode_steps, 1)
-    return_batch = storage.returns.reshape(-1, args.max_episode_steps, 1)
+    # combine episodes into trials
+    _obs = jnp.stack([strg.obs for strg in storage_list])
+    _actions = jnp.stack([strg.actions for strg in storage_list])
+    _logprobs = jnp.stack([strg.logprobs for strg in storage_list])
+    _dones = jnp.stack([strg.dones for strg in storage_list])
+    _values = jnp.stack([strg.values for strg in storage_list])
+    _advantages = jnp.stack([strg.advantages for strg in storage_list])
+    _returns = jnp.stack([strg.returns for strg in storage_list])
+    _rewards = jnp.stack([strg.rewards for strg in storage_list])
+
+    obs_batch = _obs.reshape(-1, args.max_episode_steps, _obs.shape[-1])
+    action_batch = _actions.reshape(-1, args.max_episode_steps, _actions.shape[-1])
+    advantage_batch = _advantages.reshape(-1, args.max_episode_steps, 1)
+    logprob_batch = _logprobs.reshape(-1, args.max_episode_steps, 1)
+    return_batch = _returns.reshape(-1, args.max_episode_steps, 1)
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
@@ -358,8 +364,8 @@ def update_rl2_ppo(
             mb_inds = np.array(b_inds[start:end])
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                obs_batch[mb_inds].reshape(-1, storage.obs.shape[-1]),
-                action_batch[mb_inds].reshape(-1, storage.actions.shape[-1]),
+                obs_batch[mb_inds].reshape(-1, _obs.shape[-1]),
+                action_batch[mb_inds].reshape(-1, _actions.shape[-1]),
                 advantage_batch[mb_inds].reshape(-1, 1),
                 logprob_batch[mb_inds].reshape(-1, 1),
                 return_batch[mb_inds].reshape(-1, 1),
@@ -380,35 +386,22 @@ def compute_gae(
     carry: jax.Array,
 ):
     storage = storage.replace(advantages=storage.advantages.at[:].set(0.0))
-    ep_start_idx = (
-        np.arange(
-            args.max_episode_steps, storage.obs.shape[0] + 1, args.max_episode_steps
+    _, next_value, carry = agent_state.apply_fn(agent_state.params, next_obs, carry)
+    lastgaelam = 0
+    for t in reversed(range(args.max_episode_steps)):
+        if t == args.max_episode_steps - 1:
+            nextnonterminal = 1.0 - next_done
+            nextvalues = next_value
+        else:
+            nextnonterminal = 1.0 - storage.dones[t + 1]
+            nextvalues = storage.values[t + 1]
+        delta = (
+            storage.rewards[t]
+            + args.gamma * nextvalues * nextnonterminal
+            - storage.values[t]
         )
-        - 1
-    )
-    for ep in reversed(range((storage.obs.shape[0] // args.max_episode_steps))):
-        lastgaelam = 0
-        for _t in reversed(range(args.max_episode_steps)):
-            t = _t + (ep * args.max_episode_steps)
-            if t in ep_start_idx:
-                nextnonterminal = 1.0 - next_done
-                _, nextvalues, carry = agent_state.apply_fn(
-                    agent_state.params, storage.obs[t], carry
-                )
-            else:
-                nextnonterminal = 1.0 - storage.dones[t + 1]
-                nextvalues = storage.values[t + 1]
-            delta = (
-                storage.rewards[t]
-                + args.gamma * nextvalues * nextnonterminal
-                - storage.values[t]
-            )
-            lastgaelam = (
-                delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            )
-            storage = storage.replace(
-                advantages=storage.advantages.at[t].set(lastgaelam)
-            )
+        lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+        storage = storage.replace(advantages=storage.advantages.at[t].set(lastgaelam))
 
     storage = storage.replace(returns=storage.advantages + storage.values)
     return storage
@@ -440,6 +433,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
+    key, agent_init_key = jax.random.split(key)
 
     if args.env_id == "ML10":
         benchmark = metaworld.ML10(seed=args.seed)
@@ -453,11 +447,13 @@ if __name__ == "__main__":
     keys = list(benchmark.train_classes.keys())
 
     eval_train_envs = make_eval_envs(
-        benchmark, args.seed, train=True,
+        benchmark,
+        args.seed,
+        train=True,
     )
 
     eval_test_envs = make_eval_envs(
-        benchmark, args.seed, train=args.env_id in ["MT10", "MT50"]
+        benchmark, args.seed, train=False
     )
 
     NUM_TASKS = len(benchmark.train_classes)
@@ -467,7 +463,6 @@ if __name__ == "__main__":
     ), "only continuous action space is supported"
     obs, _ = envs.reset()
 
-    key, agent_init_key = jax.random.split(key)
     agent = RL2ActorCritic(envs, args)
     agent.apply = jax.jit(agent.apply)
     agent_state = TrainState.create(
@@ -482,17 +477,20 @@ if __name__ == "__main__":
     )
 
     num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
-
-    trial_length = args.max_episode_steps * num_trial_episodes
+    # trial_length = args.max_episode_steps * num_trial_episodes
     storage = Storage(
-        obs=jnp.zeros((trial_length, NUM_TASKS, *envs.single_observation_space.shape)),
-        actions=jnp.zeros((trial_length, NUM_TASKS, *envs.single_action_space.shape)),
-        logprobs=jnp.zeros((trial_length, NUM_TASKS, 1)),
-        dones=jnp.zeros((trial_length, NUM_TASKS, 1)),
-        values=jnp.zeros((trial_length, NUM_TASKS, 1)),
-        advantages=jnp.zeros((trial_length, NUM_TASKS, 1)),
-        returns=jnp.zeros((trial_length, NUM_TASKS, 1)),
-        rewards=jnp.zeros((trial_length, NUM_TASKS, 1)),
+        obs=jnp.zeros(
+            (args.max_episode_steps, NUM_TASKS, *envs.single_observation_space.shape)
+        ),
+        actions=jnp.zeros(
+            (args.max_episode_steps, NUM_TASKS, *envs.single_action_space.shape)
+        ),
+        logprobs=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
+        dones=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
+        values=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
+        advantages=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
+        returns=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
+        rewards=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
     )
 
     # TRY NOT TO MODIFY: start the game
@@ -508,6 +506,7 @@ if __name__ == "__main__":
         assert args.n_episodes_per_trial > NUM_TASKS
         # collect a trial of n episodes per task
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
+        meta_trial = list()
         for meta_ep in range(1, num_trial_episodes + 1):
             # RL^2 stuff
             # reset hidden state for each meta trial
@@ -521,16 +520,13 @@ if __name__ == "__main__":
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
                 done = np.logical_or(terminated, truncated).reshape(-1, 1)
-                _current_step = meta_step * meta_ep
                 storage = storage.replace(
-                    obs=storage.obs.at[_current_step].set(next_obs),
-                    dones=storage.dones.at[_current_step].set(done),
-                    actions=storage.actions.at[_current_step].set(action),
-                    values=storage.values.at[_current_step].set(value),
-                    logprobs=storage.logprobs.at[_current_step].set(logprob),
-                    rewards=storage.rewards.at[_current_step].set(
-                        reward.reshape(-1, 1)
-                    ),
+                    obs=storage.obs.at[meta_step].set(next_obs),
+                    dones=storage.dones.at[meta_step].set(done),
+                    actions=storage.actions.at[meta_step].set(action),
+                    values=storage.values.at[meta_step].set(value),
+                    logprobs=storage.logprobs.at[meta_step].set(logprob),
+                    rewards=storage.rewards.at[meta_step].set(reward.reshape(-1, 1)),
                 )
                 obs = next_obs
 
@@ -553,10 +549,11 @@ if __name__ == "__main__":
                 storage,
                 carry,
             )
+            meta_trial.append(storage)
 
         if global_step % 500 == 0 and global_episodic_return:
             mean_ep_return = np.mean(global_episodic_return)
-            print(f"global_step={total_steps}, mean_episodic_return={mean_ep_return}")
+            print(f"{total_steps=}, {mean_ep_return=}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 mean_ep_return,
@@ -568,7 +565,7 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(args, agent_state, storage, key)
+        agent_state, logs = update_rl2_ppo(args, agent_state, meta_trial, key)
         logs = jax.device_get(logs)
 
         if global_step % 100 == 0:
@@ -582,7 +579,7 @@ if __name__ == "__main__":
             )
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
-            print(f"Evaluating on test set at total_steps={total_steps}")
+            print(f"Evaluating on test set at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
                 args, agent, agent_state, eval_test_envs, args.evaluation_num_episodes
             )
@@ -599,7 +596,7 @@ if __name__ == "__main__":
             for k, v in eval_metrics.items():
                 writer.add_scalar(k, v, total_steps)
 
-            print(f"Evaluating on train set at total_steps={total_steps}")
+            print(f"Evaluating on train set at {total_steps=}")
             train_success_rate, train_returns, train_success_per_task = rl2_evaluation(
                 args, agent, agent_state, eval_train_envs, args.evaluation_num_episodes
             )
