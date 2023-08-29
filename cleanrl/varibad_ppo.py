@@ -78,7 +78,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=1000,
+    parser.add_argument("--eval-freq", type=int, default=500,
         help="how many updates to do before evaluating the agent")
 
     # fmt: on
@@ -1204,13 +1204,14 @@ if __name__ == "__main__":
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    dones = torch.zeros((args.num_steps + 1, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    masks = torch.ones((args.num_steps, args.num_envs, 1)).to(device)
-    bad_masks = torch.ones((args.num_steps, args.num_envs, 1))
-    prev_obs_storage = torch.zeros((args.num_steps, args.num_envs, args.state_dim)).to(device)
+    masks = torch.ones((args.num_steps + 1, args.num_envs, 1)).to(device)
+    bad_masks = torch.ones((args.num_steps + 1, args.num_envs, 1))
+    returns_storage = torch.zeros(args.num_steps + 1, args.num_envs, 1)
+    prev_obs_storage = torch.zeros((args.num_steps + 1, args.num_envs, args.state_dim)).to(device)
     next_obs_storage = torch.zeros((args.num_steps, args.num_envs, args.state_dim)).to(device)
-    hidden_state_storage = torch.zeros((args.num_steps, args.num_envs, args.encoder_gru_hidden_size)).to(device)
+    hidden_state_storage = torch.zeros((args.num_steps + 1, args.num_envs, args.encoder_gru_hidden_size)).to(device)
     latent_mean_storage = []
     latent_sample_storage = []
     latent_logvars_storage = []
@@ -1278,13 +1279,13 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
-            prev_obs_storage[step] = prev_obs
-            dones[step] = next_done
+            prev_obs_storage[step+1] = prev_obs
+            dones[step+1] = next_done
 
             latent_sample_storage.append(latent_sample.detach().clone())
             latent_mean_storage.append(latent_mean.detach().clone())
             latent_logvars_storage.append(latent_logvars.detach().clone())
-            hidden_state_storage[step] = hidden_state
+            hidden_state_storage[step+1] = hidden_state
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -1305,7 +1306,8 @@ if __name__ == "__main__":
             reward_normalized = 0
             next_obs, reward_raw, terminated, truncated, infos = envs.step(action.cpu().numpy().tolist())
             done = np.logical_or(terminated, truncated)
-
+            masks_done = torch.FloatTensor([[0.0] if d else [1.0] for d in terminated]).to(device)
+            bad_mask = torch.FloatTensor([[0.0] if d else [1.0] for d in truncated]).to(device)
             rewards[step] = torch.tensor(reward_raw).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
@@ -1338,7 +1340,7 @@ if __name__ == "__main__":
             latent_sample_storage[step] = latent_sample.clone()
             latent_mean_storage[step] = latent_mean.clone()
             latent_logvars_storage[step] = latent_logvars.clone()
-
+            prev_obs = next_obs
 
             # Only print when at least 1 env is done
             if "final_info" not in infos:
@@ -1358,11 +1360,13 @@ if __name__ == "__main__":
             if update >= args.pretrain_len and update > 0:
                 # bootstrap value if not done
 
-                with torch.no_grad():  # state, latent, belief, task
-                    next_value, action, logprob, entropy = agent.act(next_obs, latent, belief, task)
+                with torch.no_grad():
+                    latent = get_latent_for_policy(args, latent_sample, latent_mean, latent_logvars)
+                    next_value = agent.get_value(prev_obs, latent, None, None)
                     next_value = torch.squeeze(next_value)
                     advantages = torch.zeros_like(rewards).to(device)
                     lastgaelam = 0
+                    values[-1] = next_value
                     for t in reversed(range(args.num_steps)):
                         if t == args.num_steps - 1:
                             nextnonterminal = 1.0 - next_done
@@ -1373,12 +1377,11 @@ if __name__ == "__main__":
                         delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                         advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                     returns = advantages + values
-
                 # flatten the batch
                 b_obs = prev_obs_storage.reshape((-1,) + envs.single_observation_space.shape)
                 b_logprobs = logprobs.reshape(-1)
                 b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-                b_advantages = advantages.reshape(-1)
+                b_advantages = advantages.reshape(-1, 1)
                 b_returns = returns.reshape(-1)
                 b_values = values.reshape(-1)
 
@@ -1393,10 +1396,12 @@ if __name__ == "__main__":
                     for start in range(0, args.batch_size, args.minibatch_size):
                         end = start + args.minibatch_size
                         mb_inds = b_inds[start:end]
+
                         latent_sample_batch = torch.cat(latent_sample_storage[:-1])[mb_inds].detach()
                         latent_mean_batch = torch.cat(latent_mean_storage[:-1])[mb_inds].detach()
                         latent_logvar_batch = torch.cat(latent_logvars_storage[:-1])[mb_inds].detach()
                         state_batch = b_obs[mb_inds].detach()
+
                         latent_batch = get_latent_for_policy(args, latent_sample_batch, latent_mean_batch, latent_logvar_batch)
                         newvalue, action_log_probs, dist_entropy = agent.evaluate_actions(state_batch, latent_batch,
                                                                                         None, None, b_actions[mb_inds].detach())
@@ -1409,8 +1414,7 @@ if __name__ == "__main__":
                             clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                         mb_advantages = b_advantages[mb_inds]
-                        if args.norm_adv:
-                            mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                         # Policy loss
                         pg_loss1 = -mb_advantages * ratio
@@ -1419,7 +1423,14 @@ if __name__ == "__main__":
 
                         # Value loss
                         newvalue = newvalue.view(-1)
-                        if args.clip_vloss:
+                        if args.ppo_use_huberloss and args.clip_vloss:
+                            value_pred_clipped = b_values[mb_inds] + (newvalue - b_values[mb_inds]).clamp(
+                                                                                                -args.ppo_clip_param,
+                                                                                                args.ppo_clip_param)
+                            value_losses = F.smooth_l1_loss(newvalue, b_returns[mb_inds], reduction='none')
+                            value_losses_clipped = F.smooth_l1_loss(value_pred_clipped, b_returns[mb_inds], reduction='none')
+                            v_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                        elif args.clip_vloss:
                             v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                             v_clipped = b_values[mb_inds] + torch.clamp(
                                 newvalue - b_values[mb_inds],
@@ -1449,7 +1460,7 @@ if __name__ == "__main__":
                 var_y = np.var(y_true)
                 explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-                vae.compute_vae_loss(update=True)
+
 
                 # TRY NOT TO MODIFY: record rewards for plotting purposes
                 writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
@@ -1462,6 +1473,8 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/explained_variance", explained_var, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                for _ in range(args.num_vae_updates):
+                    vae.compute_vae_loss(update=True)
         prev_obs_storage[0].copy_(prev_obs_storage[-1])
         hidden_state_storage[0].copy_(hidden_state_storage[-1])
         dones[0].copy_(dones[-1])

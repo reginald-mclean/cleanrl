@@ -40,6 +40,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
                     writer.add_scalar(f"charts/{worker_result['task_name']}_avg_eval_rewards_"+writer_append, np.mean(worker_result['eval_rewards']), update - 1)
         success_rate = float(mean_success_rate) / (num_envs * num_evals)
         writer.add_scalar("charts/mean_success_rate_"+writer_append, success_rate, update - 1)
+        print(success_rate)
     return success_rate
 
 
