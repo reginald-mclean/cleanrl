@@ -70,16 +70,16 @@ def parse_args():
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
+    parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
+        help="number of inner / adaptation gradient steps")
     # ProMP
     parser.add_argument("--meta-lr", type=float, default=3e-4, help="the meta-policy gradient step size")
     parser.add_argument("--num-promp-steps", type=int, default=10, help="the number of ProMP steps without re-sampling")
-    parser.add_argument("--clip-eps", type=float, default=0.1, help="clipping range")
-    parser.add_argument("--inner-kl-penalty", type=float, default=1e-2, help="kl penalty parameter eta")
-    parser.add_argument("--target-outer-kl", type=float, default=0.02,
+    parser.add_argument("--clip-eps", type=float, default=0.2, help="clipping range")
+    parser.add_argument("--inner-kl-penalty", type=float, default=5e-4, help="kl penalty parameter eta")
+    parser.add_argument("--target-outer-kl", type=float, default=0.01,
         help=("upper bound for the KL divergence between post update policy pi_\\theta' and pi_\\theta_old."
         " Can be thought of as the delta parameter in TRPO."))
-    parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
-        help="number of inner / adaptation gradient steps")
 
     args = parser.parse_args()
     # fmt: on
@@ -283,12 +283,9 @@ def outer_step(
             rollouts = all_rollouts[i]
 
             # Compute inner KL
+            theta_old_dist = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
             theta_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
-            kl = (
-                distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
-                .kl_divergence(theta_dist)
-                .mean(axis=1)  # Mean per rollout, not per task
-            )
+            kl = theta_old_dist.kl_divergence(theta_dist).mean(axis=1)  # Mean over timesteps, not tasks
             kls.append(kl)
 
             # Adapt
@@ -306,16 +303,18 @@ def outer_step(
             jnp.clip(likelihood_ratio, 1 - clip_eps, 1 + clip_eps) * rollouts.advantages,
         )
 
-        # Compute J^ProMP, Equation 13
+        # 1st term of J^ProMP - J^Clip but the minimisation version
         mean_obj = -jnp.mean(outer_objective)
 
         # KLs is a list of len(num_inner_gradient_steps), where each element is of shape (num_tasks,)
         # Mean over tasks for each step (axis=1) and then weight by eta, and then mean over everything.
         inner_kl = jnp.stack(kls).mean(axis=1)
-        mean_kl = jnp.mean(eta * inner_kl)
+        mean_kl = jnp.mean(eta * inner_kl)  # Want to min the KL div so keep it positive
 
-        outer_kl = new_param_dist.kl_divergence(theta_dist)
+        theta_old_prime = distrax.MultivariateNormalDiag(loc=rollouts.means, scale_diag=rollouts.stds)
+        outer_kl = theta_old_prime.kl_divergence(new_param_dist)
 
+        # Compute J^ProMP, Equation 13. Since the sign of the objective is inversed, we add the two terms
         return mean_obj + mean_kl, (inner_kl.mean(), outer_kl.mean())
 
     loss_before = promp_loss(train_state.params)[0]

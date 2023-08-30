@@ -302,7 +302,7 @@ def outer_step(
             inner_train_state = inner_step(inner_train_state, rollouts)
 
         new_param_dist = inner_train_state.apply_fn(inner_train_state.params, inputs[-1].observations)
-        return new_param_dist.kl_divergence(targets).mean()
+        return targets.kl_divergence(new_param_dist).mean()
 
     target_dist = distrax.MultivariateNormalDiag(all_rollouts[-1].means, all_rollouts[-1].stds)
     kl_before = kl_constraint(train_state.params, all_rollouts, target_dist)
