@@ -5,6 +5,7 @@ import time
 from distutils.util import strtobool
 
 from flax.training.train_state import TrainState
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from cleanrl_utils.wrappers import metaworld_wrappers
 import gymnasium as gym
