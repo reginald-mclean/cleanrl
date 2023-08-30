@@ -62,7 +62,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=1.0,
         help="the lambda for the general advantage estimation")
-    # ProMP 
+    # MAML 
     parser.add_argument("--meta-batch-size", type=int, default=20,
         help="the number of tasks to sample and train on in parallel")
     parser.add_argument("--rollouts-per-task", type=int, default=10,
@@ -70,11 +70,12 @@ def parse_args():
     parser.add_argument("--num-layers", type=int, default=2, help="the number of hidden layers in the MLP")
     parser.add_argument("--hidden-dim", type=int, default=512, help="the dimension of each hidden layer in the MLP")
     parser.add_argument("--inner-lr", type=float, default=0.1, help="the inner (adaptation) step size")
+    # ProMP
     parser.add_argument("--meta-lr", type=float, default=3e-4, help="the meta-policy gradient step size")
     parser.add_argument("--num-promp-steps", type=int, default=10, help="the number of ProMP steps without re-sampling")
-    parser.add_argument("--clip-eps", type=float, default=0.2, help="clipping range")
+    parser.add_argument("--clip-eps", type=float, default=0.1, help="clipping range")
     parser.add_argument("--inner-kl-penalty", type=float, default=1e-2, help="kl penalty parameter eta")
-    parser.add_argument("--target-outer-kl", type=float, default=0.01,
+    parser.add_argument("--target-outer-kl", type=float, default=0.02,
         help=("upper bound for the KL divergence between post update policy pi_\\theta' and pi_\\theta_old."
         " Can be thought of as the delta parameter in TRPO."))
     parser.add_argument("--num-inner-gradient-steps", type=int, default=1,
