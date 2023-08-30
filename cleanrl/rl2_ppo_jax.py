@@ -38,11 +38,10 @@ def parse_args():
         help="the entity (team) of wandb's project")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=80,
+    parser.add_argument("--n-episodes-per-trial", type=int, default=40,
                         help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--mini-batch-size", type=int, default=4)
     # agent parameters
     parser.add_argument("--recurrent-state-size", type=int, default=128)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -250,6 +249,27 @@ class Storage:
     rewards: jnp.array
 
 
+def get_storage(envs, max_episode_steps, num_tasks):
+    return Storage(
+        obs=jnp.zeros(
+            (
+                max_episode_steps,
+                num_tasks,
+                *envs.single_observation_space.shape,
+            )
+        ),
+        actions=jnp.zeros(
+            (max_episode_steps, num_tasks, *envs.single_action_space.shape)
+        ),
+        logprobs=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        dones=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        values=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        advantages=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        returns=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        rewards=jnp.zeros((max_episode_steps, num_tasks, 1)),
+    )
+
+
 def rl2_evaluation(
     args,
     agent,
@@ -297,13 +317,14 @@ def rl2_evaluation(
 
 def update_rl2_ppo(
     args,
+    agent: RL2ActorCritic,
     agent_state: TrainState,
     storage_list: List[Storage],
     key,
 ):
     @jax.jit
     def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
-        carry = jnp.zeros((obs.shape[0], args.recurrent_state_size))
+        carry = agent.initialize_state(obs.shape[0])
         action_dist, newvalue, carry = agent_state.apply_fn(params, obs, carry)
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
         logratio = newlog_prob.reshape(-1, 1) - logprob
@@ -318,18 +339,15 @@ def update_rl2_ppo(
             1 - args.clip_coef, ratio, 1 + args.clip_coef
         )
         pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
-
-        v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
-
-        entropy_loss = -newlog_prob.mean()
-
+        v_loss = 0.5 * jnp.square(newvalue - returns).mean()
+        entropy_loss = action_dist.distribution.entropy().mean()
         loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
         return loss, {
             "losses/loss": loss,
             "losses/pg_loss": pg_loss,
             "losses/v_loss": v_loss,
             "losses/entropy_loss": entropy_loss,
-            "losses/approx_kl": jax.lax.stop_gradient(approx_kl),
+            "losses/approx_kl": approx_kl,
         }
 
     # combine episodes into trials
@@ -352,26 +370,21 @@ def update_rl2_ppo(
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
-        # TODO: maybe remove splitting meta trial into mini batches #
-        b_inds = jax.random.permutation(subkey, args.mini_batch_size, independent=True)
-        for start in range(0, args.n_episodes_per_trial, args.mini_batch_size):
-            end = start + args.mini_batch_size
-            mb_inds = np.array(b_inds[start:end])
-            grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
-                agent_state.params,
-                # append all single episodes to be one big episode/trial and
-                # split the trial into mini batches
-                # From (n_episodes_per_trial , max_episode_steps , -1)
-                # to (mini_batch_size * max_episode_steps, -1)
-                obs_batch[mb_inds].reshape(-1, _obs.shape[-1]),
-                action_batch[mb_inds].reshape(-1, _actions.shape[-1]),
-                advantage_batch[mb_inds].reshape(-1, 1),
-                logprob_batch[mb_inds].reshape(-1, 1),
-                return_batch[mb_inds].reshape(-1, 1),
-                subkey,
-            )
-
-            agent_state = agent_state.apply_gradients(grads=grads)
+        b_inds = jax.random.permutation(
+            subkey, args.n_episodes_per_trial, independent=True
+        )
+        grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
+            agent_state.params,
+            # From (n_episodes_per_trial , max_episode_steps , -1)
+            # to (n_episodes_per_trial * max_episode_steps, -1)
+            obs_batch[b_inds].reshape(-1, _obs.shape[-1]),
+            action_batch[b_inds].reshape(-1, _actions.shape[-1]),
+            advantage_batch[b_inds].reshape(-1, 1),
+            logprob_batch[b_inds].reshape(-1, 1),
+            return_batch[b_inds].reshape(-1, 1),
+            subkey,
+        )
+        agent_state = agent_state.apply_gradients(grads=grads)
 
     return agent_state, aux_metrics
 
@@ -472,22 +485,10 @@ if __name__ == "__main__":
         ),
     )
 
+    assert (
+        args.n_episodes_per_trial % NUM_TASKS == 0
+    ), "n_episodes_per_trial must be evenly divisible by NUM_TASKS"
     num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
-    # trial_length = args.max_episode_steps * num_trial_episodes
-    storage = Storage(
-        obs=jnp.zeros(
-            (args.max_episode_steps, NUM_TASKS, *envs.single_observation_space.shape)
-        ),
-        actions=jnp.zeros(
-            (args.max_episode_steps, NUM_TASKS, *envs.single_action_space.shape)
-        ),
-        logprobs=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-        dones=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-        values=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-        advantages=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-        returns=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-        rewards=jnp.zeros((args.max_episode_steps, NUM_TASKS, 1)),
-    )
 
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
@@ -506,6 +507,7 @@ if __name__ == "__main__":
             # RL^2 stuff
             # reset hidden state for each meta trial
             carry = agent.initialize_state(NUM_TASKS)
+            storage = get_storage(envs, args.max_episode_steps, NUM_TASKS)
             for meta_step in range(args.max_episode_steps):
                 total_steps += NUM_TASKS
                 action, logprob, value, key = get_action_log_prob_and_value(
@@ -557,7 +559,7 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(args, agent_state, meta_trial, key)
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial, key)
         logs = jax.device_get(logs)
 
         if global_step % 100 == 0:
