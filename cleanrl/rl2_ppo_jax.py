@@ -30,28 +30,23 @@ def parse_args():
         help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="if toggled, `torch.backends.cudnn.deterministic=False`")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # RL^2 arguments
     parser.add_argument("--n-episodes-per-trial", type=int, default=80,
                         help="number of episodes sampled per trial/meta-batch")
-    parser.add_argument("--recurrent-state-size", type=int, default=128)
-    parser.add_argument("--encoder-hidden-size", type=int, default=128)
-    parser.add_argument("--mini-batch-size", type=int, default=6)
-    parser.add_argument("--recurrent-num-layers", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
-
-    parser.add_argument("--use-gae", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
+    parser.add_argument("--mini-batch-size", type=int, default=4)
+    # agent parameters
+    parser.add_argument("--recurrent-state-size", type=int, default=128)
+    parser.add_argument("--recurrent-num-layers", type=int, default=1)
+    parser.add_argument("--encoder-hidden-size", type=int, default=128)
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
@@ -80,8 +75,6 @@ def parse_args():
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
-    parser.add_argument("--target-kl", type=float, default=None,
-        help="the target KL divergence threshold")
 
     parser.add_argument("--eval-freq", type=int, default=100_000,
         help="how many steps to do before evaluating the agent")
@@ -121,9 +114,7 @@ class Critic(nn.Module):
         )(x)
         x = nn.relu(x)
         return nn.Dense(
-            1,
-            kernel_init=nn.initializers.orthogonal(1),
-            bias_init=nn.initializers.constant(0.0),
+            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
         )(x)
 
 
@@ -323,7 +314,9 @@ def update_rl2_ppo(
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * jnp.clip(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+        pg_loss2 = -advantages * jax.lax.clamp(
+            1 - args.clip_coef, ratio, 1 + args.clip_coef
+        )
         pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
 
         v_loss = 0.5 * ((newvalue - returns) ** 2).mean()
@@ -332,11 +325,11 @@ def update_rl2_ppo(
 
         loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
         return loss, {
-            "loss": loss,
-            "pg_loss": pg_loss,
-            "v_loss": v_loss,
-            "entropy_loss": entropy_loss,
-            "approx_kl": jax.lax.stop_gradient(approx_kl),
+            "losses/loss": loss,
+            "losses/pg_loss": pg_loss,
+            "losses/v_loss": v_loss,
+            "losses/entropy_loss": entropy_loss,
+            "losses/approx_kl": jax.lax.stop_gradient(approx_kl),
         }
 
     # combine episodes into trials
@@ -349,6 +342,8 @@ def update_rl2_ppo(
     _returns = jnp.stack([strg.returns for strg in storage_list])
     _rewards = jnp.stack([strg.rewards for strg in storage_list])
 
+    # From (n_episodes_per_trial / NUM_TASKS, max_episode_steps, NUM_TASKS, -1)
+    # to (n_episodes_per_trial, max_episode_steps, -1)
     obs_batch = _obs.reshape(-1, args.max_episode_steps, _obs.shape[-1])
     action_batch = _actions.reshape(-1, args.max_episode_steps, _actions.shape[-1])
     advantage_batch = _advantages.reshape(-1, args.max_episode_steps, 1)
@@ -357,13 +352,17 @@ def update_rl2_ppo(
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
-        args.n_episodes_per_trial
+        # TODO: maybe remove splitting meta trial into mini batches #
         b_inds = jax.random.permutation(subkey, args.mini_batch_size, independent=True)
         for start in range(0, args.n_episodes_per_trial, args.mini_batch_size):
             end = start + args.mini_batch_size
             mb_inds = np.array(b_inds[start:end])
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
+                # append all single episodes to be one big episode/trial and
+                # split the trial into mini batches
+                # From (n_episodes_per_trial , max_episode_steps , -1)
+                # to (mini_batch_size * max_episode_steps, -1)
                 obs_batch[mb_inds].reshape(-1, _obs.shape[-1]),
                 action_batch[mb_inds].reshape(-1, _actions.shape[-1]),
                 advantage_batch[mb_inds].reshape(-1, 1),
@@ -375,36 +374,6 @@ def update_rl2_ppo(
             agent_state = agent_state.apply_gradients(grads=grads)
 
     return agent_state, aux_metrics
-
-
-# @jax.jit
-def compute_gae(
-    agent_state: TrainState,
-    next_obs: np.ndarray,
-    next_done: np.ndarray,
-    storage: Storage,
-    carry: jax.Array,
-):
-    storage = storage.replace(advantages=storage.advantages.at[:].set(0.0))
-    _, next_value, carry = agent_state.apply_fn(agent_state.params, next_obs, carry)
-    lastgaelam = 0
-    for t in reversed(range(args.max_episode_steps)):
-        if t == args.max_episode_steps - 1:
-            nextnonterminal = 1.0 - next_done
-            nextvalues = next_value
-        else:
-            nextnonterminal = 1.0 - storage.dones[t + 1]
-            nextvalues = storage.values[t + 1]
-        delta = (
-            storage.rewards[t]
-            + args.gamma * nextvalues * nextnonterminal
-            - storage.values[t]
-        )
-        lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-        storage = storage.replace(advantages=storage.advantages.at[t].set(lastgaelam))
-
-    storage = storage.replace(returns=storage.advantages + storage.values)
-    return storage
 
 
 if __name__ == "__main__":
@@ -452,9 +421,7 @@ if __name__ == "__main__":
         train=True,
     )
 
-    eval_test_envs = make_eval_envs(
-        benchmark, args.seed, train=False
-    )
+    eval_test_envs = make_eval_envs(benchmark, args.seed, train=False)
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -462,6 +429,35 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
     obs, _ = envs.reset()
+
+    # @jax.jit
+    def compute_gae(
+        next_value: np.ndarray,
+        next_done: np.ndarray,
+        _storage: Storage,
+    ):
+        storage = _storage.replace(advantages=_storage.advantages.at[:].set(0.0))
+        lastgaelam = 0
+        for t in reversed(range(args.max_episode_steps)):
+            if t == args.max_episode_steps - 1:
+                nextnonterminal = 1.0 - next_done
+                nextvalues = next_value
+            else:
+                nextnonterminal = 1.0 - storage.dones[t + 1]
+                nextvalues = storage.values[t + 1]
+            delta = (
+                storage.rewards[t]
+                + args.gamma * nextvalues * nextnonterminal
+                - storage.values[t]
+            )
+            lastgaelam = (
+                delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+            )
+            storage = storage.replace(
+                advantages=storage.advantages.at[t].set(lastgaelam)
+            )
+
+        return storage.replace(returns=storage.advantages + storage.values)
 
     agent = RL2ActorCritic(envs, args)
     agent.apply = jax.jit(agent.apply)
@@ -502,12 +498,11 @@ if __name__ == "__main__":
 
     total_steps = 0
 
-    for global_step in range(int(args.total_timesteps // args.n_episodes_per_trial)):
-        assert args.n_episodes_per_trial > NUM_TASKS
+    for global_step in range(int(args.total_timesteps // NUM_TASKS)):
         # collect a trial of n episodes per task
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
         meta_trial = list()
-        for meta_ep in range(1, num_trial_episodes + 1):
+        for meta_ep in range(num_trial_episodes):
             # RL^2 stuff
             # reset hidden state for each meta trial
             carry = agent.initialize_state(NUM_TASKS)
@@ -542,13 +537,10 @@ if __name__ == "__main__":
                     global_episodic_length.append(info["episode"]["l"])
 
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            storage = compute_gae(
-                agent_state,
-                next_obs,
-                done,
-                storage,
-                carry,
+            _, _, next_value, key = get_action_log_prob_and_value(
+                agent_state, obs, carry, key
             )
+            storage = compute_gae(next_value, done, storage)
             meta_trial.append(storage)
 
         if global_step % 500 == 0 and global_episodic_return:
@@ -578,6 +570,7 @@ if __name__ == "__main__":
                 total_steps,
             )
 
+        # TODO: Finish implementation #
         if total_steps % args.eval_freq == 0 and total_steps > 0:
             print(f"Evaluating on test set at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
