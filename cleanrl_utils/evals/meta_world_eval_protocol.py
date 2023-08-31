@@ -15,7 +15,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     eval_rewards = []
     mean_success_rate = 0.0
     task_results = []
-    # agent = agent.to('cuda:0')
+    agent = agent.to('cuda:0')
     batch_size = 10 if num_envs >= 10 else num_envs
     itrs = int(num_envs/batch_size)
     with torch.no_grad():
@@ -26,7 +26,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
                 env_cls = classes[key]
                 env_tasks = [task for task in tasks if task.env_name == key]
 
-                p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, False, keys.index(key), num_envs, 'cpu', encoder))
+                p = mp.Process(target=multiprocess_eval, args=(env_cls, env_tasks, key, agent, shared_queue, num_evals, False, keys.index(key), num_envs, 'cuda:0', encoder))
                 p.start()
                 workers.append(p)
             for process in workers:
@@ -44,14 +44,14 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     return success_rate
 
 
-def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_evals, add_onehot, idx, num_envs, device, encoder):
+def eval(env, env_name, agent, num_evals,  device):
     # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
-    agent.eval()
-    env = env_cls()
-    if add_onehot:
-        env = OneHotWrapper(env, idx, num_envs)
-    env = RandomTaskSelectWrapper(env, env_tasks, sample_tasks_on_reset=True)
-    env = gym.wrappers.TimeLimit(env, max_episode_steps=200)
+    #agent.eval()
+    #env = env_cls()
+    #if add_onehot:
+    #    env = OneHotWrapper(env, idx, num_envs)
+    #env = RandomTaskSelectWrapper(env, env_tasks, sample_tasks_on_reset=True)
+    #env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
     rewards = []
     success = 0.0
     for m in range(num_evals):
@@ -71,8 +71,4 @@ def multiprocess_eval(env_cls, env_tasks, env_name, agent, shared_queue, num_eva
             if done:
                 break
 
-    shared_queue.put({
-        'eval_rewards' : rewards,
-        'success_rate' : success,
-        'task_name'    : env_name
-    })
+    print(float(success) / num_evals)

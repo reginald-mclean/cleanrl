@@ -9,6 +9,7 @@ from gymnasium.vector.utils import concatenate, create_empty_array, iterate
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from gymnasium.wrappers.time_limit import TimeLimit
+from gymnasium.wrappers.normalize import NormalizeObservation
 from numpy.typing import NDArray
 
 
@@ -200,7 +201,8 @@ class SyncVectorEnv(VectorEnv):
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             if use_one_hot_wrapper:
                 env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
-            env = TimeLimit(env, 200)
+            env = TimeLimit(env, 500)
+            #env = NormalizeObservation(env)
             env = RecordEpisodeStatistics(env)
             self.envs.append(env)
         self.copy = copy

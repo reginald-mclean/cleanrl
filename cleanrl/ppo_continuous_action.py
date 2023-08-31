@@ -8,7 +8,7 @@ from distutils.util import strtobool
 import sys
 sys.path.append('/home/reginaldkmclean/cleanrl')
 
-from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
+from cleanrl_utils.evals.meta_world_eval_protocol import eval
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
 import gymnasium as gym
 import numpy as np
@@ -50,7 +50,7 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=1,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=500,
+    parser.add_argument("--num-steps", type=int, default=5000,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -101,26 +101,26 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(128, 1), std=1.0),
         )
-        self.actor_mean = nn.Sequential(
+        self.actor = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 128)),
             nn.Tanh(),
-            layer_init(nn.Linear(128, 128), std=0.01),
+            layer_init(nn.Linear(128, 128), std=1.0),
             nn.Tanh(),
-            layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01),
+            #layer_init(nn.Linear(32, np.prod(envs.single_action_space.shape)), std=1.0),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        
+        self.log_std = layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=1.0)
+        self.mean = layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=1.0)
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        if x.size()[0] == 10:
-            action_logstd = self.actor_logstd.expand_as(action_mean)
-        else:
-            action_logstd = self.actor_logstd
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        features = self.actor(x)
+        mean = self.mean(features)
+        log_std = self.log_std(features)
+        action_std = torch.exp(log_std)
+        probs = Normal(mean, action_std)
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
@@ -130,11 +130,11 @@ if __name__ == "__main__":
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}_{args.env_name}_{args.exp_name}__{args.seed}__single_task"
     if args.track:
         import wandb
 
-        wandb.init(
+        run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
@@ -143,6 +143,10 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        f_t= time.time()
+        os.mkdir(f'{args.env_id}_{args.env_name}_{args.exp_name}__{args.seed}__single_task_{f_t}')
+        artifact = wandb.Artifact(name='model_files', type='model')
+        artifact.add_dir(local_path=f'./{args.env_id}_{args.env_name}_{args.exp_name}__{args.seed}__single_task_{f_t}')
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -156,6 +160,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(device)
     if args.env_id == 'MT10':
         benchmark = metaworld.MT10(seed=args.seed)
         args.num_envs = 10
@@ -201,14 +206,21 @@ if __name__ == "__main__":
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
             ### NEED TO SET TRAIN OR TEST TASKS
-            agent = agent.to('cpu')
+            agent = agent.to(device)
             agent.eval()
-            evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
-                                 update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
+            #evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
+            #                     update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
+            print(envs.envs[0])
+            eval(envs.envs[0], args.env_name, agent, 50,  device)
             agent = agent.to(device)
             agent.train()
-
-            torch.save(agent.state_dict(), f'agent_parameters_{args.env_name}_{update}.pth')
+            if args.track:
+                torch.save(agent.state_dict(), f'{args.env_id}_{args.env_name}_{args.exp_name}__{args.seed}__single_task_{f_t}/agent_parameters_{args.env_name}_{update}.pth')
+                #run.log_artifact(artifact)
+                artifact.add_file(f'{args.env_id}_{args.env_name}_{args.exp_name}__{args.seed}__single_task_{f_t}/agent_parameters_{args.env_name}_{update}.pth')
+                #run.log_artifact(artifact)
+            next_obs, _ = envs.reset()
+            next_obs = torch.Tensor(next_obs).to(device)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
