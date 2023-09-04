@@ -58,7 +58,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=1280,
-        help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
+                        help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=200_000,
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
@@ -92,6 +92,16 @@ class Batch(NamedTuple):
     next_observations: ArrayLike
     dones: ArrayLike
     task_ids: ArrayLike
+
+
+class TanhNormal(distrax.Transformed):
+    def __init__(self, loc, scale):
+        normal_dist = distrax.Normal(loc, scale)
+        tanh_bijector = distrax.Tanh()
+        super().__init__(distribution=normal_dist, bijector=tanh_bijector)
+
+    def mean(self):
+        return self.bijector.forward(self.distribution.mean())
 
 
 def uniform_init(bound: float):
@@ -140,10 +150,7 @@ class Actor(nn.Module):
             bias_init=uniform_init(1e-3),
         )(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        return distrax.Transformed(
-            distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
-            distrax.Block(distrax.Tanh(), ndims=1),
-        )
+        return TanhNormal(mu, jnp.exp(log_sigma))
 
 
 @jax.jit
@@ -160,16 +167,6 @@ def sample_action(
 
 
 @jax.jit
-def get_deterministic_action(
-    actor: TrainState,
-    obs: ArrayLike,
-    task_ids: ArrayLike,
-) -> jax.Array:
-    dist = actor.apply_fn(actor.params, obs, task_ids)
-    return jnp.tanh(dist.distribution.mean())
-
-
-@jax.jit
 def sample_and_log_prob(
     actor: TrainState,
     actor_params: flax.core.FrozenDict,
@@ -183,8 +180,18 @@ def sample_and_log_prob(
     return action, log_prob, key
 
 
+@jax.jit
+def get_deterministic_action(
+    actor: TrainState,
+    obs: ArrayLike,
+    task_ids: ArrayLike,
+) -> jax.Array:
+    dist = actor.apply_fn(actor.params, obs, task_ids)
+    return dist.mean()
+
+
 class Critic(nn.Module):
-    hidden_dims: int = "400,400,400"
+    hidden_dims: int = "400,400"
     num_tasks: int = 1
 
     @nn.compact
@@ -205,9 +212,10 @@ class Critic(nn.Module):
         )
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        return nn.Dense(
-            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
-        )(x)
+        out = nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(
+            x
+        )
+        return out.squeeze(-1)
 
 
 class VectorCritic(nn.Module):
@@ -225,7 +233,10 @@ class VectorCritic(nn.Module):
             out_axes=0,
             axis_size=self.n_critics,
         )
-        return vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
+        q_values = vmap_critic(self.hidden_dims, self.num_tasks)(
+            state, action, task_idx
+        )
+        return q_values
 
 
 class CriticTrainState(TrainState):
@@ -238,8 +249,8 @@ def get_alpha(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
 
 
 class Agent:
-    actor_state: TrainState
-    critic_state: CriticTrainState
+    actor: TrainState
+    critic: CriticTrainState
     alpha_train_state: TrainState
     target_entropy: float
 
@@ -278,8 +289,8 @@ class Agent:
             hidden_dims=args.actor_network,
         )
         key, actor_init_key = jax.random.split(init_key)
-        self.actor_state = TrainState.create(
-            apply_fn=jax.jit(actor_network.apply),
+        self.actor = TrainState.create(
+            apply_fn=actor_network.apply,
             params=actor_network.init(actor_init_key, just_obs, task_id),
             tx=_make_optimizer(policy_lr, clip_grad_norm),
         )
@@ -288,8 +299,8 @@ class Agent:
         vector_critic_net = VectorCritic(
             num_tasks=num_tasks, hidden_dims=args.critic_network
         )
-        self.critic_state = CriticTrainState.create(
-            apply_fn=jax.jit(vector_critic_net.apply),
+        self.critic = CriticTrainState.create(
+            apply_fn=vector_critic_net.apply,
             params=vector_critic_net.init(
                 qf_init_key, just_obs, random_action, task_id
             ),
@@ -310,12 +321,12 @@ class Agent:
         self, obs: np.ndarray, key: jax.random.PRNGKeyArray
     ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions, key = sample_action(self.actor_state, state, task_id, key)
+        actions, key = sample_action(self.actor, state, task_id, key)
         return jax.device_get(actions), key
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions = get_deterministic_action(self.actor_state, state, task_id)
+        actions = get_deterministic_action(self.actor, state, task_id)
         return jax.device_get(actions)
 
     @staticmethod
@@ -329,12 +340,12 @@ class Agent:
         return qf_state
 
     def soft_update_target_networks(self, tau: float):
-        self.critic_state = self.soft_update(tau, self.critic_state)
+        self.critic = self.soft_update(tau, self.critic)
 
     def get_ckpt(self) -> dict:
         return {
-            "actor": self.actor_state,
-            "critic": self.critic_state,
+            "actor": self.actor,
+            "critic": self.critic,
             "alpha": self.alpha_train_state,
             "target_entropy": self.target_entropy,
         }
@@ -360,16 +371,19 @@ def update(
     )
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(
-            q_values, axis=0
-        ) - alpha_val * next_action_log_probs.reshape(-1, 1)
+        min_qf_next_target = jnp.min(q_values, axis=0).reshape(
+            -1, 1
+        ) - alpha_val * next_action_log_probs.sum(-1).reshape(-1, 1)
         next_q_value = jax.lax.stop_gradient(
             batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
         )
+
         q_pred = critic.apply_fn(
             params, batch.observations, batch.actions, batch.task_ids
         )
-        return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
+        return ((q_pred - next_q_value.reshape(1, -1)) ** 2).mean(1).sum(
+            0
+        ), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
@@ -385,7 +399,7 @@ def update(
 
     def alpha_loss(params: jax.Array, log_probs: jax.Array):
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
-        return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
+        return (-log_alpha * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
 
     def update_alpha(
         _alpha: TrainState, log_probs: jax.Array
@@ -416,7 +430,7 @@ def update(
             _critic.params, batch.observations, action_samples, batch.task_ids
         )
         min_qf_values = jnp.min(q_values, axis=0)
-        return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (
+        return (_alpha_val * log_probs.sum(-1).reshape(-1, 1) - min_qf_values).mean(), (
             _alpha,
             _critic,
             logs,
@@ -586,9 +600,9 @@ if __name__ == "__main__":
             )
 
             # Update agent
-            (agent.actor_state, agent.critic_state, agent.alpha_train_state), logs, key = update(
-                agent.actor_state,
-                agent.critic_state,
+            (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
+                agent.actor,
+                agent.critic,
                 agent.alpha_train_state,
                 batch,
                 agent.target_entropy,
@@ -614,7 +628,11 @@ if __name__ == "__main__":
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                eval_success_rate, eval_returns, eval_success_per_task = evaluation(
+                (
+                    eval_success_rate,
+                    eval_returns,
+                    eval_success_per_task,
+                ) = evaluation(
                     agent=agent,
                     eval_envs=eval_envs,
                     num_episodes=args.evaluation_num_episodes,
