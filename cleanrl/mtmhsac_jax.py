@@ -213,7 +213,7 @@ class Critic(nn.Module):
 class VectorCritic(nn.Module):
     n_critics: int = 2
     num_tasks: int = 1
-    hidden_dims: int = "400,400"
+    hidden_dims: int = "400,400,400"
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array, task_idx) -> jax.Array:
@@ -238,8 +238,8 @@ def get_alpha(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
 
 
 class Agent:
-    actor: TrainState
-    critic: CriticTrainState
+    actor_state: TrainState
+    critic_state: CriticTrainState
     alpha_train_state: TrainState
     target_entropy: float
 
@@ -278,8 +278,8 @@ class Agent:
             hidden_dims=args.actor_network,
         )
         key, actor_init_key = jax.random.split(init_key)
-        self.actor = TrainState.create(
-            apply_fn=actor_network.apply,
+        self.actor_state = TrainState.create(
+            apply_fn=jax.jit(actor_network.apply),
             params=actor_network.init(actor_init_key, just_obs, task_id),
             tx=_make_optimizer(policy_lr, clip_grad_norm),
         )
@@ -288,8 +288,8 @@ class Agent:
         vector_critic_net = VectorCritic(
             num_tasks=num_tasks, hidden_dims=args.critic_network
         )
-        self.critic = CriticTrainState.create(
-            apply_fn=vector_critic_net.apply,
+        self.critic_state = CriticTrainState.create(
+            apply_fn=jax.jit(vector_critic_net.apply),
             params=vector_critic_net.init(
                 qf_init_key, just_obs, random_action, task_id
             ),
@@ -310,12 +310,12 @@ class Agent:
         self, obs: np.ndarray, key: jax.random.PRNGKeyArray
     ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions, key = sample_action(self.actor, state, task_id, key)
+        actions, key = sample_action(self.actor_state, state, task_id, key)
         return jax.device_get(actions), key
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions = get_deterministic_action(self.actor, state, task_id)
+        actions = get_deterministic_action(self.actor_state, state, task_id)
         return jax.device_get(actions)
 
     @staticmethod
@@ -329,12 +329,12 @@ class Agent:
         return qf_state
 
     def soft_update_target_networks(self, tau: float):
-        self.critic = self.soft_update(tau, self.critic)
+        self.critic_state = self.soft_update(tau, self.critic_state)
 
     def get_ckpt(self) -> dict:
         return {
-            "actor": self.actor,
-            "critic": self.critic,
+            "actor": self.actor_state,
+            "critic": self.critic_state,
             "alpha": self.alpha_train_state,
             "target_entropy": self.target_entropy,
         }
@@ -586,9 +586,9 @@ if __name__ == "__main__":
             )
 
             # Update agent
-            (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
-                agent.actor,
-                agent.critic,
+            (agent.actor_state, agent.critic_state, agent.alpha_train_state), logs, key = update(
+                agent.actor_state,
+                agent.critic_state,
                 agent.alpha_train_state,
                 batch,
                 agent.target_entropy,
