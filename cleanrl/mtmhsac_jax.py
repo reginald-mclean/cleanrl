@@ -212,10 +212,9 @@ class Critic(nn.Module):
         )
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        out = nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(
-            x
-        )
-        return out.squeeze(-1)
+        return nn.Dense(
+            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
+        )(x)
 
 
 class VectorCritic(nn.Module):
@@ -233,10 +232,7 @@ class VectorCritic(nn.Module):
             out_axes=0,
             axis_size=self.n_critics,
         )
-        q_values = vmap_critic(self.hidden_dims, self.num_tasks)(
-            state, action, task_idx
-        )
-        return q_values
+        return vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
 
 
 class CriticTrainState(TrainState):
@@ -381,7 +377,7 @@ def update(
         q_pred = critic.apply_fn(
             params, batch.observations, batch.actions, batch.task_ids
         )
-        return ((q_pred - next_q_value.reshape(1, -1)) ** 2).mean(1).sum(
+        return ((q_pred - next_q_value[None, ...]) ** 2).mean(1).sum(
             0
         ), q_pred.mean()
 

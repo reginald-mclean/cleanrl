@@ -279,7 +279,7 @@ def rl2_evaluation(
     num_episodes: int,
 ):
     obs, _ = eval_envs.reset()
-    NUM_TASKS = eval_envs.num_envs
+    NUM_TASKS = eval_envs.unwrapped.num_envs
 
     successes = np.zeros(NUM_TASKS)
     episodic_returns = [[] for _ in range(NUM_TASKS)]
