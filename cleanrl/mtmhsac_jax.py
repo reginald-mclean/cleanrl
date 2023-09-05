@@ -7,7 +7,8 @@ from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
-
+import sys
+sys.path.append('/home/reginaldkmclean/cleanrl')
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import distrax
@@ -39,15 +40,16 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
+    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
+    parser.add_argument("--env-name", type=str, default="", help="the name of the environment for MT1")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=None,
@@ -70,10 +72,10 @@ def parse_args():
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
-    parser.add_argument("--clip-grad-norm", type=float, default=1.0,
+    parser.add_argument("--clip-grad-norm", type=float, default=0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
-    parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
-    parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+    parser.add_argument("--actor-network", type=str, default="256,256", help="The architecture of the actor network")
+    parser.add_argument("--critic-network", type=str, default="256,256", help="The architecture of the critic network")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -473,7 +475,8 @@ if __name__ == "__main__":
     elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
     else:
-        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+        assert args.env_name != "", "Must pass a environment name for MT1"
+        benchmark = metaworld.MT1(args.env_name, seed=args.seed)
 
     use_one_hot_wrapper = (
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
@@ -486,7 +489,7 @@ if __name__ == "__main__":
     )
 
     NUM_TASKS = len(benchmark.train_classes)
-
+    print(NUM_TASKS)
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -573,29 +576,30 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             # Sample a batch from replay buffer
-            data = rb.sample(args.batch_size)
-            observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-            next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-            batch = Batch(
-                observations,
-                data.actions,
-                data.rewards,
-                next_observations,
-                data.dones,
-                task_ids,
-            )
+            for i in range(200):
+                data = rb.sample(args.batch_size)
+                observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
+                next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
+                batch = Batch(
+                    observations,
+                    data.actions,
+                    data.rewards,
+                    next_observations,
+                    data.dones,
+                    task_ids,
+                )
 
             # Update agent
-            (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
-                agent.actor,
-                agent.critic,
-                agent.alpha_train_state,
-                batch,
-                agent.target_entropy,
-                args.gamma,
-                key,
-            )
-            logs = jax.device_get(logs)
+                (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
+                    agent.actor,
+                    agent.critic,
+                    agent.alpha_train_state,
+                    batch,
+                    agent.target_entropy,
+                    args.gamma,
+                    key,
+                )
+                logs = jax.device_get(logs)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
