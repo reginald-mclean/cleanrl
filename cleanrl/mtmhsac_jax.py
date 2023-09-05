@@ -7,6 +7,7 @@ from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
+from cleanrl_utils.custom_layer import MultiHeadDense
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -72,8 +73,8 @@ def parse_args():
         help="the frequency of updates for the target nerworks")
     parser.add_argument("--clip-grad-norm", type=float, default=1.0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
-    parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
-    parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+    parser.add_argument("--actor-network", type=str, default="400,400", help="The architecture of the actor network")
+    parser.add_argument("--critic-network", type=str, default="400,400", help="The architecture of the critic network")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -116,7 +117,7 @@ def uniform_init(bound: float):
 class Actor(nn.Module):
     num_actions: int
     num_tasks: int
-    hidden_dims: int = "400,400,400"
+    hidden_dims: int = "400,400"
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
@@ -126,18 +127,13 @@ class Actor(nn.Module):
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
             x = nn.Dense(
-                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                h_size,
                 kernel_init=nn.initializers.he_uniform(),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
             x = nn.relu(x)
 
-        # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
-        x = jnp.take_along_axis(x, indices, axis=1)
+        x = MultiHeadDense(hidden_lst[-1], self.num_tasks)(x, task_idx.argmax(1))
 
         log_sigma = nn.Dense(
             self.num_actions,
@@ -200,18 +196,12 @@ class Critic(nn.Module):
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
             x = nn.Dense(
-                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                h_size,
                 kernel_init=nn.initializers.he_uniform(),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
             x = nn.relu(x)
-        # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
-        x = jnp.take_along_axis(x, indices, axis=1)
-
+        x = MultiHeadDense(hidden_lst[-1], self.num_tasks)(x, task_idx.argmax(1))
         return nn.Dense(
             1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
         )(x)
@@ -220,7 +210,7 @@ class Critic(nn.Module):
 class VectorCritic(nn.Module):
     n_critics: int = 2
     num_tasks: int = 1
-    hidden_dims: int = "400,400,400"
+    hidden_dims: int = "400,400"
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array, task_idx) -> jax.Array:
