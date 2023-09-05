@@ -78,8 +78,10 @@ def parse_args():
 
     parser.add_argument("--eval-freq", type=int, default=100_000,
         help="how many steps to do before evaluating the agent")
-    parser.add_argument("--evaluation-num-episodes", type=int, default=10,
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
+    parser.add_argument("--num-evaluation-goals", type=int, default=10,
+        help="the number of goal positions to evaluate on per test task")
 
     args = parser.parse_args()
     # fmt: on
@@ -202,40 +204,51 @@ def get_deterministic_action(
 def _make_envs_common(
     benchmark: metaworld.Benchmark,
     seed: int,
+    meta_batch_size: int,
     max_episode_steps: Optional[int] = None,
+    split: str = "train",
     terminate_on_success: bool = False,
-    train=True,
-) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+    task_select: str = "random",
+    total_tasks_per_class: Optional[int] = None,
+) -> Tuple[gym.vector.VectorEnv, List[str]]:
+    all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
+    all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
+    assert meta_batch_size % len(all_classes) == 0, "meta_batch_size must be divisible by envs_per_task"
+    tasks_per_env = meta_batch_size // len(all_classes)
+
+    def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.unwrapped.max_path_length)
         env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env.toggle_terminate_on_success(terminate_on_success)
-        env = metaworld_wrappers.RL2Env(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if train:
-            tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        if task_select != "random":
+            env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
         else:
-            tasks = [task for task in benchmark.test_tasks if task.env_name == name]
-        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+            env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.unwrapped.seed(seed)
         return env
 
-    if train:
-        classes = benchmark.train_classes
-    else:
-        classes = benchmark.test_classes
+    env_tuples = []
+    task_names = []
+    for env_name, env_cls in all_classes.items():
+        tasks = [task for task in all_tasks if task.env_name == env_name]
+        if total_tasks_per_class is not None:
+            tasks = tasks[:total_tasks_per_class]
+        subenv_tasks = [tasks[i::tasks_per_env] for i in range(0, tasks_per_env)]
+        for tasks_for_subenv in subenv_tasks:
+            assert len(tasks_for_subenv) == len(tasks) // tasks_per_env, f"{len(tasks_for_subenv)} {len(tasks)} {tasks_per_env}"
+            env_tuples.append((env_cls, tasks_for_subenv))
+            task_names.append(env_name)
 
-    return gym.vector.SyncVectorEnv(
-        [
-            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
-            for env_id, (name, env_cls) in enumerate(classes.items())
-        ]
+    return (
+        gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples]),
+        task_names,
     )
 
 
-make_envs = partial(_make_envs_common, terminate_on_success=False)
-make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+make_envs = partial(_make_envs_common, terminate_on_success=False, task_select="pseudorandom", split="train")
+make_eval_envs = partial(_make_envs_common, terminate_on_success=True, task_select="pseudorandom", split="test")
 
 
 @flax.struct.dataclass
@@ -250,24 +263,24 @@ class Storage:
     rewards: jnp.array
 
 
-def get_storage(envs, max_episode_steps, num_tasks):
+def get_storage(envs, max_episode_steps, num_envs):
     return Storage(
         obs=jnp.zeros(
             (
                 max_episode_steps,
-                num_tasks,
+                num_envs,
                 *envs.single_observation_space.shape,
             )
         ),
         actions=jnp.zeros(
-            (max_episode_steps, num_tasks, *envs.single_action_space.shape)
+            (max_episode_steps, num_envs, *envs.single_action_space.shape)
         ),
-        logprobs=jnp.zeros((max_episode_steps, num_tasks, 1)),
-        dones=jnp.zeros((max_episode_steps, num_tasks, 1)),
-        values=jnp.zeros((max_episode_steps, num_tasks, 1)),
-        advantages=jnp.zeros((max_episode_steps, num_tasks, 1)),
-        returns=jnp.zeros((max_episode_steps, num_tasks, 1)),
-        rewards=jnp.zeros((max_episode_steps, num_tasks, 1)),
+        logprobs=jnp.zeros((max_episode_steps, num_envs, 1)),
+        dones=jnp.zeros((max_episode_steps, num_envs, 1)),
+        values=jnp.zeros((max_episode_steps, num_envs, 1)),
+        advantages=jnp.zeros((max_episode_steps, num_envs, 1)),
+        returns=jnp.zeros((max_episode_steps, num_envs, 1)),
+        rewards=jnp.zeros((max_episode_steps, num_envs, 1)),
     )
 
 
@@ -277,21 +290,38 @@ def rl2_evaluation(
     agent_state,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
+    task_names,
 ):
-    obs, _ = eval_envs.reset()
-    NUM_TASKS = eval_envs.unwrapped.num_envs
+    NUM_ENVS = eval_envs.unwrapped.num_envs
 
-    successes = np.zeros(NUM_TASKS)
-    episodic_returns = [[] for _ in range(NUM_TASKS)]
+    successes = np.zeros(NUM_ENVS)
+    episodic_returns = [[] for _ in range(NUM_ENVS)]
+    if task_names is not None:
+        successes = {task_name: 0 for task_name in set(task_names)}
+        episodic_returns = {task_name: [] for task_name in set(task_names)}
+        envs_per_task = {task_name: task_names.count(task_name) for task_name in set(task_names)}
+    else:
+        successes = np.zeros(eval_envs.num_envs)
+        episodic_returns = [[] for _ in range(eval_envs.num_envs)]
 
     start_time = time.time()
-    carry = agent.initialize_state(NUM_TASKS)
+    carry = agent.initialize_state(NUM_ENVS)
 
-    while not all(len(returns) >= num_episodes for returns in episodic_returns):
+    eval_envs.call("toggle_sample_tasks_on_reset", False)
+    eval_envs.call("toggle_terminate_on_success", True)
+    obs, _ = zip(*eval_envs.call("sample_tasks"))
+    obs = np.stack(obs)
+
+    def eval_done(returns):
+        if type(returns) is dict:
+            return all(len(r) >= (num_episodes * envs_per_task[task_name]) for task_name, r in returns.items())
+        else:
+            return all(len(r) >= num_episodes for r in returns)
+
+    while not eval_done(episodic_returns):
         action, carry = get_deterministic_action(agent_state, obs, carry)
         action = jax.device_get(action)
-        obs, reward, _, _, infos = eval_envs.step(action)
-
+        obs, _, _, _, infos = eval_envs.step(action)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
                 # Skip the envs that are not done
@@ -301,19 +331,39 @@ def rl2_evaluation(
                 carry = carry.at[:, i : i + 1].set(
                     np.random.random(carry[:, i : i + 1].shape)
                 )
-                episodic_returns[i].append(float(info["episode"]["r"][0]))
-                if len(episodic_returns[i]) <= num_episodes:
-                    successes[i] += int(info["success"])
+                if task_names is not None:
+                    episodic_returns[task_names[i]].append(float(info["episode"]["r"][0]))
+                    if len(episodic_returns[task_names[i]]) <= num_episodes * envs_per_task[task_names[i]]:
+                        successes[task_names[i]] += int(info["success"])
+                else:
+                    episodic_returns[i].append(float(info["episode"]["r"][0]))
+                    if len(episodic_returns[i]) <= num_episodes:
+                        successes[i] += int(info["success"])
 
-    episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
+    if isinstance(episodic_returns, dict):
+        episodic_returns = {
+            task_name: returns[: (num_episodes * envs_per_task[task_name])]
+            for task_name, returns in episodic_returns.items()
+        }
+    else:
+        episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
+
+
+    if isinstance(successes, dict):
+        success_rate_per_task = np.array(
+            [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
+        )
+        mean_success_rate = np.mean(success_rate_per_task)
+        mean_returns = np.mean(list(episodic_returns.values()))
+    else:
+        success_rate_per_task = successes / num_episodes
+        mean_success_rate = np.mean(success_rate_per_task)
+        mean_returns = np.mean(episodic_returns)
+
+    task_success_rates = {task_name: success_rate_per_task[i] for i, task_name in enumerate(set(task_names))}
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
-
-    success_rate_per_task = successes / num_episodes
-    mean_success_rate = np.mean(success_rate_per_task)
-    mean_returns = np.mean(episodic_returns)
-
-    return mean_success_rate, mean_returns, success_rate_per_task
+    return mean_success_rate, mean_returns, task_success_rates
 
 
 def update_rl2_ppo(
@@ -361,7 +411,7 @@ def update_rl2_ppo(
     _returns = jnp.stack([strg.returns for strg in storage_list])
     _rewards = jnp.stack([strg.rewards for strg in storage_list])
 
-    # From (n_episodes_per_trial / NUM_TASKS, max_episode_steps, NUM_TASKS, -1)
+    # From (n_episodes_per_trial / NUM_CLASSES, max_episode_steps, NUM_CLASSES, -1)
     # to (n_episodes_per_trial, max_episode_steps, -1)
     obs_batch = _obs.reshape(-1, args.max_episode_steps, _obs.shape[-1])
     action_batch = _actions.reshape(-1, args.max_episode_steps, _actions.shape[-1])
@@ -425,26 +475,31 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
 
-    # env setup
-    envs = make_envs(benchmark, args.seed, args.max_episode_steps, train=True)
-    keys = list(benchmark.train_classes.keys())
+    NUM_CLASSES = len(benchmark.train_classes)
+    # total number of episodes per trial
+    meta_batch_size = args.n_episodes_per_trial //  NUM_CLASSES
 
-    eval_train_envs = make_eval_envs(
-        benchmark,
-        args.seed,
-        train=True,
+    # env setup
+    envs, train_task_names = make_envs(
+        benchmark, meta_batch_size=meta_batch_size, seed=args.seed, max_episode_steps=args.max_episode_steps
+    )
+    eval_envs, eval_task_names = make_eval_envs(
+        benchmark=benchmark,
+        meta_batch_size=meta_batch_size,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
+        total_tasks_per_class=args.num_evaluation_goals,
     )
 
-    eval_test_envs = make_eval_envs(benchmark, args.seed, train=False)
-
-    NUM_TASKS = len(benchmark.train_classes)
+    envs.single_observation_space.dtype = np.float32
+    obs, _ = zip(*envs.call("sample_tasks"))
+    obs = np.stack(obs)
 
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
-    obs, _ = envs.reset()
 
-    # @jax.jit
+    @jax.jit
     def compute_gae(
         next_value: np.ndarray,
         next_done: np.ndarray,
@@ -478,7 +533,7 @@ if __name__ == "__main__":
     agent_state = TrainState.create(
         apply_fn=agent.apply,
         params=agent.init(
-            agent_init_key, obs, jnp.zeros((NUM_TASKS, args.recurrent_state_size))
+            agent_init_key, obs, jnp.zeros((meta_batch_size, args.recurrent_state_size))
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
@@ -486,38 +541,36 @@ if __name__ == "__main__":
         ),
     )
 
-    assert (
-        args.n_episodes_per_trial % NUM_TASKS == 0
-    ), "n_episodes_per_trial must be evenly divisible by NUM_TASKS"
-    num_trial_episodes = args.n_episodes_per_trial // NUM_TASKS
 
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
-    obs, _ = envs.reset(seed=args.seed)
 
-    global_episodic_return = deque([], maxlen=20 * NUM_TASKS)
-    global_episodic_length = deque([], maxlen=20 * NUM_TASKS)
+    global_episodic_return = deque([], maxlen=20 * meta_batch_size)
+    global_episodic_length = deque([], maxlen=20 * meta_batch_size)
 
     total_steps = 0
+    # number of steps executed in each trial
+    meta_batch_steps = meta_batch_size * args.max_episode_steps
 
-    for global_step in range(int(args.total_timesteps // NUM_TASKS)):
-        # collect a trial of n episodes per task
+    for global_step in range(int(args.total_timesteps // meta_batch_steps)):
+        # collect a trial of size meta_batch_size
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
-        meta_trial = list()
-        for meta_ep in range(num_trial_episodes):
+        meta_trial: List[Storage] = []
+        for meta_ep in range(meta_batch_size):
             # RL^2 stuff
             # reset hidden state for each meta trial
-            carry = agent.initialize_state(NUM_TASKS)
-            storage = get_storage(envs, args.max_episode_steps, NUM_TASKS)
+            carry = agent.initialize_state(meta_batch_size)
+            storage = get_storage(envs, args.max_episode_steps, meta_batch_size)
             for meta_step in range(args.max_episode_steps):
-                total_steps += NUM_TASKS
+                total_steps += meta_batch_size
                 action, logprob, value, key = get_action_log_prob_and_value(
                     agent_state, obs, carry, key
                 )
                 action = jax.device_get(action)
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
-                done = np.logical_or(terminated, truncated).reshape(-1, 1)
+                # done = np.logical_or(terminated, truncated).reshape(-1, 1)
+                done = np.array(truncated).reshape(-1, 1)
                 storage = storage.replace(
                     obs=storage.obs.at[meta_step].set(next_obs),
                     dones=storage.dones.at[meta_step].set(done),
@@ -546,7 +599,7 @@ if __name__ == "__main__":
             storage = compute_gae(next_value, done, storage)
             meta_trial.append(storage)
 
-        if global_step % 500 == 0 and global_episodic_return:
+        if total_steps % 500 == 0 and global_episodic_return:
             mean_ep_return = np.mean(global_episodic_return)
             print(f"{total_steps=}, {mean_ep_return=}")
             writer.add_scalar(
@@ -561,60 +614,43 @@ if __name__ == "__main__":
             )
 
         agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial, key)
-        logs = jax.device_get(logs)
+        logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
-        if global_step % 100 == 0:
-            for _key, value in logs.items():
-                writer.add_scalar(_key, value, total_steps)
-            print("SPS:", int(total_steps / (time.time() - start_time)))
-            writer.add_scalar(
-                "charts/SPS",
-                int(total_steps / (time.time() - start_time)),
-                total_steps,
-            )
-
-        # TODO: Finish implementation #
-        if total_steps % args.eval_freq == 0 and total_steps > 0:
-            print(f"Evaluating on test set at {total_steps=}")
+        if total_steps % args.eval_freq == 0 and global_step > 0:
+            num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // meta_batch_size
+            print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args, agent, agent_state, eval_test_envs, args.evaluation_num_episodes
+                args, agent, agent_state, eval_envs, num_episodes=args.evaluation_num_episodes, task_names=eval_task_names
             )
-            eval_metrics = {
-                "charts/mean_test_success_rate": float(test_success_rate),
-                "charts/mean_test_return": float(eval_returns),
-                **{
-                    f"charts/{env_name}_test_success_rate": float(
-                        eval_success_per_task[i]
-                    )
-                    for i, (env_name, _) in enumerate(benchmark.test_classes.items())
-                },
-            }
-            for k, v in eval_metrics.items():
-                writer.add_scalar(k, v, total_steps)
+            logs["charts/mean_success_rate"] = float(test_success_rate)
+            logs["charts/mean_evaluation_return"] = float(eval_returns)
+            for task_name, success_rate in eval_success_per_task.items():
+                logs[f"charts/{task_name}_success_rate"] = float(success_rate)
 
             print(f"Evaluating on train set at {total_steps=}")
-            train_success_rate, train_returns, train_success_per_task = rl2_evaluation(
-                args, agent, agent_state, eval_train_envs, args.evaluation_num_episodes
+            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // meta_batch_size
+            _, _, train_success_per_task = rl2_evaluation(
+                args, agent, agent_state, envs, num_episodes=args.evaluation_num_episodes, task_names=train_task_names
             )
-            train_metrics = {
-                "charts/mean_train_success_rate": float(train_success_rate),
-                "charts/mean_train_return": float(train_returns),
-                **{
-                    f"charts/{env_name}_train_success_rate": float(
-                        train_success_per_task[i]
-                    )
-                    for i, (env_name, _) in enumerate(benchmark.test_classes.items())
-                },
-            }
-            for k, v in train_metrics.items():
-                writer.add_scalar(k, v, total_steps)
+            for task_name, success_rate in train_success_per_task.items():
+                logs[f"charts/{task_name}_train_success_rate"] = float(success_rate)
+            envs.call("toggle_terminate_on_success", False)
 
-            print(
-                f"{total_steps=} {test_success_rate=:.4f} "
-                + f"{eval_returns=:.4f} "
-                + f"{train_success_rate=:.4f} "
-                + f"{train_returns=:.4f}"
-            )
+        logs = jax.device_get(logs)
+        for k, v in logs.items():
+            writer.add_scalar(k, v, total_steps)
+        print(f"{total_steps=}", logs)
+
+        print("SPS:", int(total_steps / (time.time() - start_time)))
+        writer.add_scalar(
+            "charts/SPS",
+            int(total_steps / (time.time() - start_time)),
+            total_steps,
+        )
+
+         # Set tasks for next iteration
+        obs, _ = zip(*envs.call("sample_tasks"))
+        obs = np.stack(obs)
 
     envs.close()
     writer.close()
