@@ -44,7 +44,7 @@ def evaluation_procedure(writer, agent, classes, tasks, keys, update, num_envs, 
     return success_rate
 
 
-def eval(env, env_name, agent, num_evals,  device):
+def eval(writer, env, env_name, agent, num_evals,  device, update):
     # print(f"Agent Device for {env_name} {next(agent.parameters()).device}")
     #agent.eval()
     #env = env_cls()
@@ -72,3 +72,4 @@ def eval(env, env_name, agent, num_evals,  device):
                 break
 
     print(float(success) / num_evals)
+    writer.add_scalar('charts/mean_success_rate', float(success)/num_evals, update - 1)

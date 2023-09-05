@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reginaldkmclean/cleanrl')
+sys.path.append('/home/reggie/cleanrl')
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import distrax

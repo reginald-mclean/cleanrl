@@ -6,7 +6,7 @@ import time
 from distutils.util import strtobool
 
 import sys
-sys.path.append('/home/reginaldkmclean/cleanrl')
+sys.path.append('/home/reggie/cleanrl')
 
 from cleanrl_utils.evals.meta_world_eval_protocol import eval
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
@@ -44,7 +44,7 @@ def parse_args():
     parser.add_argument("--env-id", type=str, default="MT1",
         help="the id of the environment")
     parser.add_argument("--env-name", type=str, default="window-close-v2")
-    parser.add_argument("--total-timesteps", type=int, default=2000000,
+    parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=5e-4,
         help="the learning rate of the optimizer")
@@ -58,7 +58,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.97,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=32,
+    parser.add_argument("--num-minibatches", type=int, default=156,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=256,
         help="the K epochs to update the policy")
@@ -76,7 +76,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--eval-freq", type=int, default=2,
+    parser.add_argument("--eval-freq", type=int, default=20,
         help="how many updates to do before evaluating the agent")
     args = parser.parse_args()
     
@@ -119,6 +119,7 @@ class Agent(nn.Module):
         features = self.actor(x)
         mean = self.mean(features)
         log_std = self.log_std(features)
+        log_std = torch.clamp(log_std, min=-20, max=2)
         action_std = torch.exp(log_std)
         probs = Normal(mean, action_std)
         if action is None:
@@ -211,7 +212,7 @@ if __name__ == "__main__":
             #evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
             #                     update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
             print(envs.envs[0])
-            eval(envs.envs[0], args.env_name, agent, 50,  device)
+            eval(writer, envs.envs[0], args.env_name, agent, 50,  device, update)
             agent = agent.to(device)
             agent.train()
             if args.track:
@@ -334,7 +335,7 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                #nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None:
