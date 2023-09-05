@@ -377,9 +377,7 @@ def update(
         q_pred = critic.apply_fn(
             params, batch.observations, batch.actions, batch.task_ids
         )
-        return ((q_pred - next_q_value[None, ...]) ** 2).mean(1).sum(
-            0
-        ), q_pred.mean()
+        return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
     def update_critic(
         _critic: CriticTrainState, alpha_val: jax.Array
