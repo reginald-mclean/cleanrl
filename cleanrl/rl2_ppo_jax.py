@@ -5,6 +5,7 @@ import time
 from distutils.util import strtobool
 
 from flax.training.train_state import TrainState
+
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from cleanrl_utils.wrappers import metaworld_wrappers
@@ -43,10 +44,12 @@ def parse_args():
                         help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
+    parser.add_argument("--mini-batch-size", type=int, default=2,
+                        help="Number of episodes to consider as single trial for gradient update")
     # agent parameters
-    parser.add_argument("--recurrent-state-size", type=int, default=128)
+    parser.add_argument("--recurrent-state-size", type=int, default=256)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
-    parser.add_argument("--encoder-hidden-size", type=int, default=128)
+    parser.add_argument("--encoder-hidden-size", type=int, default=256)
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
@@ -211,14 +214,20 @@ def _make_envs_common(
     task_select: str = "random",
     total_tasks_per_class: Optional[int] = None,
 ) -> Tuple[gym.vector.VectorEnv, List[str]]:
-    all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
+    all_classes = (
+        benchmark.train_classes if split == "train" else benchmark.test_classes
+    )
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
-    assert meta_batch_size % len(all_classes) == 0, "meta_batch_size must be divisible by envs_per_task"
+    assert (
+        meta_batch_size % len(all_classes) == 0
+    ), "meta_batch_size must be divisible by envs_per_task"
     tasks_per_env = meta_batch_size // len(all_classes)
 
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.unwrapped.max_path_length)
+        env = gym.wrappers.TimeLimit(
+            env, max_episode_steps or env.unwrapped.max_path_length
+        )
         env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env.toggle_terminate_on_success(terminate_on_success)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -237,18 +246,35 @@ def _make_envs_common(
             tasks = tasks[:total_tasks_per_class]
         subenv_tasks = [tasks[i::tasks_per_env] for i in range(0, tasks_per_env)]
         for tasks_for_subenv in subenv_tasks:
-            assert len(tasks_for_subenv) == len(tasks) // tasks_per_env, f"{len(tasks_for_subenv)} {len(tasks)} {tasks_per_env}"
+            assert (
+                len(tasks_for_subenv) == len(tasks) // tasks_per_env
+            ), f"{len(tasks_for_subenv)} {len(tasks)} {tasks_per_env}"
             env_tuples.append((env_cls, tasks_for_subenv))
             task_names.append(env_name)
 
     return (
-        gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples]),
+        gym.vector.AsyncVectorEnv(
+            [
+                partial(make_env, env_cls=env_cls, tasks=tasks)
+                for env_cls, tasks in env_tuples
+            ]
+        ),
         task_names,
     )
 
 
-make_envs = partial(_make_envs_common, terminate_on_success=False, task_select="pseudorandom", split="train")
-make_eval_envs = partial(_make_envs_common, terminate_on_success=True, task_select="pseudorandom", split="test")
+make_envs = partial(
+    _make_envs_common,
+    terminate_on_success=False,
+    task_select="pseudorandom",
+    split="train",
+)
+make_eval_envs = partial(
+    _make_envs_common,
+    terminate_on_success=True,
+    task_select="pseudorandom",
+    split="test",
+)
 
 
 @flax.struct.dataclass
@@ -299,7 +325,9 @@ def rl2_evaluation(
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
         episodic_returns = {task_name: [] for task_name in set(task_names)}
-        envs_per_task = {task_name: task_names.count(task_name) for task_name in set(task_names)}
+        envs_per_task = {
+            task_name: task_names.count(task_name) for task_name in set(task_names)
+        }
     else:
         successes = np.zeros(eval_envs.num_envs)
         episodic_returns = [[] for _ in range(eval_envs.num_envs)]
@@ -314,7 +342,10 @@ def rl2_evaluation(
 
     def eval_done(returns):
         if type(returns) is dict:
-            return all(len(r) >= (num_episodes * envs_per_task[task_name]) for task_name, r in returns.items())
+            return all(
+                len(r) >= (num_episodes * envs_per_task[task_name])
+                for task_name, r in returns.items()
+            )
         else:
             return all(len(r) >= num_episodes for r in returns)
 
@@ -332,8 +363,13 @@ def rl2_evaluation(
                     np.random.random(carry[:, i : i + 1].shape)
                 )
                 if task_names is not None:
-                    episodic_returns[task_names[i]].append(float(info["episode"]["r"][0]))
-                    if len(episodic_returns[task_names[i]]) <= num_episodes * envs_per_task[task_names[i]]:
+                    episodic_returns[task_names[i]].append(
+                        float(info["episode"]["r"][0])
+                    )
+                    if (
+                        len(episodic_returns[task_names[i]])
+                        <= num_episodes * envs_per_task[task_names[i]]
+                    ):
                         successes[task_names[i]] += int(info["success"])
                 else:
                     episodic_returns[i].append(float(info["episode"]["r"][0]))
@@ -348,10 +384,12 @@ def rl2_evaluation(
     else:
         episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
 
-
     if isinstance(successes, dict):
         success_rate_per_task = np.array(
-            [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
+            [
+                successes[task_name] / (num_episodes * envs_per_task[task_name])
+                for task_name in set(task_names)
+            ]
         )
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(list(episodic_returns.values()))
@@ -360,7 +398,10 @@ def rl2_evaluation(
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(episodic_returns)
 
-    task_success_rates = {task_name: success_rate_per_task[i] for i, task_name in enumerate(set(task_names))}
+    task_success_rates = {
+        task_name: success_rate_per_task[i]
+        for i, task_name in enumerate(set(task_names))
+    }
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
     return mean_success_rate, mean_returns, task_success_rates
@@ -375,16 +416,17 @@ def update_rl2_ppo(
 ):
     @jax.jit
     def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
-        carry = agent.initialize_state(obs.shape[0])
+        # init hidden state for single trial
+        carry = agent.initialize_state(1)
         action_dist, newvalue, carry = agent_state.apply_fn(params, obs, carry)
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
         logratio = newlog_prob.reshape(-1, 1) - logprob
         ratio = jnp.exp(logratio)
-        approx_kl = ((ratio - 1) - logratio).mean()
 
         if args.norm_adv:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # TODO: check of advantages
         pg_loss1 = -advantages * ratio
         pg_loss2 = -advantages * jax.lax.clamp(
             1 - args.clip_coef, ratio, 1 + args.clip_coef
@@ -393,49 +435,50 @@ def update_rl2_ppo(
         v_loss = 0.5 * jnp.square(newvalue - returns).mean()
         entropy_loss = action_dist.distribution.entropy().mean()
         loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+
+        approx_kl = ((ratio - 1) - logratio).mean()
+        clip_fraction = (jnp.absolute(ratio - 1) > args.clip_coef).mean()
+
         return loss, {
             "losses/loss": loss,
             "losses/pg_loss": pg_loss,
             "losses/v_loss": v_loss,
             "losses/entropy_loss": entropy_loss,
             "losses/approx_kl": approx_kl,
+            "losses/clip_fraction": clip_fraction,
         }
 
-    # combine episodes into trials
-    _obs = jnp.stack([strg.obs for strg in storage_list])
-    _actions = jnp.stack([strg.actions for strg in storage_list])
-    _logprobs = jnp.stack([strg.logprobs for strg in storage_list])
-    _dones = jnp.stack([strg.dones for strg in storage_list])
-    _values = jnp.stack([strg.values for strg in storage_list])
-    _advantages = jnp.stack([strg.advantages for strg in storage_list])
-    _returns = jnp.stack([strg.returns for strg in storage_list])
-    _rewards = jnp.stack([strg.rewards for strg in storage_list])
+    _obs = jnp.concatenate([strg.obs for strg in storage_list], axis=1)
+    _actions = jnp.concatenate([strg.actions for strg in storage_list], axis=1)
+    _logprobs = jnp.concatenate([strg.logprobs for strg in storage_list], axis=1)
+    _dones = jnp.concatenate([strg.dones for strg in storage_list], axis=1)
+    _values = jnp.concatenate([strg.values for strg in storage_list], axis=1)
+    _advantages = jnp.concatenate([strg.advantages for strg in storage_list], axis=1)
+    _returns = jnp.concatenate([strg.returns for strg in storage_list], axis=1)
+    _rewards = jnp.concatenate([strg.rewards for strg in storage_list], axis=1)
 
-    # From (n_episodes_per_trial / NUM_CLASSES, max_episode_steps, NUM_CLASSES, -1)
-    # to (n_episodes_per_trial, max_episode_steps, -1)
-    obs_batch = _obs.reshape(-1, args.max_episode_steps, _obs.shape[-1])
-    action_batch = _actions.reshape(-1, args.max_episode_steps, _actions.shape[-1])
-    advantage_batch = _advantages.reshape(-1, args.max_episode_steps, 1)
-    logprob_batch = _logprobs.reshape(-1, args.max_episode_steps, 1)
-    return_batch = _returns.reshape(-1, args.max_episode_steps, 1)
+    episode_length = _obs.shape[0]
+    num_trial_episodes = _obs.shape[1]
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
-        b_inds = jax.random.permutation(
-            subkey, args.n_episodes_per_trial, independent=True
-        )
-        grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
-            agent_state.params,
-            # From (n_episodes_per_trial , max_episode_steps , -1)
-            # to (n_episodes_per_trial * max_episode_steps, -1)
-            obs_batch[b_inds].reshape(-1, _obs.shape[-1]),
-            action_batch[b_inds].reshape(-1, _actions.shape[-1]),
-            advantage_batch[b_inds].reshape(-1, 1),
-            logprob_batch[b_inds].reshape(-1, 1),
-            return_batch[b_inds].reshape(-1, 1),
-            subkey,
-        )
-        agent_state = agent_state.apply_gradients(grads=grads)
+        index_permuation = jax.random.permutation( subkey, num_trial_episodes, independent=True)
+        for start_ind in range(0, num_trial_episodes, args.mini_batch_size):
+            offset = start_ind + args.mini_batch_size
+            b_inds = index_permuation[start_ind:offset]
+            trial_length = episode_length * args.mini_batch_size
+            grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
+                agent_state.params,
+                # From (episode_length, mini_batch_size, D)
+                # to (episode_length * mini_batch_size, -1)
+                _obs[:, b_inds].reshape(trial_length, _obs.shape[-1]),
+                _actions[:, b_inds].reshape(trial_length, _actions.shape[-1]),
+                _advantages[:, b_inds].reshape(trial_length, 1),
+                _logprobs[:, b_inds].reshape(trial_length, 1),
+                _returns[:, b_inds].reshape(trial_length, 1),
+                subkey,
+            )
+            agent_state = agent_state.apply_gradients(grads=grads)
 
     return agent_state, aux_metrics
 
@@ -477,11 +520,14 @@ if __name__ == "__main__":
 
     NUM_CLASSES = len(benchmark.train_classes)
     # total number of episodes per trial
-    meta_batch_size = args.n_episodes_per_trial //  NUM_CLASSES
+    meta_batch_size = args.n_episodes_per_trial // NUM_CLASSES
 
     # env setup
     envs, train_task_names = make_envs(
-        benchmark, meta_batch_size=meta_batch_size, seed=args.seed, max_episode_steps=args.max_episode_steps
+        benchmark,
+        meta_batch_size=meta_batch_size,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
     )
     eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
@@ -506,7 +552,7 @@ if __name__ == "__main__":
         _storage: Storage,
     ):
         storage = _storage.replace(advantages=_storage.advantages.at[:].set(0.0))
-        lastgaelam = 0
+        gae = 0
         for t in reversed(range(args.max_episode_steps)):
             if t == args.max_episode_steps - 1:
                 nextnonterminal = 1.0 - next_done
@@ -519,13 +565,8 @@ if __name__ == "__main__":
                 + args.gamma * nextvalues * nextnonterminal
                 - storage.values[t]
             )
-            lastgaelam = (
-                delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            )
-            storage = storage.replace(
-                advantages=storage.advantages.at[t].set(lastgaelam)
-            )
-
+            gae = delta + args.gamma * args.gae_lambda * nextnonterminal * gae
+            storage = storage.replace(advantages=storage.advantages.at[t].set(gae))
         return storage.replace(returns=storage.advantages + storage.values)
 
     agent = RL2ActorCritic(envs, args)
@@ -540,7 +581,6 @@ if __name__ == "__main__":
             optax.adam(learning_rate=args.learning_rate),
         ),
     )
-
 
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
@@ -617,10 +657,17 @@ if __name__ == "__main__":
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and global_step > 0:
-            num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // meta_batch_size
+            num_evals = (
+                len(benchmark.test_classes) * args.num_evaluation_goals
+            ) // meta_batch_size
             print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args, agent, agent_state, eval_envs, num_episodes=args.evaluation_num_episodes, task_names=eval_task_names
+                args,
+                agent,
+                agent_state,
+                eval_envs,
+                num_episodes=args.evaluation_num_episodes,
+                task_names=eval_task_names,
             )
             logs["charts/mean_success_rate"] = float(test_success_rate)
             logs["charts/mean_evaluation_return"] = float(eval_returns)
@@ -628,9 +675,16 @@ if __name__ == "__main__":
                 logs[f"charts/{task_name}_success_rate"] = float(success_rate)
 
             print(f"Evaluating on train set at {total_steps=}")
-            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // meta_batch_size
+            num_evals = (
+                len(benchmark.train_classes) * args.num_evaluation_goals
+            ) // meta_batch_size
             _, _, train_success_per_task = rl2_evaluation(
-                args, agent, agent_state, envs, num_episodes=args.evaluation_num_episodes, task_names=train_task_names
+                args,
+                agent,
+                agent_state,
+                envs,
+                num_episodes=args.evaluation_num_episodes,
+                task_names=train_task_names,
             )
             for task_name, success_rate in train_success_per_task.items():
                 logs[f"charts/{task_name}_train_success_rate"] = float(success_rate)
@@ -648,7 +702,7 @@ if __name__ == "__main__":
             total_steps,
         )
 
-         # Set tasks for next iteration
+        # Set tasks for next iteration
         obs, _ = zip(*envs.call("sample_tasks"))
         obs = np.stack(obs)
 
