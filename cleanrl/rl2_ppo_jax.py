@@ -104,7 +104,7 @@ class Critic(nn.Module):
     args: dict
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         x = nn.Dense(
             self.args.recurrent_state_size,
             kernel_init=nn.initializers.he_uniform(),
@@ -131,7 +131,7 @@ class Actor(nn.Module):
     LOG_STD_MAX: float = 2.0
 
     @nn.compact
-    def __call__(self, x: jax.Array):
+    def __call__(self, x: jax.Array) -> jax.Array:
         x = nn.Dense(
             400,
             kernel_init=nn.initializers.he_uniform(),
@@ -166,7 +166,7 @@ class RL2ActorCritic(nn.Module):
     envs: gym.Env
     args: dict
 
-    def initialize_state(self, batch_size):
+    def initialize_state(self, batch_size: int) -> jax.Array:
         return nn.GRUCell(
             features=self.args.recurrent_state_size, parent=None
         ).initialize_carry(
@@ -189,7 +189,7 @@ class RL2ActorCritic(nn.Module):
 @jax.jit
 def get_action_log_prob_and_value(
     agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
-):
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     action_dist, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
@@ -199,7 +199,7 @@ def get_action_log_prob_and_value(
 @jax.jit
 def get_deterministic_action(
     agent_state: TrainState, obs: jax.Array, carry: jax.Array
-) -> jax.Array:
+) -> Tuple[jax.Array, jax.Array]:
     action_dist, _, carry = agent_state.apply_fn(agent_state.params, obs, carry)
     return jnp.tanh(action_dist.distribution.mean()), carry
 
