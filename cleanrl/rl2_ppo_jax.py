@@ -40,12 +40,12 @@ def parse_args():
         help="the entity (team) of wandb's project")
 
     # RL^2 arguments
-    parser.add_argument("--n-episodes-per-trial", type=int, default=40,
-                        help="number of episodes sampled per trial/meta-batch")
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--mini-batch-size", type=int, default=2,
+    parser.add_argument("--meta-batch-size", type=int, default=2,
                         help="Number of episodes to consider as single trial for gradient update")
+    parser.add_argument("--rollouts-per-task", type=int, default=10,
+        help="the number of trajectories to collect per task")
     # agent parameters
     parser.add_argument("--recurrent-state-size", type=int, default=256)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -189,11 +189,11 @@ class RL2ActorCritic(nn.Module):
 @jax.jit
 def get_action_log_prob_and_value(
     agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     action_dist, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
-    return action, log_prob.reshape(-1, 1), value, key
+    return action, log_prob.reshape(-1, 1), value, carry, key
 
 
 @jax.jit
@@ -463,15 +463,17 @@ def update_rl2_ppo(
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
-        index_permuation = jax.random.permutation( subkey, num_trial_episodes, independent=True)
-        for start_ind in range(0, num_trial_episodes, args.mini_batch_size):
-            offset = start_ind + args.mini_batch_size
+        index_permuation = jax.random.permutation(
+            subkey, num_trial_episodes, independent=True
+        )
+        for start_ind in range(0, num_trial_episodes, args.meta_batch_size):
+            offset = start_ind + args.meta_batch_size
             b_inds = index_permuation[start_ind:offset]
-            trial_length = episode_length * args.mini_batch_size
+            trial_length = episode_length * args.meta_batch_size
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                # From (episode_length, mini_batch_size, D)
-                # to (episode_length * mini_batch_size, -1)
+                # From (episode_length, meta_batch_size, D)
+                # to (episode_length * meta_batch_size, -1)
                 _obs[:, b_inds].reshape(trial_length, _obs.shape[-1]),
                 _actions[:, b_inds].reshape(trial_length, _actions.shape[-1]),
                 _advantages[:, b_inds].reshape(trial_length, 1),
@@ -520,19 +522,17 @@ if __name__ == "__main__":
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
 
     NUM_CLASSES = len(benchmark.train_classes)
-    # total number of episodes per trial
-    meta_batch_size = args.n_episodes_per_trial // NUM_CLASSES
 
     # env setup
     envs, train_task_names = make_envs(
         benchmark,
-        meta_batch_size=meta_batch_size,
+        meta_batch_size=args.rollouts_per_task,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
     )
     eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
-        meta_batch_size=meta_batch_size,
+        meta_batch_size=args.rollouts_per_task,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
         total_tasks_per_class=args.num_evaluation_goals,
@@ -575,7 +575,9 @@ if __name__ == "__main__":
     agent_state = TrainState.create(
         apply_fn=agent.apply,
         params=agent.init(
-            agent_init_key, obs, jnp.zeros((meta_batch_size, args.recurrent_state_size))
+            agent_init_key,
+            obs,
+            jnp.zeros((args.rollouts_per_task, args.recurrent_state_size)),
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
@@ -586,25 +588,21 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
 
-    global_episodic_return = deque([], maxlen=20 * meta_batch_size)
-    global_episodic_length = deque([], maxlen=20 * meta_batch_size)
+    global_episodic_return = deque([], maxlen=20 * args.rollouts_per_task)
+    global_episodic_length = deque([], maxlen=20 * args.rollouts_per_task)
 
     total_steps = 0
-    # number of steps executed in each trial
-    meta_batch_steps = meta_batch_size * args.max_episode_steps
 
-    for global_step in range(int(args.total_timesteps // meta_batch_steps)):
+    for global_step in range(int(args.total_timesteps // args.rollouts_per_task)):
         # collect a trial of size meta_batch_size
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
         meta_trial: List[Storage] = []
-        for meta_ep in range(meta_batch_size):
-            # RL^2 stuff
-            # reset hidden state for each meta trial
-            carry = agent.initialize_state(meta_batch_size)
-            storage = get_storage(envs, args.max_episode_steps, meta_batch_size)
+        for _ in range(args.rollouts_per_task):
+            carry = agent.initialize_state(args.rollouts_per_task)
+            storage = get_storage(envs, args.max_episode_steps, args.rollouts_per_task)
             for meta_step in range(args.max_episode_steps):
-                total_steps += meta_batch_size
-                action, logprob, value, key = get_action_log_prob_and_value(
+                total_steps += args.rollouts_per_task
+                action, logprob, value, carry, key = get_action_log_prob_and_value(
                     agent_state, obs, carry, key
                 )
                 action = jax.device_get(action)
@@ -634,7 +632,7 @@ if __name__ == "__main__":
                     global_episodic_length.append(info["episode"]["l"])
 
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            _, _, next_value, key = get_action_log_prob_and_value(
+            _, _, next_value, carry, key = get_action_log_prob_and_value(
                 agent_state, obs, carry, key
             )
             storage = compute_gae(next_value, done, storage)
@@ -660,7 +658,7 @@ if __name__ == "__main__":
         if total_steps % args.eval_freq == 0 and global_step > 0:
             num_evals = (
                 len(benchmark.test_classes) * args.num_evaluation_goals
-            ) // meta_batch_size
+            ) // args.rollouts_per_task
             print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
                 args,
@@ -678,7 +676,7 @@ if __name__ == "__main__":
             print(f"Evaluating on train set at {total_steps=}")
             num_evals = (
                 len(benchmark.train_classes) * args.num_evaluation_goals
-            ) // meta_batch_size
+            ) // args.rollouts_per_task
             _, _, train_success_per_task = rl2_evaluation(
                 args,
                 agent,
