@@ -230,6 +230,7 @@ def _make_envs_common(
         )
         env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env.toggle_terminate_on_success(terminate_on_success)
+        env = metaworld_wrappers.RL2Env(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if task_select != "random":
             env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
