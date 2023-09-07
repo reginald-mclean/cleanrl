@@ -13,13 +13,13 @@ import gymnasium as gym
 import numpy as np
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
-from typing import Optional, Type, Tuple, List
+from typing import Optional, Type, Tuple, List, Callable
 from functools import partial
 from torch.utils.tensorboard import SummaryWriter
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
+from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
 from collections import deque
 import distrax
 import optax
@@ -247,39 +247,6 @@ make_eval_envs = partial(
 )
 
 
-@flax.struct.dataclass
-class Storage:
-    obs: jnp.array
-    actions: jnp.array
-    logprobs: jnp.array
-    dones: jnp.array
-    values: jnp.array
-    advantages: jnp.array
-    returns: jnp.array
-    rewards: jnp.array
-
-
-def get_storage(envs, max_episode_steps, num_envs):
-    return Storage(
-        obs=jnp.zeros(
-            (
-                max_episode_steps,
-                num_envs,
-                *envs.single_observation_space.shape,
-            )
-        ),
-        actions=jnp.zeros(
-            (max_episode_steps, num_envs, *envs.single_action_space.shape)
-        ),
-        logprobs=jnp.zeros((max_episode_steps, num_envs, 1)),
-        dones=jnp.zeros((max_episode_steps, num_envs, 1)),
-        values=jnp.zeros((max_episode_steps, num_envs, 1)),
-        advantages=jnp.zeros((max_episode_steps, num_envs, 1)),
-        returns=jnp.zeros((max_episode_steps, num_envs, 1)),
-        rewards=jnp.zeros((max_episode_steps, num_envs, 1)),
-    )
-
-
 def rl2_evaluation(
     args,
     agent,
@@ -385,30 +352,29 @@ def update_rl2_ppo(
     benchmark,
     agent: RL2ActorCritic,
     agent_state: TrainState,
-    storage_list: List[Storage],
+    all_rollouts: List[Rollout],
     key,
 ):
     @jax.jit
-    def ppo_loss(params, obs, actions, advantages, logprob, returns, subkey):
+    def ppo_loss(params, rollouts, subkey):
         # init hidden state for single trial
-        carry = agent.initialize_state(1)
-        action_dist, newvalue, carry = agent_state.apply_fn(params, obs, carry)
+        carry = agent.initialize_state(rollouts.observations.shape[0])
+        action_dist, newvalue, carry = agent_state.apply_fn(
+            params, rollouts.observations, carry[:, None]
+        )
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
-        logratio = newlog_prob.reshape(-1, 1) - logprob
+        logratio = newlog_prob[..., None] - rollouts.log_probs
         ratio = jnp.exp(logratio)
 
-        if args.norm_adv:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
         # TODO: check of advantages
-        pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * jax.lax.clamp(
+        pg_loss1 = rollouts.advantages * ratio
+        pg_loss2 = rollouts.advantages * jax.lax.clamp(
             1 - args.clip_coef, ratio, 1 + args.clip_coef
         )
-        pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
-        v_loss = 0.5 * jnp.square(newvalue - returns).mean()
-        entropy_loss = action_dist.distribution.entropy().mean()
-        loss = pg_loss - args.ent_coef * entropy_loss + args.vf_coef * v_loss
+        pg_loss = jnp.minimum(pg_loss1, pg_loss2).mean()
+
+        # entropy_loss = action_dist.distribution.entropy().mean()
+        loss = pg_loss  # - args.ent_coef * entropy_loss
 
         approx_kl = ((ratio - 1) - logratio).mean()
         clip_fraction = (jnp.absolute(ratio - 1) > args.clip_coef).mean()
@@ -416,45 +382,72 @@ def update_rl2_ppo(
         return loss, {
             "losses/loss": loss,
             "losses/pg_loss": pg_loss,
-            "losses/v_loss": v_loss,
-            "losses/entropy_loss": entropy_loss,
+            # "losses/entropy_loss": entropy_loss,
             "losses/approx_kl": approx_kl,
             "losses/clip_fraction": clip_fraction,
         }
 
-    _obs = jnp.stack([strg.obs for strg in storage_list])
-    _actions = jnp.stack([strg.actions for strg in storage_list])
-    _logprobs = jnp.stack([strg.logprobs for strg in storage_list])
-    _dones = jnp.stack([strg.dones for strg in storage_list])
-    _values = jnp.stack([strg.values for strg in storage_list])
-    _advantages = jnp.stack([strg.advantages for strg in storage_list])
-    _returns = jnp.stack([strg.returns for strg in storage_list])
-    _rewards = jnp.stack([strg.rewards for strg in storage_list])
-
-    num_episodes_per_env = _obs.shape[0]
-    episode_length = _obs.shape[1]
-    num_trial_episodes = _obs.shape[2]
-    trial_length = num_episodes_per_env * episode_length
-
     for epoch in range(args.update_epochs):
-        key, subkey = jax.random.split(key)
-        index_permuation = jax.random.permutation(
-            subkey, num_trial_episodes, independent=True
-        )
-        for task_id in index_permuation:
-            # create meta trials by task_id
+        for i in range(len(all_rollouts) - 1):
+            rollouts = all_rollouts[i]
+            key, subkey = jax.random.split(key)
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                _obs[:, :, task_id].reshape(trial_length, _obs.shape[-1]),
-                _actions[:, :, task_id].reshape(trial_length, _actions.shape[-1]),
-                _advantages[:, :, task_id].reshape(trial_length, 1),
-                _logprobs[:, :, task_id].reshape(trial_length, 1),
-                _returns[:, :, task_id].reshape(trial_length, 1),
+                rollouts,
                 subkey,
             )
             agent_state = agent_state.apply_gradients(grads=grads)
 
     return agent_state, aux_metrics
+
+
+class LinearFeatureBaseline:
+    @staticmethod
+    def _extract_features(obs: np.ndarray, reshape=True):
+        obs = np.clip(obs, -10, 10)
+        ones = jnp.ones((*obs.shape[:-1], 1))
+        time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
+        features = np.concatenate(
+            [obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1
+        )
+        if reshape:
+            features = features.reshape(features.shape[0], -1, features.shape[-1])
+        return features
+
+    @classmethod
+    def _fit_baseline(
+        cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5
+    ) -> np.ndarray:
+        features = cls._extract_features(obs)
+        target = returns.reshape(returns.shape[0], -1, 1)
+
+        coeffs = []
+        for task in range(obs.shape[0]):
+            featmat = features[task]
+            _target = target[task]
+            for _ in range(5):
+                task_coeffs = np.linalg.lstsq(
+                    featmat.T @ featmat + reg_coeff * np.identity(featmat.shape[1]),
+                    featmat.T @ _target,
+                    rcond=-1,
+                )[0]
+                if not np.any(np.isnan(task_coeffs)):
+                    break
+                reg_coeff *= 10
+
+            coeffs.append(np.expand_dims(task_coeffs, axis=0))
+
+        return np.stack(coeffs)
+
+    @classmethod
+    def fit_baseline(cls, rollouts: Rollout) -> Callable[[Rollout], np.ndarray]:
+        coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
+
+        def baseline(rollouts: Rollout) -> np.ndarray:
+            features = cls._extract_features(rollouts.observations, reshape=False)
+            return features @ coeffs
+
+        return baseline
 
 
 if __name__ == "__main__":
@@ -517,31 +510,8 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
-    @jax.jit
-    def compute_gae(
-        next_value: np.ndarray,
-        next_done: np.ndarray,
-        _storage: Storage,
-    ):
-        storage = _storage.replace(advantages=_storage.advantages.at[:].set(0.0))
-        gae = 0
-        for t in reversed(range(args.max_episode_steps)):
-            if t == args.max_episode_steps - 1:
-                nextnonterminal = 1.0 - next_done
-                nextvalues = next_value
-            else:
-                nextnonterminal = 1.0 - storage.dones[t + 1]
-                nextvalues = storage.values[t + 1]
-            delta = (
-                storage.rewards[t]
-                + args.gamma * nextvalues * nextnonterminal
-                - storage.values[t]
-            )
-            gae = delta + args.gamma * args.gae_lambda * nextnonterminal * gae
-            storage = storage.replace(advantages=storage.advantages.at[t].set(gae))
-        return storage.replace(returns=storage.advantages + storage.values)
-
     agent = RL2ActorCritic(envs, args)
+    fit_baseline = LinearFeatureBaseline.fit_baseline
     agent.apply = jax.jit(agent.apply)
     agent_state = TrainState.create(
         apply_fn=agent.apply,
@@ -564,14 +534,27 @@ if __name__ == "__main__":
 
     total_steps = 0
 
+    envs.single_observation_space.dtype = np.float32
+    buffer = MultiTaskRolloutBuffer(
+        num_tasks=args.num_parallel_envs,
+        rollouts_per_task=args.num_episodes_per_env,
+        max_episode_steps=args.max_episode_steps,
+    )
+
+    buffer_processing_kwargs = {
+        "gamma": args.gamma,
+        "gae_lambda": args.gae_lambda,
+        "fit_baseline": fit_baseline,
+        "normalize_advantages": True,
+    }
+
     for global_step in range(int(args.total_timesteps // args.num_parallel_envs)):
         # collect a trial of size meta_batch_size
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
-        meta_trials: List[Storage] = []
+        meta_trials: List[Rollout] = []
         for _ in range(args.num_episodes_per_env):
             carry = agent.initialize_state(args.num_parallel_envs)
-            storage = get_storage(envs, args.max_episode_steps, args.num_parallel_envs)
-            for meta_step in range(args.max_episode_steps):
+            while not buffer.ready:
                 total_steps += args.num_parallel_envs
                 action, logprob, value, carry, key = get_action_log_prob_and_value(
                     agent_state, obs, carry, key
@@ -579,16 +562,8 @@ if __name__ == "__main__":
                 action = jax.device_get(action)
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
-                # done = np.logical_or(terminated, truncated).reshape(-1, 1)
-                done = np.array(truncated).reshape(-1, 1)
-                storage = storage.replace(
-                    obs=storage.obs.at[meta_step].set(next_obs),
-                    dones=storage.dones.at[meta_step].set(done),
-                    actions=storage.actions.at[meta_step].set(action),
-                    values=storage.values.at[meta_step].set(value),
-                    logprobs=storage.logprobs.at[meta_step].set(logprob),
-                    rewards=storage.rewards.at[meta_step].set(reward.reshape(-1, 1)),
-                )
+
+                buffer.push(obs, action, reward, truncated, log_prob=logprob)
                 obs = next_obs
 
                 # Only print when at least 1 env is done
@@ -603,11 +578,9 @@ if __name__ == "__main__":
                     global_episodic_length.append(info["episode"]["l"])
 
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            _, _, next_value, carry, key = get_action_log_prob_and_value(
-                agent_state, obs, carry, key
-            )
-            storage = compute_gae(next_value, done, storage)
-            meta_trials.append(storage)
+            rollouts = buffer.get(**buffer_processing_kwargs)
+            meta_trials.append(rollouts)
+            buffer.reset()
 
         if total_steps % 500 == 0 and global_episodic_return:
             mean_ep_return = np.mean(global_episodic_return)
