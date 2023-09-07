@@ -44,14 +44,12 @@ def parse_args():
     # RL^2 arguments
     parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--meta-batch-size", type=int, default=2,
-                        help="Number of episodes to consider as single trial for gradient update")
     parser.add_argument("--num-parallel-envs", type=int, default=10,
         help="the number of parallel envs used to collect data")
     parser.add_argument("--num-episodes-per-env", type=int, default=2,
-        help="the number episodes collected for each env before training")
+        help="the number episodes collected for each env before training, the trial size")
     # agent parameters
-    parser.add_argument("--recurrent-state-size", type=int, default=256)
+    parser.add_argument("--recurrent-state-size", type=int, default=64)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
     parser.add_argument("--encoder-hidden-size", type=int, default=256)
 
@@ -384,6 +382,7 @@ def rl2_evaluation(
 
 def update_rl2_ppo(
     args,
+    benchmark,
     agent: RL2ActorCritic,
     agent_state: TrainState,
     storage_list: List[Storage],
@@ -423,36 +422,34 @@ def update_rl2_ppo(
             "losses/clip_fraction": clip_fraction,
         }
 
-    _obs = jnp.concatenate([strg.obs for strg in storage_list], axis=1)
-    _actions = jnp.concatenate([strg.actions for strg in storage_list], axis=1)
-    _logprobs = jnp.concatenate([strg.logprobs for strg in storage_list], axis=1)
-    _dones = jnp.concatenate([strg.dones for strg in storage_list], axis=1)
-    _values = jnp.concatenate([strg.values for strg in storage_list], axis=1)
-    _advantages = jnp.concatenate([strg.advantages for strg in storage_list], axis=1)
-    _returns = jnp.concatenate([strg.returns for strg in storage_list], axis=1)
-    _rewards = jnp.concatenate([strg.rewards for strg in storage_list], axis=1)
+    _obs = jnp.stack([strg.obs for strg in storage_list])
+    _actions = jnp.stack([strg.actions for strg in storage_list])
+    _logprobs = jnp.stack([strg.logprobs for strg in storage_list])
+    _dones = jnp.stack([strg.dones for strg in storage_list])
+    _values = jnp.stack([strg.values for strg in storage_list])
+    _advantages = jnp.stack([strg.advantages for strg in storage_list])
+    _returns = jnp.stack([strg.returns for strg in storage_list])
+    _rewards = jnp.stack([strg.rewards for strg in storage_list])
 
-    episode_length = _obs.shape[0]
-    num_trial_episodes = _obs.shape[1]
+    num_episodes_per_env = _obs.shape[0]
+    episode_length = _obs.shape[1]
+    num_trial_episodes = _obs.shape[2]
+    trial_length = num_episodes_per_env * episode_length
 
     for epoch in range(args.update_epochs):
         key, subkey = jax.random.split(key)
         index_permuation = jax.random.permutation(
             subkey, num_trial_episodes, independent=True
         )
-        for start_ind in range(0, num_trial_episodes, args.meta_batch_size):
-            offset = start_ind + args.meta_batch_size
-            b_inds = index_permuation[start_ind:offset]
-            trial_length = episode_length * args.meta_batch_size
+        for task_id in index_permuation:
+            # create meta trials by task_id
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                # From (episode_length, meta_batch_size, D)
-                # to (episode_length * meta_batch_size, -1)
-                _obs[:, b_inds].reshape(trial_length, _obs.shape[-1]),
-                _actions[:, b_inds].reshape(trial_length, _actions.shape[-1]),
-                _advantages[:, b_inds].reshape(trial_length, 1),
-                _logprobs[:, b_inds].reshape(trial_length, 1),
-                _returns[:, b_inds].reshape(trial_length, 1),
+                _obs[:, :, task_id].reshape(trial_length, _obs.shape[-1]),
+                _actions[:, :, task_id].reshape(trial_length, _actions.shape[-1]),
+                _advantages[:, :, task_id].reshape(trial_length, 1),
+                _logprobs[:, :, task_id].reshape(trial_length, 1),
+                _returns[:, :, task_id].reshape(trial_length, 1),
                 subkey,
             )
             agent_state = agent_state.apply_gradients(grads=grads)
@@ -626,7 +623,9 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trials, key)
+        agent_state, logs = update_rl2_ppo(
+            args, benchmark, agent, agent_state, meta_trials, key
+        )
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and global_step > 0:
