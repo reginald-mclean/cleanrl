@@ -24,6 +24,8 @@ from collections import deque
 import distrax
 import optax
 
+gym.logger.set_level(40)
+
 
 def parse_args():
     # fmt: off
@@ -44,8 +46,10 @@ def parse_args():
                         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--meta-batch-size", type=int, default=2,
                         help="Number of episodes to consider as single trial for gradient update")
-    parser.add_argument("--rollouts-per-task", type=int, default=10,
-        help="the number of trajectories to collect per task")
+    parser.add_argument("--num-parallel-envs", type=int, default=10,
+        help="the number of parallel envs used to collect data")
+    parser.add_argument("--num-episodes-per-env", type=int, default=2,
+        help="the number episodes collected for each env before training")
     # agent parameters
     parser.add_argument("--recurrent-state-size", type=int, default=256)
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -105,19 +109,6 @@ class Critic(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = nn.Dense(
-            self.args.recurrent_state_size,
-            kernel_init=nn.initializers.he_uniform(),
-            bias_init=nn.initializers.constant(0.1),
-        )(x)
-
-        x = nn.relu(x)
-        x = nn.Dense(
-            400,
-            kernel_init=nn.initializers.he_uniform(),
-            bias_init=nn.initializers.constant(0.1),
-        )(x)
-        x = nn.relu(x)
         return nn.Dense(
             1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
         )(x)
@@ -132,19 +123,6 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        x = nn.Dense(
-            400,
-            kernel_init=nn.initializers.he_uniform(),
-            bias_init=nn.initializers.constant(0.1),
-        )(x)
-        x = nn.relu(x)
-        x = nn.Dense(
-            400,
-            kernel_init=nn.initializers.he_uniform(),
-            bias_init=nn.initializers.constant(0.1),
-        )(x)
-        x = nn.relu(x)
-
         log_sigma = nn.Dense(
             self.action_dim,
             kernel_init=uniform_init(1e-3),
@@ -180,9 +158,9 @@ class RL2ActorCritic(nn.Module):
         x = nn.relu(x)
         carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, x)
         dist = Actor(self.args, np.array(self.envs.single_action_space.shape).prod())(
-            out
+            jnp.concatenate([out, x], axis=-1)
         )
-        value = Critic(self.args)(out)
+        value = Critic(self.args)(jnp.concatenate([out, x], axis=-1))
         return dist, value, carry
 
 
@@ -196,18 +174,10 @@ def get_action_log_prob_and_value(
     return action, log_prob.reshape(-1, 1), value, carry, key
 
 
-@jax.jit
-def get_deterministic_action(
-    agent_state: TrainState, obs: jax.Array, carry: jax.Array
-) -> Tuple[jax.Array, jax.Array]:
-    action_dist, _, carry = agent_state.apply_fn(agent_state.params, obs, carry)
-    return jnp.tanh(action_dist.distribution.mean()), carry
-
-
 def _make_envs_common(
     benchmark: metaworld.Benchmark,
     seed: int,
-    meta_batch_size: int,
+    num_parallel_envs: int,
     max_episode_steps: Optional[int] = None,
     split: str = "train",
     terminate_on_success: bool = False,
@@ -218,10 +188,11 @@ def _make_envs_common(
         benchmark.train_classes if split == "train" else benchmark.test_classes
     )
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
+    envs_per_task = len(all_classes)
     assert (
-        meta_batch_size % len(all_classes) == 0
-    ), "meta_batch_size must be divisible by envs_per_task"
-    tasks_per_env = meta_batch_size // len(all_classes)
+        num_parallel_envs % envs_per_task == 0
+    ), f"{num_parallel_envs=} must be divisible by {envs_per_task=}"
+    tasks_per_env = num_parallel_envs // len(all_classes)
 
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls()
@@ -320,6 +291,7 @@ def rl2_evaluation(
     task_names,
 ):
     NUM_ENVS = eval_envs.unwrapped.num_envs
+    key = jax.random.PRNGKey(args.seed)
 
     successes = np.zeros(NUM_ENVS)
     episodic_returns = [[] for _ in range(NUM_ENVS)]
@@ -351,7 +323,9 @@ def rl2_evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        action, carry = get_deterministic_action(agent_state, obs, carry)
+        action, _, _, carry, key = get_action_log_prob_and_value(
+            agent_state, obs, carry, key
+        )
         action = jax.device_get(action)
         obs, _, _, _, infos = eval_envs.step(action)
         if "final_info" in infos:
@@ -526,13 +500,13 @@ if __name__ == "__main__":
     # env setup
     envs, train_task_names = make_envs(
         benchmark,
-        meta_batch_size=args.rollouts_per_task,
+        num_parallel_envs=args.num_parallel_envs,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
     )
     eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
-        meta_batch_size=args.rollouts_per_task,
+        num_parallel_envs=args.num_parallel_envs,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
         total_tasks_per_class=args.num_evaluation_goals,
@@ -577,7 +551,7 @@ if __name__ == "__main__":
         params=agent.init(
             agent_init_key,
             obs,
-            jnp.zeros((args.rollouts_per_task, args.recurrent_state_size)),
+            jnp.zeros((args.num_parallel_envs, args.recurrent_state_size)),
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
@@ -588,20 +562,20 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
 
-    global_episodic_return = deque([], maxlen=20 * args.rollouts_per_task)
-    global_episodic_length = deque([], maxlen=20 * args.rollouts_per_task)
+    global_episodic_return = deque([], maxlen=20 * args.num_parallel_envs)
+    global_episodic_length = deque([], maxlen=20 * args.num_parallel_envs)
 
     total_steps = 0
 
-    for global_step in range(int(args.total_timesteps // args.rollouts_per_task)):
+    for global_step in range(int(args.total_timesteps // args.num_parallel_envs)):
         # collect a trial of size meta_batch_size
         # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
-        meta_trial: List[Storage] = []
-        for _ in range(args.rollouts_per_task):
-            carry = agent.initialize_state(args.rollouts_per_task)
-            storage = get_storage(envs, args.max_episode_steps, args.rollouts_per_task)
+        meta_trials: List[Storage] = []
+        for _ in range(args.num_episodes_per_env):
+            carry = agent.initialize_state(args.num_parallel_envs)
+            storage = get_storage(envs, args.max_episode_steps, args.num_parallel_envs)
             for meta_step in range(args.max_episode_steps):
-                total_steps += args.rollouts_per_task
+                total_steps += args.num_parallel_envs
                 action, logprob, value, carry, key = get_action_log_prob_and_value(
                     agent_state, obs, carry, key
                 )
@@ -636,7 +610,7 @@ if __name__ == "__main__":
                 agent_state, obs, carry, key
             )
             storage = compute_gae(next_value, done, storage)
-            meta_trial.append(storage)
+            meta_trials.append(storage)
 
         if total_steps % 500 == 0 and global_episodic_return:
             mean_ep_return = np.mean(global_episodic_return)
@@ -652,13 +626,13 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial, key)
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trials, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and global_step > 0:
             num_evals = (
                 len(benchmark.test_classes) * args.num_evaluation_goals
-            ) // args.rollouts_per_task
+            ) // args.num_parallel_envs
             print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
                 args,
@@ -676,7 +650,7 @@ if __name__ == "__main__":
             print(f"Evaluating on train set at {total_steps=}")
             num_evals = (
                 len(benchmark.train_classes) * args.num_evaluation_goals
-            ) // args.rollouts_per_task
+            ) // args.num_parallel_envs
             _, _, train_success_per_task = rl2_evaluation(
                 args,
                 agent,
