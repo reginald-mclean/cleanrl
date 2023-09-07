@@ -356,19 +356,19 @@ def update_rl2_ppo(
     key,
 ):
     @jax.jit
-    def ppo_loss(params, rollouts, subkey):
+    def ppo_loss(params, observations, actions, advantages, log_probs, returns, subkey):
         # init hidden state for single trial
-        carry = agent.initialize_state(rollouts.observations.shape[0])
+        carry = agent.initialize_state(observations.shape[0])
         action_dist, newvalue, carry = agent_state.apply_fn(
-            params, rollouts.observations, carry[:, None]
+            params, observations, carry[:, None]
         )
         action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
-        logratio = newlog_prob[..., None] - rollouts.log_probs
+        logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
 
         # TODO: check of advantages
-        pg_loss1 = rollouts.advantages * ratio
-        pg_loss2 = rollouts.advantages * jax.lax.clamp(
+        pg_loss1 = advantages * ratio
+        pg_loss2 = advantages * jax.lax.clamp(
             1 - args.clip_coef, ratio, 1 + args.clip_coef
         )
         pg_loss = jnp.minimum(pg_loss1, pg_loss2).mean()
@@ -393,7 +393,11 @@ def update_rl2_ppo(
             key, subkey = jax.random.split(key)
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                rollouts,
+                rollouts.observations,
+                rollouts.actions,
+                rollouts.advantages,
+                rollouts.log_probs,
+                rollouts.returns,
                 subkey,
             )
             agent_state = agent_state.apply_gradients(grads=grads)
