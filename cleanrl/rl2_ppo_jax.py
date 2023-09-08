@@ -47,7 +47,7 @@ def parse_args():
                         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--num-parallel-envs", type=int, default=10,
         help="the number of parallel envs used to collect data")
-    parser.add_argument("--num-episodes-per-env", type=int, default=2,
+    parser.add_argument("--num-episodes-per-env", type=int, default=40,
         help="the number episodes collected for each env before training, the trial size")
     # agent parameters
     parser.add_argument("--recurrent-state-size", type=int, default=64)
@@ -123,7 +123,7 @@ class RL2Policy(nn.Module):
         self, state, carry
     ) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
         state_h = nn.Dense(self.args.encoder_hidden_size)(state)
-        state_h = nn.relu(state_h)
+        state_h = nn.tanh(state_h)
         carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, state_h)
 
         state_rnn_h = jnp.concatenate([out, state_h], axis=-1)
@@ -144,17 +144,24 @@ class RL2Policy(nn.Module):
 
 
 @jax.jit
-def sample_action(
-    agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
+def exploit(
+    agent_state: TrainState,
+    obs: jax.Array,
+    carry: jax.Array,
+    key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
     action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
-    return action_dist.sample(seed=action_key), carry, key
+    return action_dist.mean(), carry, key
+
 
 @jax.jit
 def sample_action_logprob(
-    agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
+    agent_state: TrainState,
+    obs: jax.Array,
+    carry: jax.Array,
+    key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
@@ -279,7 +286,7 @@ def rl2_evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        action, carry, key = sample_action( agent_state, obs, carry, key)
+        action, carry, key = exploit(agent_state, obs, carry, key)
         action = jax.device_get(action)
         obs, _, _, _, infos = eval_envs.step(action)
         if "final_info" in infos:
@@ -338,21 +345,11 @@ def rl2_evaluation(
 
 def update_rl2_ppo(
     args,
-    benchmark,
     agent: RL2Policy,
     agent_state: TrainState,
     all_rollouts: List[Rollout],
-    key,
+    key: jax.random.PRNGKeyArray,
 ):
-
-    std = 0.1 * jnp.ones(all_rollouts[0].actions.shape[-1])
-    @jax.jit
-    def policy_entropy_logprob(policy_out, action, std=std):
-        distrib = distrax.MultivariateNormalDiag(loc=policy_out, scale_diag=std)
-        entropy = distrib.entropy()
-        log_prob = distrib.log_prob(action)
-        return entropy, log_prob
-
     @jax.jit
     def ppo_loss(
         params: FrozenDict,
@@ -362,18 +359,23 @@ def update_rl2_ppo(
         log_probs: jax.Array,
         returns: jax.Array,
         subkey: jax.random.PRNGKeyArray,
-    ):
-        # init hidden state for single trial
+    ) -> Tuple[jax.Array, dict]:
         carry = agent.initialize_state(observations.shape[0])
-        mu, log_sigma, carry = agent_state.apply_fn(params, observations, carry[:, None])
-        action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
+        mu, log_sigma, carry = agent_state.apply_fn(
+            params, observations, carry[:, None]
+        )
+        action_dist = distrax.MultivariateNormalDiag(
+            loc=mu, scale_diag=jnp.exp(log_sigma)
+        )
         newlog_prob = action_dist.log_prob(actions)
         entropies = action_dist.entropy()
         logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
 
         pg_loss1 = advantages * ratio
-        pg_loss2 = advantages * jnp.clip(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+        pg_loss2 = advantages * jnp.clip(
+            ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef
+        )
         pg_loss = -jnp.minimum(pg_loss1, pg_loss2).mean()
 
         entropy_loss = entropies.mean()
@@ -391,7 +393,12 @@ def update_rl2_ppo(
         }
 
     for epoch in range(args.update_epochs):
-        for i in range(len(all_rollouts) - 1):
+        key, subkey = jax.random.split(key)
+        # shuffle the rollouts
+        rollout_inds = jax.random.permutation(
+            subkey, len(all_rollouts), independent=True
+        )
+        for i in rollout_inds:
             rollouts = all_rollouts[i]
             key, subkey = jax.random.split(key)
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
@@ -570,7 +577,9 @@ if __name__ == "__main__":
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
 
-                buffer.push(obs, action, reward, truncated, log_prob=logprob)
+                buffer.push(
+                    obs, action, reward, truncated, log_prob=jax.device_get(logprob)
+                )
                 obs = next_obs
 
                 # Only print when at least 1 env is done
@@ -603,9 +612,7 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        agent_state, logs = update_rl2_ppo(
-            args, benchmark, agent, agent_state, meta_trials, key
-        )
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trials, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and global_step > 0:
