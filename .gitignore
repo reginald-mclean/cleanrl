@@ -6,6 +6,7 @@ cleanrl/ppo_continuous_action_isaacgym/isaacgym/LICENSE.txt
 cleanrl/ppo_continuous_action_isaacgym/isaacgym/rlgpu_conda_env.yml
 cleanrl/ppo_continuous_action_isaacgym/isaacgym/setup.py
 
+Metaworld
 *.pth
 
 IsaacGym_Preview_3_Package.tar.gz

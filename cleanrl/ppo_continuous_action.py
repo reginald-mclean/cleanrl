@@ -6,7 +6,7 @@ import time
 from distutils.util import strtobool
 
 import sys
-sys.path.append('/home/reggie/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 from cleanrl_utils.evals.meta_world_eval_protocol import eval
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
@@ -60,7 +60,7 @@ def parse_args():
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=156,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=256,
+    parser.add_argument("--update-epochs", type=int, default=64,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
