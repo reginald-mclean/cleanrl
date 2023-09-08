@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from typing import Optional, Type, Tuple, List, Callable
 from functools import partial
+from flax.core.frozen_dict import FrozenDict
 from torch.utils.tensorboard import SummaryWriter
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
@@ -102,45 +103,12 @@ def uniform_init(bound: float):
     return _init
 
 
-class Critic(nn.Module):
+class RL2Policy(nn.Module):
+    envs: gym.Env
     args: dict
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.Dense(
-            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
-        )(x)
-
-
-class Actor(nn.Module):
-    args: dict
-    action_dim: int
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        log_sigma = nn.Dense(
-            self.action_dim,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )(x)
-        mu = nn.Dense(
-            self.action_dim,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )(x)
-        log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        return distrax.Transformed(
-            distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
-            distrax.Block(distrax.Tanh(), ndims=1),
-        )
-
-
-class RL2ActorCritic(nn.Module):
-    envs: gym.Env
-    args: dict
 
     def initialize_state(self, batch_size: int) -> jax.Array:
         return nn.GRUCell(
@@ -151,25 +119,48 @@ class RL2ActorCritic(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, x, carry) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
-        x = nn.Dense(self.args.encoder_hidden_size)(x)
-        x = nn.relu(x)
-        carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, x)
-        dist = Actor(self.args, np.array(self.envs.single_action_space.shape).prod())(
-            jnp.concatenate([out, x], axis=-1)
-        )
-        value = Critic(self.args)(jnp.concatenate([out, x], axis=-1))
-        return dist, value, carry
+    def __call__(
+        self, state, carry
+    ) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
+        state_h = nn.Dense(self.args.encoder_hidden_size)(state)
+        state_h = nn.relu(state_h)
+        carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, state_h)
+
+        state_rnn_h = jnp.concatenate([out, state_h], axis=-1)
+        log_sigma = nn.Dense(
+            np.array(self.envs.single_action_space.shape).prod(),
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(state_rnn_h)
+
+        mu = nn.Dense(
+            np.array(self.envs.single_action_space.shape).prod(),
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(state_rnn_h)
+
+        log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mu, log_sigma, carry
 
 
 @jax.jit
-def get_action_log_prob_and_value(
+def sample_action(
     agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    action_dist, value, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
+    return action_dist.sample(seed=action_key), carry, key
+
+@jax.jit
+def sample_action_logprob(
+    agent_state: TrainState, obs: jax.Array, carry: jax.Array, key
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
+    key, action_key = jax.random.split(key)
+    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
-    return action, log_prob.reshape(-1, 1), value, carry, key
+    return action, log_prob.reshape(-1, 1), carry, key
 
 
 def _make_envs_common(
@@ -288,9 +279,7 @@ def rl2_evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        action, _, _, carry, key = get_action_log_prob_and_value(
-            agent_state, obs, carry, key
-        )
+        action, carry, key = sample_action( agent_state, obs, carry, key)
         action = jax.device_get(action)
         obs, _, _, _, infos = eval_envs.step(action)
         if "final_info" in infos:
@@ -350,31 +339,45 @@ def rl2_evaluation(
 def update_rl2_ppo(
     args,
     benchmark,
-    agent: RL2ActorCritic,
+    agent: RL2Policy,
     agent_state: TrainState,
     all_rollouts: List[Rollout],
     key,
 ):
+
+    std = 0.1 * jnp.ones(all_rollouts[0].actions.shape[-1])
     @jax.jit
-    def ppo_loss(params, observations, actions, advantages, log_probs, returns, subkey):
+    def policy_entropy_logprob(policy_out, action, std=std):
+        distrib = distrax.MultivariateNormalDiag(loc=policy_out, scale_diag=std)
+        entropy = distrib.entropy()
+        log_prob = distrib.log_prob(action)
+        return entropy, log_prob
+
+    @jax.jit
+    def ppo_loss(
+        params: FrozenDict,
+        observations: jax.Array,
+        actions: jax.Array,
+        advantages: jax.Array,
+        log_probs: jax.Array,
+        returns: jax.Array,
+        subkey: jax.random.PRNGKeyArray,
+    ):
         # init hidden state for single trial
         carry = agent.initialize_state(observations.shape[0])
-        action_dist, newvalue, carry = agent_state.apply_fn(
-            params, observations, carry[:, None]
-        )
-        action, newlog_prob = action_dist.sample_and_log_prob(seed=subkey)
+        mu, log_sigma, carry = agent_state.apply_fn(params, observations, carry[:, None])
+        action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
+        newlog_prob = action_dist.log_prob(actions)
+        entropies = action_dist.entropy()
         logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
 
-        # TODO: check of advantages
         pg_loss1 = advantages * ratio
-        pg_loss2 = advantages * jax.lax.clamp(
-            1 - args.clip_coef, ratio, 1 + args.clip_coef
-        )
-        pg_loss = jnp.minimum(pg_loss1, pg_loss2).mean()
+        pg_loss2 = advantages * jnp.clip(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
+        pg_loss = -jnp.minimum(pg_loss1, pg_loss2).mean()
 
-        # entropy_loss = action_dist.distribution.entropy().mean()
-        loss = pg_loss  # - args.ent_coef * entropy_loss
+        entropy_loss = entropies.mean()
+        loss = pg_loss - args.ent_coef * entropy_loss
 
         approx_kl = ((ratio - 1) - logratio).mean()
         clip_fraction = (jnp.absolute(ratio - 1) > args.clip_coef).mean()
@@ -382,7 +385,7 @@ def update_rl2_ppo(
         return loss, {
             "losses/loss": loss,
             "losses/pg_loss": pg_loss,
-            # "losses/entropy_loss": entropy_loss,
+            "losses/entropy_loss": entropy_loss,
             "losses/approx_kl": approx_kl,
             "losses/clip_fraction": clip_fraction,
         }
@@ -514,7 +517,7 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
-    agent = RL2ActorCritic(envs, args)
+    agent = RL2Policy(envs, args)
     fit_baseline = LinearFeatureBaseline.fit_baseline
     agent.apply = jax.jit(agent.apply)
     agent_state = TrainState.create(
@@ -560,7 +563,7 @@ if __name__ == "__main__":
             carry = agent.initialize_state(args.num_parallel_envs)
             while not buffer.ready:
                 total_steps += args.num_parallel_envs
-                action, logprob, value, carry, key = get_action_log_prob_and_value(
+                action, logprob, carry, key = sample_action_logprob(
                     agent_state, obs, carry, key
                 )
                 action = jax.device_get(action)
