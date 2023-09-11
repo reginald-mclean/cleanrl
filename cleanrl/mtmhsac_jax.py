@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reggie/cleanrl')
+sys.path.append('/home/reginaldkmclean/cleanrl')
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import distrax
@@ -29,6 +29,8 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
+from metaworld.envs import ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE
+from cleanrl_utils.evals.meta_world_eval_protocol import eval
 
 
 def parse_args():
@@ -48,8 +50,8 @@ def parse_args():
         help="whether to save model into the `runs/{run_name}` folder")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--env-name", type=str, default="", help="the name of the environment for MT1")
+    parser.add_argument("--env-id", type=str, default="MT1", help="the id of the environment")
+    parser.add_argument("--env-name", type=str, default="peg-insert-side-v2", help="the name of the environment for MT1")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=None,
@@ -108,7 +110,7 @@ def uniform_init(bound: float):
 class Actor(nn.Module):
     num_actions: int
     num_tasks: int
-    hidden_dims: int = "400,400,400"
+    hidden_dims: int = "256,256"
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
@@ -186,7 +188,7 @@ def sample_and_log_prob(
 
 
 class Critic(nn.Module):
-    hidden_dims: int = "400,400,400"
+    hidden_dims: int = "256,256"
     num_tasks: int = 1
 
     @nn.compact
@@ -215,7 +217,7 @@ class Critic(nn.Module):
 class VectorCritic(nn.Module):
     n_critics: int = 2
     num_tasks: int = 1
-    hidden_dims: int = "400,400"
+    hidden_dims: int = "256,256"
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array, task_idx) -> jax.Array:
@@ -477,9 +479,9 @@ if __name__ == "__main__":
     else:
         assert args.env_name != "", "Must pass a environment name for MT1"
         benchmark = metaworld.MT1(args.env_name, seed=args.seed)
-
+        #benchmark._train_tasks = benchmark.train_tasks[0]
     use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
+        True if "MT10" in args.env_id or "MT50" in args.env_id or "MT1" in args.env_id else False
     )
     envs = make_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
@@ -491,7 +493,7 @@ if __name__ == "__main__":
     NUM_TASKS = len(benchmark.train_classes)
     print(NUM_TASKS)
     assert isinstance(
-        envs.single_action_space, gym.spaces.Box
+       envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
     # agent setup
@@ -505,7 +507,7 @@ if __name__ == "__main__":
 
     global_episodic_return: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
     global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
-
+    
     obs, _ = envs.reset()
 
     key, agent_init_key = jax.random.split(key)
@@ -519,7 +521,8 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
-
+    eval(writer, eval_envs, args.env_name, agent, 50,  'cuda:0', 0)
+    obs, _ = envs.reset()
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -576,7 +579,7 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             # Sample a batch from replay buffer
-            for i in range(200):
+            for i in range(1):
                 data = rb.sample(args.batch_size)
                 observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
                 next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
@@ -617,26 +620,28 @@ if __name__ == "__main__":
                 )
 
             # Evaluation
-            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                eval_success_rate, eval_returns, eval_success_per_task = evaluation(
-                    agent=agent,
-                    eval_envs=eval_envs,
-                    num_episodes=args.evaluation_num_episodes,
-                )
-                eval_metrics = {
-                    "charts/mean_success_rate": float(eval_success_rate),
-                    "charts/mean_evaluation_return": float(eval_returns),
-                } | {
-                    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-                    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
-                }
+            if total_steps % args.evaluation_frequency == 0:
+                #eval_success_rate, eval_returns, eval_success_per_task = evaluation(
+                #    agent=agent,
+                #    eval_envs=eval_envs,
+                #    num_episodes=args.evaluation_num_episodes,
+                #)
+                eval(writer, eval_envs, args.env_name, agent, 50,  'cuda:0', total_steps)
+                #eval_metrics = {
+                #    "charts/mean_success_rate": float(eval_success_rate),
+                #    "charts/mean_evaluation_return": float(eval_returns),
+                #}
+                # | {
+                #    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                #    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+                #}
 
-                for k, v in eval_metrics.items():
-                    writer.add_scalar(k, v, total_steps)
-                print(
-                    f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
-                    + f" return: {eval_returns:.4f}"
-                )
+                #for k, v in eval_metrics.items():
+                #    writer.add_scalar(k, v, total_steps)
+                #print(
+                #    f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
+                #    + f" return: {eval_returns:.4f}"
+                #)
 
                 # Checkpointing
                 if args.save_model:

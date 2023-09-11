@@ -54,20 +54,21 @@ def eval(writer, env, env_name, agent, num_evals,  device, update):
     #env = gym.wrappers.TimeLimit(env, max_episode_steps=500)
     rewards = []
     success = 0.0
+    print(env)
     for m in range(num_evals):
         obs, info = env.reset()
         done = False
         while not done:
             with torch.no_grad():
-                action, _, _, _ = agent.get_action_and_value(
-                        torch.from_numpy(obs).to(torch.float32).to(device).unsqueeze(0))
-            next_obs, reward, terminated, truncated, info = env.step(action.squeeze(0).detach().cpu().numpy())
+                action = agent.get_action_eval(obs)
+            next_obs, reward, terminated, truncated, info = env.step(action)
             rewards.append(reward)
             done = truncated or terminated
             obs = next_obs
-            if int(info['success']) == 1:
-                success += 1
-                done = True
+            if "final_info" in info:
+                if int(info['final_info'][0]['success']) == 1:
+                    success += 1
+                    done = True
             if done:
                 break
 

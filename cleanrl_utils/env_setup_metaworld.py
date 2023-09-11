@@ -26,6 +26,7 @@ def _make_envs_common(
                 env, env_id, len(benchmark.train_classes)
             )
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        tasks = [tasks[0]]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
