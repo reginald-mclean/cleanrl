@@ -198,11 +198,12 @@ class SyncVectorEnv(VectorEnv):
             self.env_names.append(env_name)
             self.tasks[env_name] = [task for task in tasks if task.env_name == env_name]
             self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
-            env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
+            #env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
+            env = PseudoRandomTaskSelectWrapper(env, self.tasks[env_name], True)
             if use_one_hot_wrapper:
                 env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
             env = TimeLimit(env, 500)
-            #env = NormalizeObservation(env)
+            env = NormalizeObservation(env)
             env = RecordEpisodeStatistics(env)
             self.envs.append(env)
         self.copy = copy
@@ -278,11 +279,6 @@ class SyncVectorEnv(VectorEnv):
                 kwargs["seed"] = single_seed
             if options is not None:
                 kwargs["options"] = options
-            # need to set task first
-            env_name = self.env_names[i]
-            _, _ = env.reset()
-            self.current_tasks[env_name] = (self.current_tasks[env_name] + 1) % len(self.tasks[env_name])
-            env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             observation, info = env.reset(**kwargs)
             observations.append(observation)
             infos = self._add_info(infos, info, i)
@@ -312,11 +308,6 @@ class SyncVectorEnv(VectorEnv):
 
             if self._terminateds[i] or self._truncateds[i]:
                 old_observation, old_info = observation, info
-                # select new task
-                env_name = self.env_names[i]
-                _, _ = env.reset()
-                self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
-                env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
                 observation, info = env.reset()
                 info["final_observation"] = old_observation
                 info["final_info"] = old_info

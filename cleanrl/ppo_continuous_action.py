@@ -6,7 +6,7 @@ import time
 from distutils.util import strtobool
 
 import sys
-sys.path.append('/home/reginaldkmclean/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 from cleanrl_utils.evals.meta_world_eval_protocol import eval
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
