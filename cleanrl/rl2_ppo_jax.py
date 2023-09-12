@@ -11,6 +11,8 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 from cleanrl_utils.wrappers import metaworld_wrappers
 import gymnasium as gym
 import numpy as np
+import orbax
+import orbax.checkpoint
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -21,7 +23,6 @@ from torch.utils.tensorboard import SummaryWriter
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
 from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
-from collections import deque
 import distrax
 import optax
 
@@ -41,23 +42,25 @@ def parse_args():
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
+    parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to save model into the `runs/{run_name}` folder")
 
     # RL^2 arguments
-    parser.add_argument("--max-episode-steps", type=int, default=200,
+    parser.add_argument("--max-episode-steps", type=int, default=500,
                         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--num-parallel-envs", type=int, default=10,
-        help="the number of parallel envs used to collect data")
-    parser.add_argument("--num-episodes-per-env", type=int, default=40,
-        help="the number episodes collected for each env before training, the trial size")
-    # agent parameters
+                        help="the number of parallel envs used to collect data")
+    parser.add_argument("--num-episodes-per-trial", type=int, default=20,
+                        help="the number episodes collected for each env before training, the trial size")
     parser.add_argument("--recurrent-state-size", type=int, default=64)
+    parser.add_argument("--recurrent-type", type=str, default="gru")
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
     parser.add_argument("--encoder-hidden-size", type=int, default=256)
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=2e7,
+    parser.add_argument("--total-timesteps", type=int, default=15e6,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
@@ -92,82 +95,6 @@ def parse_args():
     args = parser.parse_args()
     # fmt: on
     return args
-
-
-def uniform_init(bound: float):
-    def _init(key, shape, dtype):
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
-
-    return _init
-
-
-class RL2Policy(nn.Module):
-    envs: gym.Env
-    args: dict
-
-    LOG_STD_MIN: float = -20.0
-    LOG_STD_MAX: float = 2.0
-
-    def initialize_state(self, batch_size: int) -> jax.Array:
-        return nn.GRUCell(
-            features=self.args.recurrent_state_size, parent=None
-        ).initialize_carry(
-            jax.random.PRNGKey(0),
-            (batch_size, self.args.encoder_hidden_size),
-        )
-
-    @nn.compact
-    def __call__(
-        self, state, carry
-    ) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
-        state_h = nn.Dense(self.args.encoder_hidden_size)(state)
-        state_h = nn.tanh(state_h)
-        carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(carry, state_h)
-
-        state_rnn_h = jnp.concatenate([out, state_h], axis=-1)
-        log_sigma = nn.Dense(
-            np.array(self.envs.single_action_space.shape).prod(),
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )(state_rnn_h)
-
-        mu = nn.Dense(
-            np.array(self.envs.single_action_space.shape).prod(),
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
-        )(state_rnn_h)
-
-        log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        return mu, log_sigma, carry
-
-
-@jax.jit
-def exploit(
-    agent_state: TrainState,
-    obs: jax.Array,
-    carry: jax.Array,
-    key: jax.random.PRNGKeyArray,
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
-    key, action_key = jax.random.split(key)
-    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
-    action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
-    return action_dist.mean(), carry, key
-
-
-@jax.jit
-def sample_action_logprob(
-    agent_state: TrainState,
-    obs: jax.Array,
-    carry: jax.Array,
-    key: jax.random.PRNGKeyArray,
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
-    key, action_key = jax.random.split(key)
-    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
-    action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
-    action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
-    return action, log_prob.reshape(-1, 1), carry, key
 
 
 def _make_envs_common(
@@ -246,7 +173,6 @@ make_eval_envs = partial(
 
 
 def rl2_evaluation(
-    args,
     agent,
     agent_state,
     eval_envs: gym.vector.VectorEnv,
@@ -254,8 +180,6 @@ def rl2_evaluation(
     task_names,
 ):
     NUM_ENVS = eval_envs.unwrapped.num_envs
-    key = jax.random.PRNGKey(args.seed)
-
     successes = np.zeros(NUM_ENVS)
     episodic_returns = [[] for _ in range(NUM_ENVS)]
     if task_names is not None:
@@ -269,7 +193,7 @@ def rl2_evaluation(
         episodic_returns = [[] for _ in range(eval_envs.num_envs)]
 
     start_time = time.time()
-    carry = agent.initialize_state(NUM_ENVS)
+    carry = agent.initialize_carry((NUM_ENVS,))
 
     eval_envs.call("toggle_sample_tasks_on_reset", False)
     eval_envs.call("toggle_terminate_on_success", True)
@@ -277,7 +201,7 @@ def rl2_evaluation(
     obs = np.stack(obs)
 
     def eval_done(returns):
-        if type(returns) is dict:
+        if isinstance(returns, dict):
             return all(
                 len(r) >= (num_episodes * envs_per_task[task_name])
                 for task_name, r in returns.items()
@@ -286,7 +210,7 @@ def rl2_evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        action, carry, key = exploit(agent_state, obs, carry, key)
+        action, carry = exploit(agent_state, obs, carry)
         action = jax.device_get(action)
         obs, _, _, _, infos = eval_envs.step(action)
         if "final_info" in infos:
@@ -294,10 +218,21 @@ def rl2_evaluation(
                 # Skip the envs that are not done
                 if info is None:
                     continue
+                # TODO #
                 # reset states of finished episodes
-                carry = carry.at[:, i : i + 1].set(
-                    np.random.random(carry[:, i : i + 1].shape)
-                )
+                # if args.recurrent_type == "gru":
+                #     carry = carry.at[:, i : i + 1].set(
+                #         np.random.random(carry[:, i : i + 1].shape)
+                #     )
+                # elif args.recurrent_type == "lstm":
+                #     t1 = carry[0].at[:, i : i + 1].set(
+                #         np.random.random(carry[0][:, i : i + 1].shape)
+                #     )
+                #     t2 = carry[1].at[:, i : i + 1].set(
+                #         np.random.random(carry[1][:, i : i + 1].shape)
+                #     )
+                #     carry = (t1,t2)
+
                 if task_names is not None:
                     episodic_returns[task_names[i]].append(
                         float(info["episode"]["r"][0])
@@ -343,13 +278,98 @@ def rl2_evaluation(
     return mean_success_rate, mean_returns, task_success_rates
 
 
+def uniform_init(bound: float):
+    def _init(key, shape, dtype):
+        return jax.random.uniform(
+            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
+        )
+
+    return _init
+
+
+class RL2Policy(nn.Module):
+    envs: gym.Env
+    args: argparse.Namespace
+
+    LOG_STD_MIN: float = -20.0
+    LOG_STD_MAX: float = 2.0
+
+    def initialize_carry(self, batch_seq_len: Tuple):
+        carry_shape = batch_seq_len + (self.args.recurrent_state_size,)
+        if self.args.recurrent_type == "gru":
+            return nn.GRUCell(
+                self.args.recurrent_state_size, parent=None
+            ).initialize_carry(jax.random.PRNGKey(0), carry_shape)
+        elif self.args.recurrent_type == "lstm":
+            return nn.OptimizedLSTMCell(
+                self.args.recurrent_state_size, parent=None
+            ).initialize_carry(jax.random.PRNGKey(0), carry_shape)
+
+    @nn.compact
+    def __call__(
+        self, state, carry
+    ) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
+        state_h = nn.Dense(self.args.encoder_hidden_size)(state)
+        state_h = nn.tanh(state_h)
+        if self.args.recurrent_type == "gru":
+            carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(
+                carry, state_h
+            )
+        elif self.args.recurrent_type == "lstm":
+            carry, out = nn.OptimizedLSTMCell(features=self.args.recurrent_state_size)(
+                carry, state_h
+            )
+
+        state_rnn_h = jnp.concatenate([out, state_h], axis=-1)
+        log_sigma = nn.Dense(
+            np.array(self.envs.single_action_space.shape).prod(),
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(state_rnn_h)
+
+        mu = nn.Dense(
+            np.array(self.envs.single_action_space.shape).prod(),
+            kernel_init=uniform_init(1e-3),
+            bias_init=uniform_init(1e-3),
+        )(state_rnn_h)
+
+        log_sigma = jax.lax.clamp(self.LOG_STD_MIN, log_sigma, self.LOG_STD_MAX)
+        return mu, log_sigma, carry
+
+
+@jax.jit
+def exploit(
+    agent_state: TrainState,
+    obs: jax.Array,
+    carry: jax.Array,
+) -> Tuple[jax.Array, jax.Array]:
+    mu, _, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    # action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
+    # return action_dist.mode(), carry
+    return mu, carry
+
+
+@jax.jit
+def sample_action_logprob(
+    agent_state: TrainState,
+    obs: jax.Array,
+    carry: jax.Array,
+    key: jax.random.PRNGKeyArray,
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
+    key, action_key = jax.random.split(key)
+    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
+    action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
+    return action, log_prob.reshape(-1, 1), carry, key
+
+
 def update_rl2_ppo(
     args,
     agent: RL2Policy,
     agent_state: TrainState,
     all_rollouts: List[Rollout],
     key: jax.random.PRNGKeyArray,
-):
+) -> Tuple[TrainState, dict]:
     @jax.jit
     def ppo_loss(
         params: FrozenDict,
@@ -357,28 +377,23 @@ def update_rl2_ppo(
         actions: jax.Array,
         advantages: jax.Array,
         log_probs: jax.Array,
-        returns: jax.Array,
-        subkey: jax.random.PRNGKeyArray,
     ) -> Tuple[jax.Array, dict]:
-        carry = agent.initialize_state(observations.shape[0])
-        mu, log_sigma, carry = agent_state.apply_fn(
-            params, observations, carry[:, None]
-        )
+        carry = agent.initialize_carry((observations.shape[0], 1))
+        mu, log_sigma, carry = agent_state.apply_fn(params, observations, carry)
         action_dist = distrax.MultivariateNormalDiag(
             loc=mu, scale_diag=jnp.exp(log_sigma)
         )
         newlog_prob = action_dist.log_prob(actions)
-        entropies = action_dist.entropy()
         logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
 
         pg_loss1 = advantages * ratio
-        pg_loss2 = advantages * jnp.clip(
-            ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef
+        pg_loss2 = advantages * jax.lax.clamp(
+            1.0 - args.clip_coef, ratio, 1.0 + args.clip_coef
         )
         pg_loss = -jnp.minimum(pg_loss1, pg_loss2).mean()
 
-        entropy_loss = entropies.mean()
+        entropy_loss = action_dist.entropy().mean()
         loss = pg_loss - args.ent_coef * entropy_loss
 
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -392,23 +407,20 @@ def update_rl2_ppo(
             "losses/clip_fraction": clip_fraction,
         }
 
-    for epoch in range(args.update_epochs):
+    for _ in range(args.update_epochs):
         key, subkey = jax.random.split(key)
-        # shuffle the rollouts
+        # shuffle the meta trials
         rollout_inds = jax.random.permutation(
             subkey, len(all_rollouts), independent=True
         )
         for i in rollout_inds:
             rollouts = all_rollouts[i]
-            key, subkey = jax.random.split(key)
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
                 rollouts.observations,
                 rollouts.actions,
                 rollouts.advantages,
                 rollouts.log_probs,
-                rollouts.returns,
-                subkey,
             )
             agent_state = agent_state.apply_gradients(grads=grads)
 
@@ -499,8 +511,6 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
 
-    NUM_CLASSES = len(benchmark.train_classes)
-
     # env setup
     envs, train_task_names = make_envs(
         benchmark,
@@ -526,32 +536,40 @@ if __name__ == "__main__":
 
     agent = RL2Policy(envs, args)
     fit_baseline = LinearFeatureBaseline.fit_baseline
+    dummy_carry = agent.initialize_carry((args.num_parallel_envs,))
+    print(
+        agent.tabulate(
+            agent_init_key,
+            obs,
+            dummy_carry,
+        )
+    )
     agent.apply = jax.jit(agent.apply)
     agent_state = TrainState.create(
         apply_fn=agent.apply,
-        params=agent.init(
-            agent_init_key,
-            obs,
-            jnp.zeros((args.num_parallel_envs, args.recurrent_state_size)),
-        ),
+        params=agent.init(agent_init_key, obs, dummy_carry),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.adam(learning_rate=args.learning_rate),
         ),
     )
 
+    if args.save_model:
+        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
+            max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
+        )
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        ckpt_manager = orbax.checkpoint.CheckpointManager(
+            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+        )
+
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
-
-    global_episodic_return = deque([], maxlen=20 * args.num_parallel_envs)
-    global_episodic_length = deque([], maxlen=20 * args.num_parallel_envs)
-
-    total_steps = 0
 
     envs.single_observation_space.dtype = np.float32
     buffer = MultiTaskRolloutBuffer(
         num_tasks=args.num_parallel_envs,
-        rollouts_per_task=args.num_episodes_per_env,
+        rollouts_per_task=args.num_episodes_per_trial,
         max_episode_steps=args.max_episode_steps,
     )
 
@@ -559,69 +577,52 @@ if __name__ == "__main__":
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
         "fit_baseline": fit_baseline,
-        "normalize_advantages": True,
+        "normalize_advantages": args.norm_adv,
     }
-
-    for global_step in range(int(args.total_timesteps // args.num_parallel_envs)):
-        # collect a trial of size meta_batch_size
-        # https://github.com/rlworkgroup/garage/blob/master/src/garage/sampler/default_worker.py
+    total_steps = 0
+    steps_per_iter = (
+        args.num_parallel_envs * args.num_episodes_per_trial * args.max_episode_steps
+    )
+    n_iters = int(args.total_timesteps // steps_per_iter)
+    for _iter in range(n_iters):
+        print(f"Iteration {_iter} {total_steps=}")
         meta_trials: List[Rollout] = []
-        for _ in range(args.num_episodes_per_env):
-            carry = agent.initialize_state(args.num_parallel_envs)
+        for _ in range(args.num_episodes_per_trial):
+            carry = agent.initialize_carry((args.num_parallel_envs,))
             while not buffer.ready:
-                total_steps += args.num_parallel_envs
                 action, logprob, carry, key = sample_action_logprob(
                     agent_state, obs, carry, key
                 )
                 action = jax.device_get(action)
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
+                total_steps += args.num_parallel_envs
 
                 buffer.push(
                     obs, action, reward, truncated, log_prob=jax.device_get(logprob)
                 )
                 obs = next_obs
 
-                # Only print when at least 1 env is done
-                if "final_info" not in infos:
-                    continue
-
-                for i, info in enumerate(infos["final_info"]):
-                    # Skip the envs that are not done
-                    if info is None:
-                        continue
-                    global_episodic_return.append(info["episode"]["r"])
-                    global_episodic_length.append(info["episode"]["l"])
-
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
             rollouts = buffer.get(**buffer_processing_kwargs)
             meta_trials.append(rollouts)
             buffer.reset()
 
-        if total_steps % 500 == 0 and global_episodic_return:
-            mean_ep_return = np.mean(global_episodic_return)
-            print(f"{total_steps=}, {mean_ep_return=}")
-            writer.add_scalar(
-                "charts/mean_episodic_return",
-                mean_ep_return,
-                total_steps,
-            )
-            writer.add_scalar(
-                "charts/mean_episodic_length",
-                np.mean(global_episodic_length),
-                total_steps,
-            )
+        mean_episodic_return = meta_trials[-1].episode_returns.mean()
+        writer.add_scalar(
+            "charts/mean_episodic_return", mean_episodic_return, total_steps
+        )
+        print(f"{total_steps=}, {mean_episodic_return=}")
 
         agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trials, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
-        if total_steps % args.eval_freq == 0 and global_step > 0:
+        if total_steps % args.eval_freq == 0 and total_steps > 0:
             num_evals = (
                 len(benchmark.test_classes) * args.num_evaluation_goals
             ) // args.num_parallel_envs
             print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
-                args,
                 agent,
                 agent_state,
                 eval_envs,
@@ -638,7 +639,6 @@ if __name__ == "__main__":
                 len(benchmark.train_classes) * args.num_evaluation_goals
             ) // args.num_parallel_envs
             _, _, train_success_per_task = rl2_evaluation(
-                args,
                 agent,
                 agent_state,
                 envs,
@@ -648,6 +648,17 @@ if __name__ == "__main__":
             for task_name, success_rate in train_success_per_task.items():
                 logs[f"charts/{task_name}_train_success_rate"] = float(success_rate)
             envs.call("toggle_terminate_on_success", False)
+
+            if args.save_model:
+                ckpt_manager.save(
+                    step=total_steps,
+                    items={
+                        "agent_state": agent_state,
+                        "key": key,
+                        "global_step": global_step,
+                    },
+                    metrics=logs,
+                )
 
         logs = jax.device_get(logs)
         for k, v in logs.items():
