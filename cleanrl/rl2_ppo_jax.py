@@ -655,7 +655,7 @@ if __name__ == "__main__":
                     items={
                         "agent_state": agent_state,
                         "key": key,
-                        "global_step": global_step,
+                        "total_steps": total_steps,
                     },
                     metrics=logs,
                 )
