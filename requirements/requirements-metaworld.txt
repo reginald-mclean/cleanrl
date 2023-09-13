@@ -7,4 +7,4 @@ wandb
 jax
 jaxlib
 distrax
-flax
+flax>=0.7.2

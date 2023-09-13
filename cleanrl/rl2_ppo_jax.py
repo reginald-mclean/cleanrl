@@ -55,7 +55,6 @@ def parse_args():
     parser.add_argument("--recurrent-state-size", type=int, default=64)
     parser.add_argument("--recurrent-type", type=str, default="gru")
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
-    parser.add_argument("--encoder-hidden-size", type=int, default=256)
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
@@ -70,18 +69,12 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--update-epochs", type=int, default=15,
+    parser.add_argument("--update-epochs", type=int, default=10,
         help="the K epochs to update the policy")
-    parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles advantages normalization")
     parser.add_argument("--clip-coef", type=float, default=0.2,
         help="the surrogate clipping coefficient")
-    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=2e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.5,
-        help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
 
@@ -218,21 +211,6 @@ def rl2_evaluation(
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                # TODO #
-                # reset states of finished episodes
-                # if args.recurrent_type == "gru":
-                #     carry = carry.at[:, i : i + 1].set(
-                #         np.random.random(carry[:, i : i + 1].shape)
-                #     )
-                # elif args.recurrent_type == "lstm":
-                #     t1 = carry[0].at[:, i : i + 1].set(
-                #         np.random.random(carry[0][:, i : i + 1].shape)
-                #     )
-                #     t2 = carry[1].at[:, i : i + 1].set(
-                #         np.random.random(carry[1][:, i : i + 1].shape)
-                #     )
-                #     carry = (t1,t2)
-
                 if task_names is not None:
                     episodic_returns[task_names[i]].append(
                         float(info["episode"]["r"][0])
@@ -309,29 +287,26 @@ class RL2Policy(nn.Module):
     def __call__(
         self, state, carry
     ) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
-        state_h = nn.Dense(self.args.encoder_hidden_size)(state)
-        state_h = nn.tanh(state_h)
         if self.args.recurrent_type == "gru":
             carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(
-                carry, state_h
+                carry, state
             )
         elif self.args.recurrent_type == "lstm":
             carry, out = nn.OptimizedLSTMCell(features=self.args.recurrent_state_size)(
-                carry, state_h
+                carry, state
             )
 
-        state_rnn_h = jnp.concatenate([out, state_h], axis=-1)
         log_sigma = nn.Dense(
             np.array(self.envs.single_action_space.shape).prod(),
             kernel_init=uniform_init(1e-3),
             bias_init=uniform_init(1e-3),
-        )(state_rnn_h)
+        )(out)
 
         mu = nn.Dense(
             np.array(self.envs.single_action_space.shape).prod(),
             kernel_init=uniform_init(1e-3),
             bias_init=uniform_init(1e-3),
-        )(state_rnn_h)
+        )(out)
 
         log_sigma = jax.lax.clamp(self.LOG_STD_MIN, log_sigma, self.LOG_STD_MAX)
         return mu, log_sigma, carry
@@ -367,7 +342,7 @@ def update_rl2_ppo(
     args,
     agent: RL2Policy,
     agent_state: TrainState,
-    all_rollouts: List[Rollout],
+    rollouts: Rollout,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[TrainState, dict]:
     @jax.jit
@@ -407,23 +382,15 @@ def update_rl2_ppo(
             "losses/clip_fraction": clip_fraction,
         }
 
-    for _ in range(args.update_epochs):
-        key, subkey = jax.random.split(key)
-        # shuffle the meta trials
-        rollout_inds = jax.random.permutation(
-            subkey, len(all_rollouts), independent=True
+    for i in range(args.update_epochs):
+        grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
+            agent_state.params,
+            rollouts.observations,
+            rollouts.actions,
+            rollouts.advantages,
+            rollouts.log_probs,
         )
-        for i in rollout_inds:
-            rollouts = all_rollouts[i]
-            grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
-                agent_state.params,
-                rollouts.observations,
-                rollouts.actions,
-                rollouts.advantages,
-                rollouts.log_probs,
-            )
-            agent_state = agent_state.apply_gradients(grads=grads)
-
+        agent_state = agent_state.apply_gradients(grads=grads)
     return agent_state, aux_metrics
 
 
@@ -577,44 +544,43 @@ if __name__ == "__main__":
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
         "fit_baseline": fit_baseline,
-        "normalize_advantages": args.norm_adv,
+        "normalize_advantages": False,
     }
     total_steps = 0
     steps_per_iter = (
-        args.num_parallel_envs * args.num_episodes_per_trial * args.max_episode_steps
+        args.num_parallel_envs
+        * args.num_episodes_per_trial
+        * args.max_episode_steps
     )
     n_iters = int(args.total_timesteps // steps_per_iter)
     for _iter in range(n_iters):
         print(f"Iteration {_iter} {total_steps=}")
-        meta_trials: List[Rollout] = []
-        for _ in range(args.num_episodes_per_trial):
-            carry = agent.initialize_carry((args.num_parallel_envs,))
-            while not buffer.ready:
-                action, logprob, carry, key = sample_action_logprob(
-                    agent_state, obs, carry, key
-                )
-                action = jax.device_get(action)
-                # TRY NOT TO MODIFY: execute the game and log data.
-                next_obs, reward, terminated, truncated, infos = envs.step(action)
-                total_steps += args.num_parallel_envs
+        carry = agent.initialize_carry((args.num_parallel_envs,))
+        while not buffer.ready:
+            action, logprob, carry, key = sample_action_logprob(
+                agent_state, obs, carry, key
+            )
+            action = jax.device_get(action)
+            # TRY NOT TO MODIFY: execute the game and log data.
+            next_obs, reward, terminated, truncated, infos = envs.step(action)
+            total_steps += args.num_parallel_envs
 
-                buffer.push(
-                    obs, action, reward, truncated, log_prob=jax.device_get(logprob)
-                )
-                obs = next_obs
+            buffer.push(
+                obs, action, reward, truncated, log_prob=jax.device_get(logprob)
+            )
+            obs = next_obs
 
-            # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-            rollouts = buffer.get(**buffer_processing_kwargs)
-            meta_trials.append(rollouts)
-            buffer.reset()
+        # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
+        rollouts = buffer.get(**buffer_processing_kwargs)
+        buffer.reset()
 
-        mean_episodic_return = meta_trials[-1].episode_returns.mean()
+        mean_episodic_return = rollouts.episode_returns.mean()
         writer.add_scalar(
             "charts/mean_episodic_return", mean_episodic_return, total_steps
         )
         print(f"{total_steps=}, {mean_episodic_return=}")
 
-        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trials, key)
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, rollouts, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
