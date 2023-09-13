@@ -52,6 +52,7 @@ def parse_args():
                         help="the number of parallel envs used to collect data")
     parser.add_argument("--num-episodes-per-trial", type=int, default=20,
                         help="the number episodes collected for each env before training, the trial size")
+    parser.add_argument("--mini-batch-size", type=int, default=32)
     parser.add_argument("--recurrent-state-size", type=int, default=64)
     parser.add_argument("--recurrent-type", type=str, default="gru")
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -382,15 +383,24 @@ def update_rl2_ppo(
             "losses/clip_fraction": clip_fraction,
         }
 
+    number_batches = int(
+        np.ceil(rollouts.actions.shape[1] * 1.0 / args.mini_batch_size)
+    )
+    b_inds = np.arange(rollouts.actions.shape[1])
+
     for i in range(args.update_epochs):
-        grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
-            agent_state.params,
-            rollouts.observations,
-            rollouts.actions,
-            rollouts.advantages,
-            rollouts.log_probs,
-        )
-        agent_state = agent_state.apply_gradients(grads=grads)
+        for itr in range(number_batches):
+            batch_start = itr * args.mini_batch_size
+            batch_end = (itr + 1) * args.mini_batch_size
+            batch_ids = b_inds[batch_start:batch_end]
+            grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
+                agent_state.params,
+                rollouts.observations[:, batch_ids],
+                rollouts.actions[:, batch_ids],
+                rollouts.advantages[:, batch_ids],
+                rollouts.log_probs[:, batch_ids],
+            )
+            agent_state = agent_state.apply_gradients(grads=grads)
     return agent_state, aux_metrics
 
 
@@ -548,9 +558,7 @@ if __name__ == "__main__":
     }
     total_steps = 0
     steps_per_iter = (
-        args.num_parallel_envs
-        * args.num_episodes_per_trial
-        * args.max_episode_steps
+        args.num_parallel_envs * args.num_episodes_per_trial * args.max_episode_steps
     )
     n_iters = int(args.total_timesteps // steps_per_iter)
     for _iter in range(n_iters):
