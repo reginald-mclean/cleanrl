@@ -31,7 +31,7 @@ from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
 from metaworld.envs import ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE
 from cleanrl_utils.evals.meta_world_eval_protocol import eval
-
+import json
 
 def parse_args():
     # fmt: off
@@ -495,7 +495,7 @@ if __name__ == "__main__":
         )
 
         NUM_TASKS = len(benchmark.train_classes)
-        print(NUM_TASKS)
+        #print(NUM_TASKS)
         obs, _ = envs1.reset()
         key = jax.random.PRNGKey(seed)
         key, agent_init_key = jax.random.split(key)
@@ -509,17 +509,17 @@ if __name__ == "__main__":
             clip_grad_norm=args.clip_grad_norm,
             init_key=key,
         )
-        print(env_name)
+        #print(env_name)
         ckpt = ckpt_manager.restore(step=load_checkpoint[env_name][0], directory=load_checkpoint[env_name][1])
         agent1.actor = agent1.actor.replace(params=ckpt["actor"]['params'])
         agent1.critic = agent1.critic.replace(params=ckpt["critic"]['params'])
         agent1.alpha_train_state = agent1.alpha_train_state.replace(params=ckpt["alpha"]['params'])
         #print(ckpt["actor"])
         for e_name2, seed2 in list(zip(env_names, seeds)):
-            print(env_name, e_name2)
             if env_name == e_name2:
                 continue
-            benchmark2 = metaworld.MT1(env_name, seed=seed2)
+            print(env_name, e_name2)
+            benchmark2 = metaworld.MT1(e_name2, seed=seed2)
             #benchmark._train_tasks = benchmark.train_tasks[0]
             use_one_hot_wrapper = True
             envs2 = make_envs(
@@ -527,8 +527,8 @@ if __name__ == "__main__":
             )
 
             NUM_TASKS = len(benchmark.train_classes)
-            print(NUM_TASKS)
-            print(e_name2, seed2)
+            #print(NUM_TASKS)
+            #print(e_name2, seed2)
             obs, _ = envs2.reset()
             key2 = jax.random.PRNGKey(seed2)
             key2, agent_init_key = jax.random.split(key2)
@@ -563,22 +563,35 @@ if __name__ == "__main__":
                         done1 = int(info1['success'][0]) == 1
                         obs1 = next1
                         if done1:
-                            print(f'done1 at count {count}')
+                            print(f'{env_name} done1 at count {count}')
                     if not done2:
                         a2 = agent2.get_action_eval(obs2)
                         next2, reward2, trunc2, term2, info2 = envs2.step(a2)
-                        if 'success' in info2:
-                            print(info2['success'][0], count)
-                            store_dict[env_name + ' ' + e_name2][e_name2][count].append([a2, obs2, next2, reward2, trunc2, term2, info2, int(info2['success'][0])==1])
-                            done2 = int(info2['success'][0]) == 1
+                        #if 'success' in info2:
+                        #print(info2['success'][0], count)
+                        store_dict[env_name + ' ' + e_name2][e_name2][count].append([a2, obs2, next2, reward2, trunc2, term2, info2, int(info2['success'][0])==1])
+                        done2 = int(info2['success'][0]) == 1
                         obs2 = next2
                         if done2:
-                            print(f'done2 at count {count}')
+                            print(f'{e_name2} done2 at count {count}')
                     count += 1
 
+data = json.dumps(store_dict)
+with open('mtmhsac_jax_trajectories.json', 'w') as f:
+    f.write(data)
 
+data2 = None
+with open('mtmhsac_jax_trajectories.json') as f:
+    data2 = f.read()
 
-
-
-
-
+def findDiff(d1, d2, path=""):
+    for k in d1:
+        if k in d2:
+            if type(d1[k]) is dict:
+                findDiff(d1[k],d2[k], "%s -> %s" % (path, k) if path else k)
+            if d1[k] != d2[k]:
+                result = [ "%s: " % path, " - %s : %s" % (k, d1[k]) , " + %s : %s" % (k, d2[k])]
+                print("\n".join(result))
+        else:
+            print ("%s%s as key not in d2\n" % ("%s: " % path if path else "", k))
+findDiff(data, data1)
