@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=1280,
         help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=200_000,
@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
-    parser.add_argument("--clip-grad-norm", type=float, default=1,
+    parser.add_argument("--clip-grad-norm", type=float, default=0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="256,256", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="256,256", help="The architecture of the critic network")
@@ -168,11 +168,9 @@ def get_deterministic_action(
     actor: TrainState,
     obs: ArrayLike,
     task_ids: ArrayLike,
-) -> jax.Array:
-    print(type(actor))
-    print(actor.params)
+):
     dist = actor.apply_fn(actor.params, obs, task_ids)
-    return jnp.tanh(dist.distribution.mean())
+    return jnp.tanh(dist.distribution.mean()), dist
 
 
 @jax.jit
@@ -321,8 +319,8 @@ class Agent:
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions = get_deterministic_action(self.actor, state, task_id)
-        return jax.device_get(actions)
+        actions, dist = get_deterministic_action(self.actor, state, task_id)
+        return jax.device_get(actions), jax.device_get(dist)
 
     @staticmethod
     @jax.jit
@@ -459,205 +457,121 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    if args.save_model:  # Orbax checkpoints
-        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
-            max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
-        )
-        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
-        )
+    #if args.save_model:  # Orbax checkpoints
+    ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
+        max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
+    )
+    checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    ckpt_manager = orbax.checkpoint.CheckpointManager(
+        f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+    )
 
-    # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    key = jax.random.PRNGKey(args.seed)
+    env_names = ['push-v2', 'door-open-v2', 'peg-insert-side-v2', 'button-press-topdown-v2', 'window-open-v2', 'window-close-v2', 'drawer-close-v2', 'drawer-open-v2'] # , 'pick-place-v2', reach-v2]
+    seeds = [432, 8123, 1029385, 765, 345, 234, 654, 986] # , 1, 4212]
+    load_checkpoint = dict()
+    #load_checkpoint['reach-v2'] =(4800000, "/home/reginaldkmclean/cleanrl/runs/MT1__mtmhsac_jax__1__1694616820/checkpoints") 
+    load_checkpoint['push-v2'] = (400000, "/home/reginaldkmclean/cleanrl/runs/MT1__push__432__1694623435/checkpoints")
+    load_checkpoint['door-open-v2'] = (200000, "/home/reginaldkmclean/cleanrl/runs/MT1__mtmhsac_jax__8123__1694616784/checkpoints")
+    load_checkpoint['peg-insert-side-v2'] = (1400000, "/home/reginaldkmclean/cleanrl/runs/MT1__mtmhsac_jax__1029385__1694481752/checkpoints")
+    load_checkpoint['button-press-topdown-v2'] = (200000, "/home/reginaldkmclean/cleanrl/runs/MT1__button-press-topdown__765__1694623425/checkpoints/")
+    load_checkpoint['window-open-v2'] = (200000, "/home/reginaldkmclean/cleanrl/runs/MT1__window-open__345__1694623401/checkpoints")
+    load_checkpoint['window-close-v2'] = (200000, "/home/reginaldkmclean/cleanrl/runs/MT1__window-close__234__1694623411/checkpoints")
+    load_checkpoint['drawer-close-v2'] = (200000, "/home/reginaldkmclean/cleanrl/runs/MT1__drawer-close__654__1694623380/checkpoints")
+    load_checkpoint['drawer-open-v2'] = (2200000, "/home/reginaldkmclean/cleanrl/runs/MT1__drawer-open__986__1694623389/checkpoints")
 
-    # env setup
-    if args.env_id == "MT10":
-        benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == "MT50":
-        benchmark = metaworld.MT50(seed=args.seed)
-    else:
-        assert args.env_name != "", "Must pass a environment name for MT1"
-        benchmark = metaworld.MT1(args.env_name, seed=args.seed)
+    store_dict = dict()
+
+    #load_checkpoint['pick-place-v2'] = (, "/home/reginaldkmclean/cleanrl/)
+    #ckpt = ckpt_manager.restore(step=200000, directory="/home/reginaldkmclean/cleanrl/runs/MT1__button-press-topdown__765__1694623425/checkpoints/")
+    #agent.actor = ckpt["actor"]
+    #agent.critic = ckpt["critic"]
+    #agent.alpha_train_state = ckpt["alpha"]
+    for env_name, seed in list(zip(env_names, seeds)):
+        benchmark = metaworld.MT1(env_name, seed=seed)
         #benchmark._train_tasks = benchmark.train_tasks[0]
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id or "MT1" in args.env_id else False
-    )
-    envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-    )
-    eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-    )
+        use_one_hot_wrapper = True
+        envs1 = make_envs(
+            benchmark, seed, 500, use_one_hot=use_one_hot_wrapper, terminate_on_success=False
+        )
 
-    NUM_TASKS = len(benchmark.train_classes)
-    print(NUM_TASKS)
-    assert isinstance(
-       envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
-
-    # agent setup
-    rb = MultiTaskReplayBuffer(
-        total_capacity=args.buffer_size,
-        num_tasks=NUM_TASKS,
-        envs=envs,
-        use_torch=False,
-        seed=args.seed,
-    )
-
-    global_episodic_return: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
-    global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
-    
-    obs, _ = envs.reset()
-
-    key, agent_init_key = jax.random.split(key)
-    agent = Agent(
-        init_obs=obs,
-        num_tasks=NUM_TASKS,
-        action_space=envs.single_action_space,
-        policy_lr=args.policy_lr,
-        q_lr=args.q_lr,
-        gamma=args.gamma,
-        clip_grad_norm=args.clip_grad_norm,
-        init_key=key,
-    )
-    eval(writer, eval_envs, args.env_name, agent, 50,  'cuda:0', 0)
-    obs, _ = envs.reset()
-    start_time = time.time()
-
-    # TRY NOT TO MODIFY: start the game
-    for global_step in range(args.total_timesteps // NUM_TASKS):
-        total_steps = global_step * NUM_TASKS
-
-        # ALGO LOGIC: put action logic here
-        if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
-            )
-        else:
-            actions, key = agent.get_action_train(obs, key)
-
-        # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                # Skip the envs that are not done
-                if info is None:
-                    continue
-                global_episodic_return.append(info["episode"]["r"])
-                global_episodic_length.append(info["episode"]["l"])
-
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
-        real_next_obs = next_obs.copy()
-        for idx, d in enumerate(truncations):
-            if d:
-                real_next_obs[idx] = infos["final_observation"][idx]
-
-        # Store data in the buffer
-        rb.add(obs, real_next_obs, actions, rewards, terminations)
-
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-        obs = next_obs
-
-        if global_step % 500 == 0 and global_episodic_return:
-            print(
-                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
-            )
-            writer.add_scalar(
-                "charts/mean_episodic_return",
-                np.mean(list(global_episodic_return)),
-                total_steps,
-            )
-            writer.add_scalar(
-                "charts/mean_episodic_length",
-                np.mean(list(global_episodic_length)),
-                total_steps,
+        NUM_TASKS = len(benchmark.train_classes)
+        print(NUM_TASKS)
+        obs, _ = envs1.reset()
+        key = jax.random.PRNGKey(seed)
+        key, agent_init_key = jax.random.split(key)
+        agent = Agent(
+            init_obs=obs,
+            num_tasks=NUM_TASKS,
+            action_space=envs1.single_action_space,
+            policy_lr=args.policy_lr,
+            q_lr=args.q_lr,
+            gamma=args.gamma,
+            clip_grad_norm=args.clip_grad_norm,
+            init_key=key,
+        )
+        ckpt = ckpt_manager.restore(step=load_checkpoint[env_name][0], directory=load_checkpoint[env_name][1])
+        agent.actor = ckpt["actor"]
+        agent.critic = ckpt["critic"]
+        agent.alpha_train_state = ckpt["alpha"]
+        for e_name2, seed2 in list(zip(env_names, seeds)):
+            
+            if env_name == e_name2:
+                continue
+            benchmark = metaworld.MT1(env_name, seed=seed)
+            #benchmark._train_tasks = benchmark.train_tasks[0]
+            use_one_hot_wrapper = True
+            envs2 = make_envs(
+                benchmark, seed, 500, use_one_hot=use_one_hot_wrapper, terminate_on_success=False
             )
 
-        # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
-            # Sample a batch from replay buffer
-            for i in range(1):
-                data = rb.sample(args.batch_size)
-                observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-                next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-                batch = Batch(
-                    observations,
-                    data.actions,
-                    data.rewards,
-                    next_observations,
-                    data.dones,
-                    task_ids,
-                )
+            NUM_TASKS = len(benchmark.train_classes)
+            print(NUM_TASKS)
+            obs, _ = envs2.reset()
+            key = jax.random.PRNGKey(seed2)
+            key2, agent_init_key = jax.random.split(key)
+            agent2 = Agent(
+                init_obs=obs,
+                num_tasks=NUM_TASKS,
+                action_space=envs2.single_action_space,
+                policy_lr=args.policy_lr,
+                q_lr=args.q_lr,
+                gamma=args.gamma,
+                clip_grad_norm=args.clip_grad_norm,
+                init_key=key2,
+            )
+            ckpt2 = ckpt_manager.restore(step=load_checkpoint[e_name2][0], directory=load_checkpoint[e_name2][1])
+            agent2.actor = ckpt2["actor"]
+            agent2.critic = ckpt2["critic"]
+            agent2.alpha_train_state = ckpt2["alpha"]
+            store_dict[env_name + ' ' + e_name2] = dict()
+            store_dict[env_name + ' ' + e_name2][env_name] = {i: [] for i in range(500)}
+            store_dict[env_name + ' ' + e_name2][e_name2] = {i: [] for i in range(500)}
+        
+            done1 = False
+            done2 = False
+            count = 0
+            obs1, _ = envs1.reset()
+            obs2, _ = envs2.reset() 
 
-            # Update agent
-                (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
-                    agent.actor,
-                    agent.critic,
-                    agent.alpha_train_state,
-                    batch,
-                    agent.target_entropy,
-                    args.gamma,
-                    key,
-                )
-                logs = jax.device_get(logs)
+            while not done1 and not done2:
+                if not done1:
+                    a1, dist1 = agent1.get_action_eval(obs1)
+                    next1, reward1, trunc1, term1, info1 = envs1.step(a1)
+                    store_dict[env_name + ' ' + e_name2][env_name][count].append([a1, dist1, obs1, next1, reward1, trunc1, term1, info1, int(info1['success'])==1])
+                    done1 = int(info1['success']) == 1
+                    obs1 = next1
+                if not done2:
+                    a2, dist2 = agent2.get_action_eval(obs2)
+                    next2, reward2, trunc2, term2, info2 = envs2.step(a2)
+                    store_dict[env_name + ' ' + e_name2][e_name2][count].append([a2, dist2, obs2, next2, reward2, trunc2, term2, info2, int(info2['success'])==1])
+                    done2 = int(info2['success']) == 1
+                    obs2 = next2
+                count += 1
+            print(store_dict[env_name + ' ' + e_name2])
 
-            # update the target networks
-            if global_step % args.target_network_frequency == 0:
-                agent.soft_update_target_networks(args.tau)
 
-            # Logging
-            if global_step % 100 == 0:
-                for _key, value in logs.items():
-                    writer.add_scalar(_key, value, total_steps)
-                print("SPS:", int(total_steps / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(total_steps / (time.time() - start_time)),
-                    total_steps,
-                )
 
-            # Evaluation
-            if total_steps % args.evaluation_frequency == 0:
-                #eval_success_rate, eval_returns, eval_success_per_task = evaluation(
-                #    agent=agent,
-                #    eval_envs=eval_envs,
-                #    num_episodes=args.evaluation_num_episodes,
-                #)
-                eval(writer, eval_envs, args.env_name, agent, 50,  'cuda:0', total_steps)
-                #eval_metrics = {
-                #    "charts/mean_success_rate": float(eval_success_rate),
-                #    "charts/mean_evaluation_return": float(eval_returns),
-                #}
-                # | {
-                #    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-                #    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
-                #}
 
-                #for k, v in eval_metrics.items():
-                #    writer.add_scalar(k, v, total_steps)
-                #print(
-                #    f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
-                #    + f" return: {eval_returns:.4f}"
-                #)
 
-                # Checkpointing
-                if args.save_model:
-                    ckpt = agent.get_ckpt()
-                    ckpt["rng_key"] = key
-                    ckpt["global_step"] = global_step
-                    save_args = orbax_utils.save_args_from_target(ckpt)
-                    ckpt_manager.save(
-                        step=global_step,
-                        items=ckpt,
-                        save_kwargs={"save_args": save_args},
-                        metrics=None,
-                    )
-                    print(f"model saved to {ckpt_manager.directory}")
 
-    envs.close()
-    writer.close()
+
