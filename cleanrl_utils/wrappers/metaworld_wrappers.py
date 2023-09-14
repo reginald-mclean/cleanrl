@@ -416,6 +416,6 @@ class RL2Env(gym.Wrapper):
         return rl2_next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):
-        obs, info = super().reset(seed=seed, options=options)
+        obs, info = self.env.reset(seed=seed, options=options)
         rl2_obs = np.concatenate([obs, np.zeros(self.env.action_space.shape), [0], [0]])
         return rl2_obs, info

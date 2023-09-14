@@ -62,10 +62,8 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=15e6,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=1e-3,
         help="the learning rate of the optimizer")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
@@ -387,18 +385,16 @@ def update_rl2_ppo(
         np.ceil(rollouts.actions.shape[1] * 1.0 / args.mini_batch_size)
     )
     b_inds = np.arange(rollouts.actions.shape[1])
-
+    mb_inds_lst = np.array_split(b_inds, number_batches)
     for i in range(args.update_epochs):
-        for itr in range(number_batches):
-            batch_start = itr * args.mini_batch_size
-            batch_end = (itr + 1) * args.mini_batch_size
-            batch_ids = b_inds[batch_start:batch_end]
+        np.random.shuffle(mb_inds_lst)
+        for mb_inds in mb_inds_lst:
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                rollouts.observations[:, batch_ids],
-                rollouts.actions[:, batch_ids],
-                rollouts.advantages[:, batch_ids],
-                rollouts.log_probs[:, batch_ids],
+                rollouts.observations[:, mb_inds],
+                rollouts.actions[:, mb_inds],
+                rollouts.advantages[:, mb_inds],
+                rollouts.log_probs[:, mb_inds],
             )
             agent_state = agent_state.apply_gradients(grads=grads)
     return agent_state, aux_metrics
