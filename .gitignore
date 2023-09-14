@@ -8,7 +8,7 @@ cleanrl/ppo_continuous_action_isaacgym/isaacgym/setup.py
 
 Metaworld
 *.pth
-
+MT1_*
 IsaacGym_Preview_3_Package.tar.gz
 IsaacGym_Preview_4_Package.tar.gz
 cleanrl_hpopt.db

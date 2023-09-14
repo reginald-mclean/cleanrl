@@ -653,7 +653,7 @@ if __name__ == "__main__":
                         step=global_step,
                         items=ckpt,
                         save_kwargs={"save_args": save_args},
-                        metrics=eval_metrics,
+                        metrics=None,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
 
