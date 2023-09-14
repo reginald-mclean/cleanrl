@@ -170,7 +170,7 @@ def get_deterministic_action(
     task_ids: ArrayLike,
 ):
     dist = actor.apply_fn(actor.params, obs, task_ids)
-    return jnp.tanh(dist.distribution.mean())
+    return jnp.tanh(dist.distribution.mean()), dist
 
 
 @jax.jit
@@ -319,8 +319,8 @@ class Agent:
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions = get_deterministic_action(self.actor, state, task_id)
-        return jax.device_get(actions) 
+        actions, dist = get_deterministic_action(self.actor, state, task_id)
+        return jax.device_get(actions), dist 
 
     @staticmethod
     @jax.jit
@@ -557,19 +557,19 @@ if __name__ == "__main__":
                 obs2, _ = envs2.reset() 
                 while (not done1 or not done2) and count < 500:
                     if not done1:
-                        a1 = agent1.get_action_eval(obs1)
+                        a1, dist1 = agent1.get_action_eval(obs1)
                         next1, reward1, trunc1, term1, info1 = envs1.step(a1)
-                        store_dict[env_name + ' ' + e_name2][env_name][count].append([a1, obs1, next1, reward1, trunc1, term1, info1, int(info1['success'][0])==1])
+                        store_dict[env_name + ' ' + e_name2][env_name][count].append([a1, dist1, obs1, next1, reward1, trunc1, term1, info1, int(info1['success'][0])==1])
                         done1 = int(info1['success'][0]) == 1
                         obs1 = next1
                         if done1:
                             print(f'{env_name} done1 at count {count}')
                     if not done2:
-                        a2 = agent2.get_action_eval(obs2)
+                        a2, dist2 = agent2.get_action_eval(obs2)
                         next2, reward2, trunc2, term2, info2 = envs2.step(a2)
                         #if 'success' in info2:
                         #print(info2['success'][0], count)
-                        store_dict[env_name + ' ' + e_name2][e_name2][count].append([a2, obs2, next2, reward2, trunc2, term2, info2, int(info2['success'][0])==1])
+                        store_dict[env_name + ' ' + e_name2][e_name2][count].append([a2, dist2, obs2, next2, reward2, trunc2, term2, info2, int(info2['success'][0])==1])
                         done2 = int(info2['success'][0]) == 1
                         obs2 = next2
                         if done2:
