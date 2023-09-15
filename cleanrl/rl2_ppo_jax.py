@@ -52,7 +52,7 @@ def parse_args():
                         help="the number of parallel envs used to collect data")
     parser.add_argument("--num-episodes-per-trial", type=int, default=20,
                         help="the number episodes collected for each env before training, the trial size")
-    parser.add_argument("--mini-batch-size", type=int, default=32)
+    parser.add_argument("--mini-batch-size", type=int, default=1000)
     parser.add_argument("--recurrent-state-size", type=int, default=64)
     parser.add_argument("--recurrent-type", type=str, default="gru")
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -60,9 +60,9 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=15e6,
+    parser.add_argument("--total-timesteps", type=int, default=25e6,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=1e-3,
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
@@ -74,7 +74,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--ent-coef", type=float, default=2e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--max-grad-norm", type=float, default=0.5,
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
         help="the maximum norm for the gradient clipping")
 
     parser.add_argument("--eval-freq", type=int, default=100_000,
