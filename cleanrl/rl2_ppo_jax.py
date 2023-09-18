@@ -83,7 +83,7 @@ def parse_args():
         help="the number episodes to run per evaluation")
     parser.add_argument("--num-evaluation-goals", type=int, default=10,
         help="the number of goal positions to evaluate on per test task")
-    parser.add_argument("--target-kl", type=float, default=0.01,
+    parser.add_argument("--target-kl", default=0.01,
                         help="the target KL divergence threshold")
 
     args = parser.parse_args()
