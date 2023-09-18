@@ -52,7 +52,7 @@ def parse_args():
                         help="the number of parallel envs used to collect data")
     parser.add_argument("--num-episodes-per-trial", type=int, default=20,
                         help="the number episodes collected for each env before training, the trial size")
-    parser.add_argument("--mini-batch-size", type=int, default=1000)
+    parser.add_argument("--trial-batch-size", type=int, default=8)
     parser.add_argument("--recurrent-state-size", type=int, default=64)
     parser.add_argument("--recurrent-type", type=str, default="gru")
     parser.add_argument("--recurrent-num-layers", type=int, default=1)
@@ -72,7 +72,7 @@ def parse_args():
         help="the K epochs to update the policy")
     parser.add_argument("--clip-coef", type=float, default=0.2,
         help="the surrogate clipping coefficient")
-    parser.add_argument("--ent-coef", type=float, default=2e-3,
+    parser.add_argument("--ent-coef", type=float, default=2e-2,
         help="coefficient of the entropy")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
         help="the maximum norm for the gradient clipping")
@@ -343,7 +343,7 @@ def update_rl2_ppo(
     args,
     agent: RL2Policy,
     agent_state: TrainState,
-    rollouts: Rollout,
+    meta_rollouts: Rollout,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[TrainState, dict]:
     @jax.jit
@@ -385,20 +385,20 @@ def update_rl2_ppo(
             "losses/clip_fraction": clip_fraction,
         }
 
-    number_batches = int(
-        np.ceil(rollouts.actions.shape[1] * 1.0 / args.mini_batch_size)
-    )
-    b_inds = np.arange(rollouts.actions.shape[1])
-    mb_inds_lst = np.array_split(b_inds, number_batches)
-    for i in range(args.update_epochs):
-        np.random.shuffle(mb_inds_lst)
-        for mb_inds in mb_inds_lst:
+    for _ in range(args.update_epochs):
+        key, subkey = jax.random.split(key)
+        # shuffle batch of the meta trials
+        rollout_inds = jax.random.permutation(
+            subkey, len(meta_rollouts), independent=True
+        )
+        for i in rollout_inds:
+            rollouts = meta_rollouts[i]
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
-                rollouts.observations[:, mb_inds],
-                rollouts.actions[:, mb_inds],
-                rollouts.advantages[:, mb_inds],
-                rollouts.log_probs[:, mb_inds],
+                rollouts.observations,
+                rollouts.actions,
+                rollouts.advantages,
+                rollouts.log_probs,
             )
             agent_state = agent_state.apply_gradients(grads=grads)
 
@@ -562,37 +562,43 @@ if __name__ == "__main__":
     }
     total_steps = 0
     steps_per_iter = (
-        args.num_parallel_envs * args.num_episodes_per_trial * args.max_episode_steps
+        args.num_parallel_envs
+        * args.num_episodes_per_trial
+        * args.max_episode_steps
+        * args.trial_batch_size
     )
     n_iters = int(args.total_timesteps // steps_per_iter)
     for _iter in range(n_iters):
         print(f"Iteration {_iter} {total_steps=}")
-        carry = agent.initialize_carry((args.num_parallel_envs,))
-        while not buffer.ready:
-            action, logprob, carry, key = sample_action_logprob(
-                agent_state, obs, carry, key
-            )
-            action = jax.device_get(action)
-            # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminated, truncated, infos = envs.step(action)
-            total_steps += args.num_parallel_envs
+        meta_trial_batch: List[Rollout] = []
+        for _ in range(args.trial_batch_size):
+            carry = agent.initialize_carry((args.num_parallel_envs,))
+            while not buffer.ready:
+                action, logprob, carry, key = sample_action_logprob(
+                    agent_state, obs, carry, key
+                )
+                action = jax.device_get(action)
+                # TRY NOT TO MODIFY: execute the game and log data.
+                next_obs, reward, terminated, truncated, infos = envs.step(action)
+                total_steps += args.num_parallel_envs
 
-            buffer.push(
-                obs, action, reward, truncated, log_prob=jax.device_get(logprob)
-            )
-            obs = next_obs
+                buffer.push(
+                    obs, action, reward, truncated, log_prob=jax.device_get(logprob)
+                )
+                obs = next_obs
 
-        # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
-        rollouts = buffer.get(**buffer_processing_kwargs)
-        buffer.reset()
+            # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
+            rollouts = buffer.get(**buffer_processing_kwargs)
+            meta_trial_batch.append(rollouts)
+            buffer.reset()
 
-        mean_episodic_return = rollouts.episode_returns.mean()
+        mean_episodic_return = meta_trial_batch[-1].episode_returns.mean()
         writer.add_scalar(
             "charts/mean_episodic_return", mean_episodic_return, total_steps
         )
         print(f"{total_steps=}, {mean_episodic_return=}")
 
-        agent_state, logs = update_rl2_ppo(args, agent, agent_state, rollouts, key)
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial_batch, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
