@@ -74,7 +74,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--ent-coef", type=float, default=2e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+    parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
 
     parser.add_argument("--eval-freq", type=int, default=100_000,
