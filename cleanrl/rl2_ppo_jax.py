@@ -83,6 +83,8 @@ def parse_args():
         help="the number episodes to run per evaluation")
     parser.add_argument("--num-evaluation-goals", type=int, default=10,
         help="the number of goal positions to evaluate on per test task")
+    parser.add_argument("--target-kl", type=float, default=0.01,
+                        help="the target KL divergence threshold")
 
     args = parser.parse_args()
     # fmt: on
@@ -361,6 +363,10 @@ def update_rl2_ppo(
         logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
 
+        old_approx_kl = (-logratio).mean()
+        approx_kl = ((ratio - 1.0) - logratio).mean()
+        clip_fraction = (jnp.absolute(ratio - 1.0) > args.clip_coef).mean()
+
         pg_loss1 = advantages * ratio
         pg_loss2 = advantages * jax.lax.clamp(
             1.0 - args.clip_coef, ratio, 1.0 + args.clip_coef
@@ -370,14 +376,12 @@ def update_rl2_ppo(
         entropy_loss = action_dist.entropy().mean()
         loss = pg_loss - args.ent_coef * entropy_loss
 
-        approx_kl = ((ratio - 1) - logratio).mean()
-        clip_fraction = (jnp.absolute(ratio - 1) > args.clip_coef).mean()
-
         return loss, {
             "losses/loss": loss,
             "losses/pg_loss": pg_loss,
             "losses/entropy_loss": entropy_loss,
             "losses/approx_kl": approx_kl,
+            "losses/old_approx_kl": old_approx_kl,
             "losses/clip_fraction": clip_fraction,
         }
 
@@ -397,6 +401,10 @@ def update_rl2_ppo(
                 rollouts.log_probs[:, mb_inds],
             )
             agent_state = agent_state.apply_gradients(grads=grads)
+
+        if args.target_kl is not None:
+            if aux_metrics["losses/approx_kl"] > args.target_kl:
+                break
     return agent_state, aux_metrics
 
 
