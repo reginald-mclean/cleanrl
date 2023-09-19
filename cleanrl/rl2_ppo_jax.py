@@ -83,8 +83,8 @@ def parse_args():
         help="the number episodes to run per evaluation")
     parser.add_argument("--num-evaluation-goals", type=int, default=10,
         help="the number of goal positions to evaluate on per test task")
-    parser.add_argument("--target-kl", default=0.01,
-                        help="the target KL divergence threshold")
+    parser.add_argument("--target-kl", type=float, default=None,
+        help="the target KL divergence threshold")
 
     args = parser.parse_args()
     # fmt: on
@@ -403,7 +403,7 @@ def update_rl2_ppo(
             agent_state = agent_state.apply_gradients(grads=grads)
 
         if args.target_kl is not None:
-            if aux_metrics["losses/approx_kl"].item() > float(args.target_kl):
+            if aux_metrics["losses/approx_kl"].item() > args.target_kl:
                 break
     return agent_state, aux_metrics
 
