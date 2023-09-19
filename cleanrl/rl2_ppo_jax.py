@@ -403,7 +403,7 @@ def update_rl2_ppo(
             agent_state = agent_state.apply_gradients(grads=grads)
 
         if args.target_kl is not None:
-            if aux_metrics["losses/approx_kl"] > args.target_kl:
+            if aux_metrics["losses/approx_kl"].item() > args.target_kl:
                 break
     return agent_state, aux_metrics
 
