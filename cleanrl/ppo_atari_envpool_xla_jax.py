@@ -4,16 +4,16 @@ import os
 import random
 import time
 from distutils.util import strtobool
-from typing import Sequence
+from typing import Deque, NamedTuple, Optional, Tuple, Type, Union, Sequence
+from functools import partial
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 ] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
-import envpool
 import flax
 import flax.linen as nn
-import gym
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -21,7 +21,7 @@ import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
-
+import distrax
 
 def parse_args():
     # fmt: off
@@ -44,7 +44,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="Pong-v5",
+    parser.add_argument("--env-id", type=str, default="reach-v2",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
@@ -52,7 +52,7 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=500,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -87,38 +87,10 @@ def parse_args():
 class Network(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x / (255.0)
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
-        x = nn.relu(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+        x = nn.tanh(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+        x = nn.tanh(x)
         return x
 
 
@@ -133,7 +105,8 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x), \
+            nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
 
 
 @flax.struct.dataclass
@@ -162,6 +135,40 @@ class EpisodeStatistics:
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
 
+import metaworld
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
+from cleanrl_utils.wrappers import metaworld_wrappers
+
+def _make_envs_common(
+    benchmark: metaworld.Benchmark,
+    seed: int,
+    max_episode_steps: Optional[int] = None,
+    use_one_hot: bool = True,
+    terminate_on_success: bool = False,
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+        env = env_cls()
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        if terminate_on_success:
+            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if use_one_hot:
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env.action_space.seed(seed)
+        return env
+
+    return gym.vector.AsyncVectorEnv(
+        [
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+
+
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
 
 if __name__ == "__main__":
     args = parse_args()
@@ -191,44 +198,27 @@ if __name__ == "__main__":
     key, network_key, actor_key, critic_key = jax.random.split(key, 4)
 
     # env setup
-    envs = envpool.make(
-        args.env_id,
-        env_type="gym",
-        num_envs=args.num_envs,
-        episodic_life=True,
-        reward_clip=True,
-        seed=args.seed,
-    )
-    envs.num_envs = args.num_envs
-    envs.single_action_space = envs.action_space
-    envs.single_observation_space = envs.observation_space
-    envs.is_vector_env = True
+    make_envs = partial(_make_envs_common, terminate_on_success=False)
+    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+
+    if args.env_id == "MT10":
+        benchmark = metaworld.MT10(seed=args.seed)
+    elif args.env_id == "MT50":
+        benchmark = metaworld.MT50(seed=args.seed)
+    else:
+        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
+    envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
+    eval_envs = make_eval_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
         returned_episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         returned_episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
     )
-    handle, recv, send, step_env = envs.xla()
 
-    def step_env_wrappeed(episode_stats, handle, action):
-        handle, (next_obs, reward, next_done, info) = step_env(handle, action)
-        new_episode_return = episode_stats.episode_returns + info["reward"]
-        new_episode_length = episode_stats.episode_lengths + 1
-        episode_stats = episode_stats.replace(
-            episode_returns=(new_episode_return) * (1 - info["terminated"]) * (1 - info["TimeLimit.truncated"]),
-            episode_lengths=(new_episode_length) * (1 - info["terminated"]) * (1 - info["TimeLimit.truncated"]),
-            # only update the `returned_episode_returns` if the episode is done
-            returned_episode_returns=jnp.where(
-                info["terminated"] + info["TimeLimit.truncated"], new_episode_return, episode_stats.returned_episode_returns
-            ),
-            returned_episode_lengths=jnp.where(
-                info["terminated"] + info["TimeLimit.truncated"], new_episode_length, episode_stats.returned_episode_lengths
-            ),
-        )
-        return episode_stats, handle, (next_obs, reward, next_done, info)
-
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     def linear_schedule(count):
         # anneal learning rate linearly after one training iteration which contains
@@ -237,7 +227,8 @@ if __name__ == "__main__":
         return args.learning_rate * frac
 
     network = Network()
-    actor = Actor(action_dim=envs.single_action_space.n)
+    print(envs.single_action_space)
+    actor = Actor(action_dim=envs.single_action_space.shape[0])
     critic = Critic()
     network_params = network.init(network_key, np.array([envs.single_observation_space.sample()]))
     agent_state = TrainState.create(
@@ -281,13 +272,15 @@ if __name__ == "__main__":
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
         hidden = network.apply(agent_state.params.network_params, next_obs)
-        logits = actor.apply(agent_state.params.actor_params, hidden)
-        # sample action: Gumbel-softmax trick
-        # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
+        mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
         key, subkey = jax.random.split(key)
-        u = jax.random.uniform(subkey, shape=logits.shape)
-        action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
-        logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
+        log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
+        std = jnp.exp(log_std)
+        dist = distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mean, scale_diag=std), distrax.Block(distrax.Tanh(), ndims=1)
+        )
+        action = dist.sample(seed=subkey)
+        logprob = dist.log_prob(action)
         value = critic.apply(agent_state.params.critic_params, hidden)
         storage = storage.replace(
             obs=storage.obs.at[step].set(next_obs),
@@ -296,25 +289,28 @@ if __name__ == "__main__":
             logprobs=storage.logprobs.at[step].set(logprob),
             values=storage.values.at[step].set(value.squeeze()),
         )
-        return storage, action, key
+        actions = jax.device_get(action)
+        return storage, actions, key
 
     @jax.jit
     def get_action_and_value2(
         params: flax.core.FrozenDict,
         x: np.ndarray,
         action: np.ndarray,
+        key: jax.random.PRNGKey,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
         hidden = network.apply(params.network_params, x)
-        logits = actor.apply(params.actor_params, hidden)
-        logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
-        # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
-        logits = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
-        logits = logits.clip(min=jnp.finfo(logits.dtype).min)
-        p_log_p = logits * jax.nn.softmax(logits)
-        entropy = -p_log_p.sum(-1)
-        value = critic.apply(params.critic_params, hidden).squeeze()
-        return logprob, entropy, value
+        mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
+        key, subkey = jax.random.split(key)
+        log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
+        std = jnp.exp(log_std)
+        dist = distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mean, scale_diag=std), distrax.Block(distrax.Tanh(), ndims=1)
+        )
+        value = critic.apply(agent_state.params.critic_params, hidden)
+        logprob = dist.log_prob(action)
+        return logprob, dist.entropy(), value
 
     @jax.jit
     def compute_gae(
@@ -395,24 +391,24 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs = envs.reset()
+    next_obs, info = envs.reset()
     next_done = np.zeros(args.num_envs)
 
-    @jax.jit
-    def rollout(agent_state, episode_stats, next_obs, next_done, storage, key, handle, global_step):
+    def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
             storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            episode_stats, handle, (next_obs, reward, next_done, _) = step_env_wrappeed(episode_stats, handle, action)
+            next_obs, reward, truncate, terminate, _ = envs.step(action)
+            next_done = np.logical_or(truncate, terminate)
             storage = storage.replace(rewards=storage.rewards.at[step].set(reward))
-        return agent_state, episode_stats, next_obs, next_done, storage, key, handle, global_step
+        return agent_state, next_obs, next_done, storage, key, global_step
 
     for update in range(1, args.num_updates + 1):
         update_time_start = time.time()
-        agent_state, episode_stats, next_obs, next_done, storage, key, handle, global_step = rollout(
-            agent_state, episode_stats, next_obs, next_done, storage, key, handle, global_step
+        agent_state, next_obs, next_done, storage, key, global_step = rollout(
+            agent_state, next_obs, next_done, storage, key, global_step
         )
         storage = compute_gae(agent_state, next_obs, next_done, storage)
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
