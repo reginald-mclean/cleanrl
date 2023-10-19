@@ -6,10 +6,13 @@ import time
 from distutils.util import strtobool
 from typing import Deque, NamedTuple, Optional, Tuple, Type, Union, Sequence
 from functools import partial
+from collections import deque
+import sys
+sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.7"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+] = "0.15"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 import flax
 import flax.linen as nn
@@ -22,6 +25,8 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 import distrax
+from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
+
 
 def parse_args():
     # fmt: off
@@ -36,50 +41,62 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
-        help="the entity (team) of wandb's project")
+    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
+        help="the entity (team) of wandb's project")    
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="reach-v2",
+    parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=10000000,
+    parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=8,
+    parser.add_argument("--num-envs", type=int, default=10,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=500,
+    parser.add_argument("--num-steps", type=int, default=10000,
         help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95,
+    parser.add_argument("--gae-lambda", type=float, default=0.97,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=4,
+    parser.add_argument("--num-minibatches", type=int, default=32,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=4,
+    parser.add_argument("--update-epochs", type=int, default=16,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
-    parser.add_argument("--clip-coef", type=float, default=0.1,
+    parser.add_argument("--clip-coef", type=float, default=0.2,
         help="the surrogate clipping coefficient")
-    parser.add_argument("--ent-coef", type=float, default=0.01,
+    parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
+    parser.add_argument("--ent-coef", type=float, default=5e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.5,
+    parser.add_argument("--vf-coef", type=float, default=0.0,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--eval-freq", type=int, default=2,
+        help="how many updates to do before evaluating the agent")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
+        help="the number episodes to run per evaluation")
+
+    parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to save model into the `runs/{run_name}` folder")
+
     args = parser.parse_args()
+
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_updates = args.total_timesteps // args.batch_size
+    print(int(args.total_timesteps // args.batch_size))
+    args.num_updates = int(args.total_timesteps // args.batch_size)
     # fmt: on
     return args
 
@@ -203,11 +220,13 @@ if __name__ == "__main__":
 
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
+        args.num_envs = 10
     elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
+        args.num_envs = 50
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-
+        args.num_envs = 1
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
     envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
     eval_envs = make_eval_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
@@ -261,7 +280,7 @@ if __name__ == "__main__":
         rewards=jnp.zeros((args.num_steps, args.num_envs)),
     )
 
-    @jax.jit
+    #@jax.jit
     def get_action_and_value(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -276,9 +295,7 @@ if __name__ == "__main__":
         key, subkey = jax.random.split(key)
         log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
         std = jnp.exp(log_std)
-        dist = distrax.Transformed(
-            distrax.MultivariateNormalDiag(loc=mean, scale_diag=std), distrax.Block(distrax.Tanh(), ndims=1)
-        )
+        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         action = dist.sample(seed=subkey)
         logprob = dist.log_prob(action)
         value = critic.apply(agent_state.params.critic_params, hidden)
@@ -289,25 +306,21 @@ if __name__ == "__main__":
             logprobs=storage.logprobs.at[step].set(logprob),
             values=storage.values.at[step].set(value.squeeze()),
         )
-        actions = jax.device_get(action)
-        return storage, actions, key
+        action = jax.device_get(action)
+        return storage, action, key
 
     @jax.jit
     def get_action_and_value2(
         params: flax.core.FrozenDict,
         x: np.ndarray,
         action: np.ndarray,
-        key: jax.random.PRNGKey,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
         hidden = network.apply(params.network_params, x)
         mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
-        key, subkey = jax.random.split(key)
         log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
         std = jnp.exp(log_std)
-        dist = distrax.Transformed(
-            distrax.MultivariateNormalDiag(loc=mean, scale_diag=std), distrax.Block(distrax.Tanh(), ndims=1)
-        )
+        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         value = critic.apply(agent_state.params.critic_params, hidden)
         logprob = dist.log_prob(action)
         return logprob, dist.entropy(), value
@@ -371,7 +384,7 @@ if __name__ == "__main__":
             return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
         ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
-        for _ in range(args.update_epochs):
+        for a in range(args.update_epochs):
             key, subkey = jax.random.split(key)
             b_inds = jax.random.permutation(subkey, args.batch_size, independent=True)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -394,29 +407,73 @@ if __name__ == "__main__":
     next_obs, info = envs.reset()
     next_done = np.zeros(args.num_envs)
 
+    global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
+    global_episodic_length: Deque[int] = deque([], maxlen=20 * args.num_envs)
+
+
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
             storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, truncate, terminate, _ = envs.step(action)
+            
+            next_obs, reward, truncate, terminate, infos = envs.step(action)
             next_done = np.logical_or(truncate, terminate)
             storage = storage.replace(rewards=storage.rewards.at[step].set(reward))
+
         return agent_state, next_obs, next_done, storage, key, global_step
 
+    print(f'num updates {args.num_updates}')
+
     for update in range(1, args.num_updates + 1):
+        if (update - 1) % args.eval_freq == 0:
+            eval_success_rate, eval_returns, eval_success_per_task = ppo_evaluation(
+                    agent_state=agent_state,
+                    network=network,
+                    actor=actor,
+                    eval_envs=eval_envs,
+                    num_episodes=args.evaluation_num_episodes,
+            )
+            eval_metrics = {
+                    "charts/mean_success_rate": float(eval_success_rate),
+                    "charts/mean_evaluation_return": float(eval_returns),
+                } | {
+                    f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+            }
+
+            for k, v in eval_metrics.items():
+                writer.add_scalar(k, v, global_step)
+                print(
+                    f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                    + f" return: {eval_returns:.4f}"
+                )
+
+            # Checkpointing
+            if args.save_model:
+                ckpt = agent.get_ckpt()
+                ckpt["rng_key"] = key
+                ckpt["global_step"] = global_step
+                save_args = orbax_utils.save_args_from_target(ckpt)
+                ckpt_manager.save(
+                    step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=eval_metrics
+                )
+                print(f"model saved to {ckpt_manager.directory}")
+
         update_time_start = time.time()
         agent_state, next_obs, next_done, storage, key, global_step = rollout(
             agent_state, next_obs, next_done, storage, key, global_step
         )
+        print(update)
         storage = compute_gae(agent_state, next_obs, next_done, storage)
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
             agent_state,
             storage,
             key,
         )
-        avg_episodic_return = np.mean(jax.device_get(episode_stats.returned_episode_returns))
+
+        avg_episodic_return = np.mean(list(global_episodic_return))
         print(f"global_step={global_step}, avg_episodic_return={avg_episodic_return}")
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes

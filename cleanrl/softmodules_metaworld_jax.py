@@ -7,6 +7,8 @@ from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Type, Union
+import sys
+sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -314,6 +316,7 @@ def sample_action(
     key, action_key = jax.random.split(key)
     dist = actor.apply_fn(actor.params, obs, task_ids)
     action = dist.sample(seed=action_key)
+    print(f'sample action {type(action)}')
     return action, key
 
 
@@ -468,7 +471,9 @@ class Agent:  # MT SAC Agent
     ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, s_t, z_Tau, key)
+        print(f'get act {type(actions)}')
         actions = jax.device_get(actions)
+        print(f'get act 2 {type(actions)}')
         return actions, key
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
