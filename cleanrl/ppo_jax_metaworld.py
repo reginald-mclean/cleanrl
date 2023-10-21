@@ -1,4 +1,3 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_envpool_xla_jaxpy
 import argparse
 import os
 import random
@@ -6,6 +5,7 @@ import time
 from distutils.util import strtobool
 from typing import Deque, NamedTuple, Optional, Tuple, Type, Union, Sequence
 from functools import partial
+import functools
 from collections import deque
 import sys
 sys.path.append('/home/reggie/Desktop/cleanrl')
@@ -13,6 +13,8 @@ sys.path.append('/home/reggie/Desktop/cleanrl')
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 ] = "0.15"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+
+
 
 import flax
 import flax.linen as nn
@@ -26,7 +28,10 @@ from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 import distrax
 from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
+from jax.config import config
 
+config.update('jax_disable_jit', True)
+config.update("jax_enable_x64", True)
 
 def parse_args():
     # fmt: off
@@ -101,34 +106,43 @@ def parse_args():
     return args
 
 
-class Network(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
-        x = nn.tanh(x)
-        return x
-
-
-class Critic(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(1, kernel_init=orthogonal(1), bias_init=constant(0.0))(x)
-
-
 class Actor(nn.Module):
     action_dim: Sequence[int]
 
     @nn.compact
     def __call__(self, x):
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.tanh(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.tanh(x)
+        log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float64)
+        log_std = self.param('log_std', log_std_init, (self.action_dim,))
+        expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
+        std = jnp.exp(expanded_log_std)
+        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x), std
+
+
+class Critic(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.tanh(x)
+        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.tanh(x)
+        return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+
+
+'''class Actor(nn.Module):
+    action_dim: Sequence[int]
+
+    @nn.compact
+    def __call__(self, x):
         return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x), \
-            nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)
+            nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)'''
 
 
 @flax.struct.dataclass
 class AgentParams:
-    network_params: flax.core.FrozenDict
     actor_params: flax.core.FrozenDict
     critic_params: flax.core.FrozenDict
 
@@ -212,7 +226,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, network_key, actor_key, critic_key = jax.random.split(key, 4)
+    key, actor_key, critic_key = jax.random.split(key, 3)
 
     # env setup
     make_envs = partial(_make_envs_common, terminate_on_success=False)
@@ -245,39 +259,37 @@ if __name__ == "__main__":
         frac = 1.0 - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
         return args.learning_rate * frac
 
-    network = Network()
     print(envs.single_action_space)
     actor = Actor(action_dim=envs.single_action_space.shape[0])
     critic = Critic()
-    network_params = network.init(network_key, np.array([envs.single_observation_space.sample()]))
+    #network_params = network.init(network_key, np.array([envs.single_observation_space.sample()]))
     agent_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
-            network_params,
-            actor.init(actor_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
-            critic.init(critic_key, network.apply(network_params, np.array([envs.single_observation_space.sample()]))),
+            actor.init(actor_key, np.array([envs.single_observation_space.sample()])),
+            critic.init(critic_key, np.array([envs.single_observation_space.sample()])),
         ),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate, eps=1e-5
+                learning_rate=args.learning_rate, eps=1e-5
             ),
         ),
     )
-    network.apply = jax.jit(network.apply)
+    #network.apply = jax.jit(network.apply)
     actor.apply = jax.jit(actor.apply)
     critic.apply = jax.jit(critic.apply)
 
     # ALGO Logic: Storage setup
     storage = Storage(
-        obs=jnp.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape),
-        actions=jnp.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, dtype=jnp.int32),
-        logprobs=jnp.zeros((args.num_steps, args.num_envs)),
-        dones=jnp.zeros((args.num_steps, args.num_envs)),
-        values=jnp.zeros((args.num_steps, args.num_envs)),
-        advantages=jnp.zeros((args.num_steps, args.num_envs)),
-        returns=jnp.zeros((args.num_steps, args.num_envs)),
-        rewards=jnp.zeros((args.num_steps, args.num_envs)),
+        obs=jnp.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, dtype=jnp.float64),
+        actions=jnp.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, dtype=jnp.float64),
+        logprobs=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        dones=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        values=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        advantages=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        returns=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        rewards=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
     )
 
     #@jax.jit
@@ -290,15 +302,12 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
-        hidden = network.apply(agent_state.params.network_params, next_obs)
-        mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
+        mean, std = actor.apply(agent_state.params.actor_params, next_obs)
         key, subkey = jax.random.split(key)
-        log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
-        std = jnp.exp(log_std)
-        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
+        dist = distrax.Normal(loc=mean, scale=std)
         action = dist.sample(seed=subkey)
-        logprob = dist.log_prob(action)
-        value = critic.apply(agent_state.params.critic_params, hidden)
+        logprob = jnp.sum(dist.log_prob(action), 1)
+        value = critic.apply(agent_state.params.critic_params, next_obs)
         storage = storage.replace(
             obs=storage.obs.at[step].set(next_obs),
             dones=storage.dones.at[step].set(next_done),
@@ -316,16 +325,13 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
-        hidden = network.apply(params.network_params, x)
-        mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
-        log_std = jnp.clip(log_std, a_min=LOG_STD_MIN, a_max=LOG_STD_MAX)
-        std = jnp.exp(log_std)
-        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
-        value = critic.apply(agent_state.params.critic_params, hidden)
-        logprob = dist.log_prob(action)
+        mean, std = actor.apply(agent_state.params.actor_params, x)
+        dist = distrax.Normal(loc=mean, scale=std)
+        value = critic.apply(agent_state.params.critic_params, x)
+        logprob = jnp.sum(dist.log_prob(action))
         return logprob, dist.entropy(), value
 
-    @jax.jit
+    '''@jax.jit
     def compute_gae(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -334,8 +340,7 @@ if __name__ == "__main__":
     ):
         storage = storage.replace(advantages=storage.advantages.at[:].set(0.0))
         next_value = critic.apply(
-            agent_state.params.critic_params, network.apply(agent_state.params.network_params, next_obs)
-        ).squeeze()
+            agent_state.params.critic_params,next_obs).squeeze()
         lastgaelam = 0
         for t in reversed(range(args.num_steps)):
             if t == args.num_steps - 1:
@@ -348,6 +353,39 @@ if __name__ == "__main__":
             lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             storage = storage.replace(advantages=storage.advantages.at[t].set(lastgaelam))
         storage = storage.replace(returns=storage.advantages + storage.values)
+        return storage'''
+
+    def compute_gae_once(carry, inp, gamma, gae_lambda):
+        advantages = carry
+        nextdone, nextvalues, curvalues, reward = inp
+        nextnonterminal = 1.0 - nextdone
+
+        delta = reward + gamma * nextvalues * nextnonterminal - curvalues
+        advantages = delta + gamma * gae_lambda * nextnonterminal * advantages
+        return advantages, advantages
+
+    compute_gae_once = partial(compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda)
+
+
+    @jax.jit
+    def compute_gae(
+        agent_state: TrainState,
+        next_obs: np.ndarray,
+        next_done: np.ndarray,
+        storage: Storage,
+    ):
+        next_value = critic.apply(agent_state.params.critic_params, next_obs).squeeze()
+
+        advantages = jnp.zeros((args.num_envs,))
+        dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
+        values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
+        _, advantages = jax.lax.scan(
+            compute_gae_once, advantages, (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
+        )
+        storage = storage.replace(
+            advantages=advantages,
+            returns=advantages + storage.values,
+        )
         return storage
 
     @jax.jit
@@ -361,8 +399,10 @@ if __name__ == "__main__":
         b_actions = storage.actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = storage.advantages.reshape(-1)
         b_returns = storage.returns.reshape(-1)
+        b_values = storage.values.reshape(-1)
 
-        def ppo_loss(params, x, a, logp, mb_advantages, mb_returns):
+        def ppo_loss(params, x, a, mb_values, logp, mb_advantages, mb_returns):
+            #print(params)
             newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
             logratio = newlogprob - logp
             ratio = jnp.exp(logratio)
@@ -377,13 +417,19 @@ if __name__ == "__main__":
             pg_loss = jnp.maximum(pg_loss1, pg_loss2).mean()
 
             # Value loss
-            v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
+            newvalue = newvalue.reshape(-1)
+            v_loss_unclipped = (newvalue - mb_returns) ** 2
+            v_clipped = mb_values + jnp.clip(newvalue - mb_values, -args.clip_coef, args.clip_coef)
+            v_loss_clipped = (v_clipped - mb_returns) ** 2
+            v_loss_max = jnp.maximum(v_loss_unclipped, v_loss_clipped)
+            v_loss = 0.5 * v_loss_max.mean()
 
             entropy_loss = entropy.mean()
+
             loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
             return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
-        ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+        ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True, argnums=0)
         for a in range(args.update_epochs):
             key, subkey = jax.random.split(key)
             b_inds = jax.random.permutation(subkey, args.batch_size, independent=True)
@@ -394,6 +440,7 @@ if __name__ == "__main__":
                     agent_state.params,
                     b_obs[mb_inds],
                     b_actions[mb_inds],
+                    b_values[mb_inds],
                     b_logprobs[mb_inds],
                     b_advantages[mb_inds],
                     b_returns[mb_inds],
@@ -421,19 +468,42 @@ if __name__ == "__main__":
             next_obs, reward, truncate, terminate, infos = envs.step(action)
             next_done = np.logical_or(truncate, terminate)
             storage = storage.replace(rewards=storage.rewards.at[step].set(reward))
+            if "final_info" not in infos:
+                continue
 
+            for i, info in enumerate(infos["final_info"]):
+                # Skip the envs that are not done
+                if info is None:
+                    continue
+                #print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                #print(i, info)
+                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
         return agent_state, next_obs, next_done, storage, key, global_step
 
-    print(f'num updates {args.num_updates}')
+    #print(f'num updates {args.num_updates}')
 
     for update in range(1, args.num_updates + 1):
+        #print(agent_state.params.actor_params)
+        #print('actor')
+        for k in agent_state.params.actor_params['params']:
+            if 'Dense' in k:
+                print(k)
+                print(jnp.linalg.norm(agent_state.params.actor_params['params'][k]['kernel']))
+        print('critic')
+        for k in agent_state.params.critic_params['params']:
+            if 'Dense' in k:
+                print(k) 
+                print(jnp.linalg.norm(agent_state.params.critic_params['params'][k]['kernel']))
+
         if (update - 1) % args.eval_freq == 0:
-            eval_success_rate, eval_returns, eval_success_per_task = ppo_evaluation(
+            eval_success_rate, eval_returns, eval_success_per_task, key = ppo_evaluation(
                     agent_state=agent_state,
-                    network=network,
                     actor=actor,
                     eval_envs=eval_envs,
                     num_episodes=args.evaluation_num_episodes,
+                    key=key,
+                    #task_names=list(benchmark.train_classes.keys())
             )
             eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
@@ -442,13 +512,13 @@ if __name__ == "__main__":
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
             }
-
+            print(eval_metrics)
             for k, v in eval_metrics.items():
                 writer.add_scalar(k, v, global_step)
-                print(
-                    f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
-                    + f" return: {eval_returns:.4f}"
-                )
+            #print(
+            #        f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+            #        + f" return: {eval_returns:.4f}"
+            #)
 
             # Checkpointing
             if args.save_model:
@@ -465,8 +535,9 @@ if __name__ == "__main__":
         agent_state, next_obs, next_done, storage, key, global_step = rollout(
             agent_state, next_obs, next_done, storage, key, global_step
         )
-        print(update)
+        #print(update)
         storage = compute_gae(agent_state, next_obs, next_done, storage)
+        #print(jax.make_jaxpr(update_ppo)(agent_state, storage, key))
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
             agent_state,
             storage,

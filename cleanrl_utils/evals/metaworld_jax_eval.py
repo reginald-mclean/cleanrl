@@ -8,7 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import jax.numpy as jnp
 from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer
-
+import distrax
 
 def evaluation(
     agent,
@@ -133,15 +133,12 @@ def metalearning_evaluation(
 
 def ppo_evaluation(
     agent_state,
-    network,
     actor,
+    key,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     task_names: Optional[List[str]] = None,
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
-
-    # get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
-
     print(f"Evaluating for {num_episodes} episodes.")
 
     obs, _ = eval_envs.reset()
@@ -163,10 +160,10 @@ def ppo_evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        hidden = network.apply(agent_state.params.network_params, obs)
-        mean, log_std = actor.apply(agent_state.params.actor_params, hidden)
-        actions = jnp.tanh(mean)
-        actions = jax.device_get(actions)
+        key, action_key = jax.random.split(key)
+        mean, std = actor.apply(agent_state.params.actor_params, obs)
+        dist = distrax.Normal(loc=mean, scale=std)
+        actions = jax.device_get(dist.sample(seed=action_key))
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
@@ -191,7 +188,8 @@ def ppo_evaluation(
         episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
-
+    print(successes)
+    print(episodic_returns)
     if type(successes) is dict:
         success_rate_per_task = np.array(
             [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
@@ -203,4 +201,4 @@ def ppo_evaluation(
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(episodic_returns)
 
-    return mean_success_rate, mean_returns, success_rate_per_task
+    return mean_success_rate, mean_returns, success_rate_per_task, key
