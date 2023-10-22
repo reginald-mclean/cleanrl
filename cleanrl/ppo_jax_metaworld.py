@@ -195,6 +195,7 @@ LOG_STD_MIN = 0.5
 
 if __name__ == "__main__":
     args = parse_args()
+    print(f'seed {args.seed}')
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -366,11 +367,12 @@ if __name__ == "__main__":
         next_done: np.ndarray,
         storage: Storage,
     ):
-        next_value = critic.apply(agent_state.params.critic_params, next_obs).squeeze()
-
+        next_value = critic.apply(agent_state.params.critic_params, next_obs)
+        print(next_value.shape)
         advantages = jnp.zeros((args.num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
-        values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
+        print(storage.values.shape, next_value.shape)
+        values = jnp.concatenate([storage.values, next_value], axis=0)
         _, advantages = jax.lax.scan(
             compute_gae_once, advantages, (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
         )
