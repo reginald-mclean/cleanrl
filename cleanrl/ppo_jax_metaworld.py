@@ -12,7 +12,7 @@ sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.15"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+] = "0.5"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 
 
@@ -30,8 +30,8 @@ import distrax
 from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
 from jax.config import config
 
-#config.update('jax_disable_jit', True)
-#config.update("jax_enable_x64", True)
+# config.update('jax_disable_jit', True)
+# config.update("jax_enable_x64", True)
 
 def parse_args():
     # fmt: off
@@ -82,7 +82,7 @@ def parse_args():
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=5e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.0,
+    parser.add_argument("--vf-coef", type=float, default=0.01,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
@@ -100,8 +100,12 @@ def parse_args():
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    print(int(args.total_timesteps // args.batch_size))
-    args.num_updates = int(args.total_timesteps // args.batch_size)
+    print(args.total_timesteps)
+    print(type(args.total_timesteps))
+    print(type(args.batch_size))
+    print(args.batch_size)
+    print(int(float(args.total_timesteps) // args.batch_size))
+    args.num_updates = int(int(args.total_timesteps) // args.batch_size)
     # fmt: on
     return args
 
@@ -118,6 +122,7 @@ class Actor(nn.Module):
         log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
         log_std = self.param('log_std', log_std_init, (self.action_dim,))
         expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
+        expanded_log_std = jnp.clip(expanded_log_std, LOG_STD_MIN, LOG_STD_MAX)
         std = jnp.exp(expanded_log_std)
         return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x), std
 
@@ -130,15 +135,6 @@ class Critic(nn.Module):
         x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
         return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
-
-
-'''class Actor(nn.Module):
-    action_dim: Sequence[int]
-
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x), \
-            nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(x)'''
 
 
 @flax.struct.dataclass
@@ -304,9 +300,9 @@ if __name__ == "__main__":
         """sample action, calculate value, logprob, entropy, and update storage"""
         mean, std = actor.apply(state.params.actor_params, next_obs)
         key, subkey = jax.random.split(key)
-        dist = distrax.Normal(loc=mean, scale=std)
+        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         action = dist.sample(seed=subkey)
-        logprob = jnp.sum(dist.log_prob(action), 1)
+        logprob = dist.log_prob(action)
         value = critic.apply(state.params.critic_params, next_obs)
         storage = storage.replace(
             obs=storage.obs.at[step].set(next_obs),
@@ -326,9 +322,9 @@ if __name__ == "__main__":
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
         mean, std = actor.apply(params.actor_params, x)
-        dist = distrax.Normal(loc=mean, scale=std)
+        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         value = critic.apply(params.critic_params, x)
-        logprob = jnp.sum(dist.log_prob(action))
+        logprob = dist.log_prob(action)
         return logprob, dist.entropy(), value
 
     '''@jax.jit
@@ -424,11 +420,10 @@ if __name__ == "__main__":
             v_loss = 0.5 * v_loss_max.mean()
 
             entropy_loss = entropy.mean()
-
             loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
             return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
-        ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True, argnums=0)
+        ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
         for a in range(args.update_epochs):
             key, subkey = jax.random.split(key)
             b_inds = jax.random.permutation(subkey, args.batch_size, independent=True)
