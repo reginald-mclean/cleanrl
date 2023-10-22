@@ -46,16 +46,16 @@ def parse_args():
         help="whether to save model into the `runs/{run_name}` folder")
 
     # RL^2 arguments
-    parser.add_argument("--max-episode-steps", type=int, default=500,
+    parser.add_argument("--max-episode-steps", type=int, default=200,
                         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--num-parallel-envs", type=int, default=10,
                         help="the number of parallel envs used to collect data")
     parser.add_argument("--num-episodes-per-trial", type=int, default=20,
                         help="the number episodes collected for each env before training, the trial size")
-    parser.add_argument("--trial-batch-size", type=int, default=8)
-    parser.add_argument("--recurrent-state-size", type=int, default=64)
+    parser.add_argument("--trial-batch-size", type=int, default=12)
+    parser.add_argument("--recurrent-state-size", type=int, default=256)
     parser.add_argument("--recurrent-type", type=str, default="gru")
-    parser.add_argument("--recurrent-num-layers", type=int, default=1)
+    parser.add_argument("--recurrent-num-layers", type=int, default=2)
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
@@ -598,7 +598,9 @@ if __name__ == "__main__":
         )
         print(f"{total_steps=}, {mean_episodic_return=}")
 
-        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial_batch, key)
+        agent_state, logs = update_rl2_ppo(
+            args, agent, agent_state, meta_trial_batch, key
+        )
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
