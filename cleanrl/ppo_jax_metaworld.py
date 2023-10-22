@@ -30,8 +30,8 @@ import distrax
 from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
 from jax.config import config
 
-config.update('jax_disable_jit', True)
-config.update("jax_enable_x64", True)
+#config.update('jax_disable_jit', True)
+#config.update("jax_enable_x64", True)
 
 def parse_args():
     # fmt: off
@@ -111,25 +111,25 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float64)
+        log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
         log_std = self.param('log_std', log_std_init, (self.action_dim,))
         expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
         std = jnp.exp(expanded_log_std)
-        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x), std
+        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x), std
 
 
 class Critic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float64), bias_init=constant(0.0, dtype=jnp.float64))(x)
+        return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
 
 
 '''class Actor(nn.Module):
@@ -282,19 +282,19 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     storage = Storage(
-        obs=jnp.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, dtype=jnp.float64),
-        actions=jnp.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, dtype=jnp.float64),
-        logprobs=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
-        dones=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
-        values=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
-        advantages=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
-        returns=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
-        rewards=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float64),
+        obs=jnp.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape, dtype=jnp.float32),
+        actions=jnp.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape, dtype=jnp.float32),
+        logprobs=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
+        dones=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
+        values=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
+        advantages=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
+        returns=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
+        rewards=jnp.zeros((args.num_steps, args.num_envs), dtype=jnp.float32),
     )
 
     #@jax.jit
     def get_action_and_value(
-        agent_state: TrainState,
+        state: TrainState,
         next_obs: np.ndarray,
         next_done: np.ndarray,
         storage: Storage,
@@ -302,12 +302,12 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
-        mean, std = actor.apply(agent_state.params.actor_params, next_obs)
+        mean, std = actor.apply(state.params.actor_params, next_obs)
         key, subkey = jax.random.split(key)
         dist = distrax.Normal(loc=mean, scale=std)
         action = dist.sample(seed=subkey)
         logprob = jnp.sum(dist.log_prob(action), 1)
-        value = critic.apply(agent_state.params.critic_params, next_obs)
+        value = critic.apply(state.params.critic_params, next_obs)
         storage = storage.replace(
             obs=storage.obs.at[step].set(next_obs),
             dones=storage.dones.at[step].set(next_done),
@@ -325,9 +325,9 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
-        mean, std = actor.apply(agent_state.params.actor_params, x)
+        mean, std = actor.apply(params.actor_params, x)
         dist = distrax.Normal(loc=mean, scale=std)
-        value = critic.apply(agent_state.params.critic_params, x)
+        value = critic.apply(params.critic_params, x)
         logprob = jnp.sum(dist.log_prob(action))
         return logprob, dist.entropy(), value
 
@@ -402,7 +402,6 @@ if __name__ == "__main__":
         b_values = storage.values.reshape(-1)
 
         def ppo_loss(params, x, a, mb_values, logp, mb_advantages, mb_returns):
-            #print(params)
             newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
             logratio = newlogprob - logp
             ratio = jnp.exp(logratio)
@@ -475,7 +474,7 @@ if __name__ == "__main__":
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                #print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 #print(i, info)
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
@@ -512,13 +511,13 @@ if __name__ == "__main__":
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
             }
-            print(eval_metrics)
+            #print(eval_metrics)
             for k, v in eval_metrics.items():
                 writer.add_scalar(k, v, global_step)
-            #print(
-            #        f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
-            #        + f" return: {eval_returns:.4f}"
-            #)
+            print(
+                    f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                    + f" return: {eval_returns:.4f}"
+            )
 
             # Checkpointing
             if args.save_model:
