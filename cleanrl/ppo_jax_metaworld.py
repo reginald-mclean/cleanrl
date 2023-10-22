@@ -82,7 +82,7 @@ def parse_args():
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
     parser.add_argument("--ent-coef", type=float, default=5e-3,
         help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.01,
+    parser.add_argument("--vf-coef", type=float, default=0.001,
         help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
@@ -100,12 +100,8 @@ def parse_args():
 
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    print(args.total_timesteps)
-    print(type(args.total_timesteps))
-    print(type(args.batch_size))
-    print(args.batch_size)
-    print(int(float(args.total_timesteps) // args.batch_size))
     args.num_updates = int(int(args.total_timesteps) // args.batch_size)
+
     # fmt: on
     return args
 
@@ -115,9 +111,9 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(128, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(128, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
         log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
         log_std = self.param('log_std', log_std_init, (self.action_dim,))
@@ -130,9 +126,9 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(128, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(512, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(128, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
         return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
 
@@ -194,8 +190,8 @@ def _make_envs_common(
     )
 
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -20
+LOG_STD_MAX = 1.5
+LOG_STD_MIN = 0.5
 
 if __name__ == "__main__":
     args = parse_args()
