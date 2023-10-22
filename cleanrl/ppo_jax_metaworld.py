@@ -12,7 +12,7 @@ sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.5"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 
 
