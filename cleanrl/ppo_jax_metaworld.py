@@ -8,7 +8,7 @@ from functools import partial
 import functools
 from collections import deque
 import sys
-sys.path.append('/home/reggie/Desktop/cleanrl')
+sys.path.append('/home/reggie/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -178,13 +178,15 @@ def _make_envs_common(
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        if not terminate_on_success:
+            tasks = tasks[env_id:(env_id+5)]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
 
     return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            partial(init_each_env, env_cls=env_cls, name=list(benchmark.train_classes.keys())[0], env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -233,10 +235,14 @@ if __name__ == "__main__":
         args.num_envs = 50
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-        args.num_envs = 1
+        eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+        args.num_envs = 10
+        for i in range(1, 10):
+            benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
+
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
     envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
-    eval_envs = make_eval_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
+    eval_envs = make_eval_envs(eval_benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
@@ -367,12 +373,12 @@ if __name__ == "__main__":
         next_done: np.ndarray,
         storage: Storage,
     ):
-        next_value = critic.apply(agent_state.params.critic_params, next_obs)
+        next_value = critic.apply(agent_state.params.critic_params, next_obs).squeeze()
         print(next_value.shape)
         advantages = jnp.zeros((args.num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         print(storage.values.shape, next_value.shape)
-        values = jnp.concatenate([storage.values, next_value], axis=0)
+        values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
         _, advantages = jax.lax.scan(
             compute_gae_once, advantages, (dones[1:], values[1:], values[:-1], storage.rewards), reverse=True
         )
@@ -382,7 +388,7 @@ if __name__ == "__main__":
         )
         return storage
 
-    @jax.jit
+    #@jax.jit
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
@@ -444,6 +450,7 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, info = envs.reset()
+    print(f'next obs {next_obs.shape}')
     next_done = np.zeros(args.num_envs)
 
     global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
@@ -497,12 +504,13 @@ if __name__ == "__main__":
                     key=key,
                     #task_names=list(benchmark.train_classes.keys())
             )
+            print(eval_success_rate, eval_returns, eval_success_per_task)
             eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
                     "charts/mean_evaluation_return": float(eval_returns),
                 } | {
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-                    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+                    for i, (env_name, _) in enumerate(eval_benchmark.train_classes.items())
             }
             #print(eval_metrics)
             for k, v in eval_metrics.items():
