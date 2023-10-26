@@ -8,7 +8,7 @@ from functools import partial
 import functools
 from collections import deque
 import sys
-sys.path.append('/home/reggie/cleanrl')
+sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -111,24 +111,24 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(128, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(128, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
-        log_std = self.param('log_std', log_std_init, (self.action_dim,))
-        expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
-        expanded_log_std = jnp.clip(expanded_log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = jnp.exp(expanded_log_std)
-        return nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x), std
+        #log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
+        #log_std = self.param('log_std', log_std_init, (self.action_dim,))
+        #expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
+        #expanded_log_std = jnp.clip(expanded_log_std, LOG_STD_MIN, LOG_STD_MAX)
+        #std = jnp.exp(expanded_log_std)
+        return nn.Dense(2*self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(1.0, dtype=jnp.float32))(x)
 
 
 class Critic(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(128, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(32, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        x = nn.Dense(128, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
+        x = nn.Dense(32, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
         return nn.Dense(1, kernel_init=orthogonal(1, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
 
@@ -180,7 +180,7 @@ def _make_envs_common(
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         if not terminate_on_success:
             tasks = tasks[env_id:(env_id+5)]
-        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
 
@@ -301,7 +301,13 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
-        mean, std = actor.apply(state.params.actor_params, next_obs)
+        output = actor.apply(state.params.actor_params, next_obs)
+        #print(output.shape)
+        mean, std = output[:, :4], output[:, 4:]
+        #print(mean.shape, std.shape)
+        std = jnp.clip(std, LOG_STD_MIN, LOG_STD_MAX) # LOG_STD_MAX
+        std = jnp.exp(std)
+        #exit(0)
         key, subkey = jax.random.split(key)
         dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         action = dist.sample(seed=subkey)
@@ -324,7 +330,10 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
-        mean, std = actor.apply(params.actor_params, x)
+        output = actor.apply(params.actor_params, x)
+        mean, std = output[:, :4], output[:, 4:]
+        std = jnp.clip(std, LOG_STD_MIN, LOG_STD_MAX) # LOG_STD_MAX
+        std = jnp.exp(std)
         dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         value = critic.apply(params.critic_params, x)
         logprob = dist.log_prob(action)
@@ -401,6 +410,7 @@ if __name__ == "__main__":
         b_returns = storage.returns.reshape(-1)
         b_values = storage.values.reshape(-1)
 
+        @jax.jit
         def ppo_loss(params, x, a, mb_values, logp, mb_advantages, mb_returns):
             newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
             logratio = newlogprob - logp

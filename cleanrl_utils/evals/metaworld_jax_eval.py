@@ -161,8 +161,10 @@ def ppo_evaluation(
 
     while not eval_done(episodic_returns):
         key, action_key = jax.random.split(key)
-        mean, std = actor.apply(agent_state.params.actor_params, obs)
-        dist = distrax.Normal(loc=mean, scale=std)
+        output = actor.apply(agent_state.params.actor_params, obs)
+        mean, std = output[:, :4], output[:, 4:]
+        std = jnp.exp(std)
+        dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         actions = jax.device_get(dist.sample(seed=action_key))
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
