@@ -1,4 +1,5 @@
-metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git
+# metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git
+metaworld @ git+ssh://git@github.com/reginald-mclean/Metaworld.git@testing_V1_reward_functions
 moviepy
 mujoco
 tensorboard
