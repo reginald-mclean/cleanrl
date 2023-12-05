@@ -54,10 +54,11 @@ def parse_args():
                         help="the number episodes collected for each env before training, the trial size")
     parser.add_argument("--trial-batch-size", type=int, default=10)
     parser.add_argument("--recurrent-state-size", type=int, default=256)
+    parser.add_argument("--hidden-size", type=int, default=512)
     parser.add_argument("--recurrent-type", type=str, default="gru")
-    parser.add_argument("--recurrent-num-layers", type=int, default=2)
 
     parser.add_argument("--reward-version", type=str, default="")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "rmsprop"])
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="ML10",
@@ -78,6 +79,7 @@ def parse_args():
         help="coefficient of the entropy")
     parser.add_argument("--max-grad-norm", type=float, default=0.5,
         help="the maximum norm for the gradient clipping")
+    parser.add_argument("--norm-advantage", type=bool, default=False)
 
     parser.add_argument("--eval-freq", type=int, default=100_000,
         help="how many steps to do before evaluating the agent")
@@ -102,7 +104,7 @@ def _make_envs_common(
     terminate_on_success: bool = False,
     task_select: str = "random",
     total_tasks_per_class: Optional[int] = None,
-    reward_version="v1"
+    reward_version="v1",
 ) -> Tuple[gym.vector.VectorEnv, List[str]]:
     all_classes = (
         benchmark.train_classes if split == "train" else benchmark.test_classes
@@ -289,28 +291,27 @@ class RL2Policy(nn.Module):
 
     @nn.compact
     def __call__(self, x, carry) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
-        for _ in range(args.recurrent_num_layers):
-            if self.args.recurrent_type == "gru":
-                carry, out = nn.GRUCell(features=self.args.recurrent_state_size)(
-                    carry, x
-                )
-            elif self.args.recurrent_type == "lstm":
-                carry, out = nn.OptimizedLSTMCell(
-                    features=self.args.recurrent_state_size
-                )(carry, x)
-                x = out
+        if self.args.recurrent_type == "gru":
+            carry, x = nn.GRUCell(features=self.args.recurrent_state_size)(carry, x)
+        elif self.args.recurrent_type == "lstm":
+            carry, x = nn.OptimizedLSTMCell(features=self.args.recurrent_state_size)(
+                carry, x
+            )
+
+        x = nn.Dense(args.hidden_size)(x)
+        x = nn.relu(x)
 
         log_sigma = nn.Dense(
             np.array(self.envs.single_action_space.shape).prod(),
             kernel_init=uniform_init(1e-3),
             bias_init=uniform_init(1e-3),
-        )(out)
+        )(x)
 
         mu = nn.Dense(
             np.array(self.envs.single_action_space.shape).prod(),
             kernel_init=uniform_init(1e-3),
             bias_init=uniform_init(1e-3),
-        )(out)
+        )(x)
         log_sigma = jax.lax.clamp(self.LOG_STD_MIN, log_sigma, self.LOG_STD_MAX)
         return mu, log_sigma, carry
 
@@ -395,6 +396,7 @@ def update_rl2_ppo(
         )
         for i in rollout_inds:
             rollouts = meta_rollouts[i]
+            # TODO
             carry = agent.initialize_carry((rollouts.observations.shape[0], 1))
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
@@ -502,7 +504,7 @@ if __name__ == "__main__":
         num_parallel_envs=args.num_parallel_envs,
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
-        reward_version=args.reward_version
+        reward_version=args.reward_version,
     )
     eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
@@ -510,7 +512,7 @@ if __name__ == "__main__":
         seed=args.seed,
         max_episode_steps=args.max_episode_steps,
         total_tasks_per_class=args.num_evaluation_goals,
-        reward_version=args.reward_version
+        reward_version=args.reward_version,
     )
 
     envs.single_observation_space.dtype = np.float32
@@ -537,7 +539,7 @@ if __name__ == "__main__":
         params=agent.init(agent_init_key, obs, dummy_carry),
         tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
-            optax.adam(learning_rate=args.learning_rate),
+            getattr(optax, args.optimizer)(learning_rate=args.learning_rate),
         ),
     )
 
@@ -564,7 +566,7 @@ if __name__ == "__main__":
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
         "fit_baseline": fit_baseline,
-        "normalize_advantages": False,
+        "normalize_advantages": args.norm_advantage,
     }
     total_steps = 0
     steps_per_iter = (
