@@ -8,7 +8,7 @@ from functools import partial
 import functools
 from collections import deque
 import sys
-sys.path.append('/home/reggiemclean/clip4clip/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -28,10 +28,11 @@ from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 import distrax
 from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
-from jax.config import config
 from clip4clip.reward import RewardCalculator
 from clip4clip.util   import get_args as clip_args
 import torch
+from argparse import Namespace
+
 
 # config.update('jax_disable_jit', True)
 # config.update("jax_enable_x64", True)
@@ -99,388 +100,9 @@ def parse_args():
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
 
-    parser.add_argument(
-        "--do_pretrain", action="store_true", help="Whether to run training."
-    )
-    parser.add_argument(
-        "--do_train", action="store_true", help="Whether to run training."
-    )
-    parser.add_argument(
-        "--do_eval",
-        default=True,
-        action="store_true",
-        help="Whether to run eval.",
-    )
-    parser.add_argument(
-        "--eval_on_val",
-        default=False,
-        action="store_true",
-        help="If True, run do_eval evaluation on the validation set. Else run on the test set.",
-    )
-
-    parser.add_argument("--train_csv", type=str, default="data/.train.csv", help="")
-    parser.add_argument("--val_csv", type=str, default="data/.val.csv", help="")
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default=f"/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/",
-        help="data pickle file path",
-    )
-    parser.add_argument(
-        "--features_path",
-        type=str,
-        default=f"/home/reggiemclean/clip4clip/clip4clip_data/",
-        help="feature path",
-    )
-    parser.add_argument(
-        "--test_data_path",
-        type=str,
-        default=None,
-        help="data path for test data",
-    )
-    parser.add_argument(
-        "--test_features_path",
-        type=str,
-        default=None,
-        help="feature path for test data",
-    )
-    parser.add_argument(
-        "--evaluate_test_accuracy",
-        default=False,
-        action="store_true",
-        help="If True, evaluate accuracy on test data.",
-    )
-    parser.add_argument(
-        "--dev",
-        default=False,
-        action="store_true",
-        help="If True, use only a few batches of data in training and validation for development purposes.",
-    )
-
-    parser.add_argument("--num_thread_reader", type=int, default=1, help="")
-    parser.add_argument(
-        "--lr", type=float, default=0.0001, help="initial learning rate"
-    )
-    parser.add_argument("--epochs", type=int, default=20, help="upper epoch limit")
-    parser.add_argument("--batch_size", type=int, default=256, help="batch size")
-    parser.add_argument(
-        "--batch_size_val", type=int, default=16, help="batch size eval"
-    )
-    parser.add_argument(
-        "--lr_decay", type=float, default=0.9, help="Learning rate exp epoch decay"
-    )
-    parser.add_argument(
-        "--n_display", type=int, default=100, help="Information display frequence"
-    )
-    parser.add_argument(
-        "--video_dim", type=int, default=1024, help="video feature dimension"
-    )
-    parser.add_argument(
-        "--video_max_len", type=int, default=-1, help="Max length of video"
-    )
-    parser.add_argument(
-        "--deduplicate_captions",
-        action="store_true",
-        default=False,
-        help="Whether to remove duplicate captions in each batch.",
-    )
-    parser.add_argument("--max_words", type=int, default=32, help="")
-    parser.add_argument("--max_frames", type=int, default=12, help="")
-    parser.add_argument("--feature_framerate", type=int, default=1, help="")
-    parser.add_argument("--margin", type=float, default=0.1, help="margin for loss")
-    parser.add_argument(
-        "--hard_negative_rate",
-        type=float,
-        default=0.5,
-        help="rate of intra negative sample",
-    )
-    parser.add_argument(
-        "--augment_images",
-        action="store_true",
-        default=False,
-        help="Whether to add image augmentations.",
-    )
-    parser.add_argument(
-        "--add_reversed_negatives",
-        action="store_true",
-        default=False,
-        help="Whether to use the videos played in reverse as negative examples.",
-    )
-    parser.add_argument(
-        "--test_on_reversed_negatives",
-        action="store_true",
-        default=False,
-        help="Whether to use the videos played in reverse as negative examples also at evaluation time.",
-    )
-    parser.add_argument(
-        "--use_failures_as_negatives_only",
-        action="store_true",
-        default=False,
-        help="Whether to only use the videos demonstrating failures as negative examples for other tasks.",
-    )
-    parser.add_argument(
-        "--success_data_only",
-        action="store_true",
-        default=False,
-        help="Whether the dataset includes only successful trajectories. If True, do not compute strict AUC.",
-    )
-    parser.add_argument(
-        "--loss_type",
-        type=str,
-        default="cross_entropy",
-        help="Type of loss function to use",
-    )
-    parser.add_argument(
-        "--dist_type",
-        type=str,
-        default="cosine",
-        help="Type of distance function to use between embeddings",
-    )
-    parser.add_argument(
-        "--triplet_margin",
-        type=float,
-        default=0.2,
-        help="Margin to enforce between positive and negative pairs in triplet loss",
-    )
-    parser.add_argument(
-        "--progress_margin",
-        type=float,
-        default=None,
-        help="Margin to enforce between successively longer segments of the video.",
-    )
-    parser.add_argument(
-        "--main_eval_metric",
-        type=str,
-        default="loss",
-        help="Which metric to use for model selection",
-    )
-    parser.add_argument(
-        "--other_eval_metrics",
-        type=str,
-        default=None,
-        help="Other eval metrics for which to keep best checkpoints.",
-    )
-    parser.add_argument(
-        "--n_ckpts_to_keep",
-        type=int,
-        default=1,
-        help="The number of checkpoints to keep in addition to the best epoch. Set to -1 to keep all.",
-    )
-
-    parser.add_argument(
-        "--negative_weighting",
-        type=int,
-        default=1,
-        help="Weight the loss for intra negative",
-    )
-    parser.add_argument(
-        "--n_pair", type=int, default=1, help="Num of pair to output from data loader"
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        default=f"/home/reggiemclean/clip4clip/ckpts/ckpt_vlm_retrieval_looseType",
-        type=str,
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument(
-        "--wandb_entity",
-        default="",
-        type=str,
-        help="Name of the weights & biases entity to use, if any.",
-    )
-    parser.add_argument(
-        "--wandb_project",
-        default="",
-        type=str,
-        help="Name of the weights & biases project to use, if any.",
-    )
-    parser.add_argument(
-        "--cross_model",
-        default="cross-base",
-        type=str,
-        required=False,
-        help="Cross module",
-    )
-    parser.add_argument(
-        "--init_model",
-        default=None,
-        type=str,
-        required=False,
-        help="Initial model.",
-    )
-    parser.add_argument(
-        "--resume_model",
-        default=None,
-        type=str,
-        required=False,
-        help="Resume train model.",
-    )
-    parser.add_argument(
-        "--resume_from_latest",
-        action="store_true",
-        default=False,
-        help="Whether to resume from the latest checkpoint.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        default=False,
-        help="Whether to overwrite experiment in output_dir.",
-    )
-    parser.add_argument(
-        "--do_lower_case",
-        action="store_true",
-        help="Set this flag if you are using an uncased model.",
-    )
-    parser.add_argument(
-        "--warmup_proportion",
-        default=0.1,
-        type=float,
-        help="Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% of training.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--n_gpu", type=int, default=1, help="Changed in the execute process."
-    )
-
-    parser.add_argument(
-        "--cache_dir",
-        default="",
-        type=str,
-        help="Where do you want to store the pre-trained models downloaded from s3",
-    )
-
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
-    )
-    parser.add_argument(
-        "--fp16_opt_level",
-        type=str,
-        default="O1",
-        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-        "See details at https://nvidia.github.io/apex/amp.html",
-    )
-
-    parser.add_argument(
-        "--task_type",
-        default="retrieval",
-        type=str,
-        help="Point the task `retrieval` to finetune.",
-    )
-    parser.add_argument(
-        "--datatype", default="vlm", type=str, help="Point the dataset to finetune."
-    )
-    parser.add_argument(
-        "--test_datatype", default=None, type=str, help="Point the dataset to test on."
-    )
-    parser.add_argument(
-        "--test_set_name",
-        default="test",
-        type=str,
-        help="Test data type added to output path when saving eval results.",
-    )
-
-    parser.add_argument("--world_size", default=0, type=int, help="distribted training")
-    parser.add_argument("--local_rank", default=0, type=int, help="distribted training")
-    parser.add_argument("--rank", default=0, type=int, help="distribted training")
-    parser.add_argument(
-        "--coef_lr", type=float, default=1.0, help="coefficient for bert branch."
-    )
-    parser.add_argument(
-        "--use_mil",
-        action="store_true",
-        help="Whether use MIL as Miech et. al. (2020).",
-    )
-    parser.add_argument(
-        "--sampled_use_mil",
-        action="store_true",
-        help="Whether MIL, has a high priority than use_mil.",
-    )
-
-    parser.add_argument(
-        "--text_num_hidden_layers", type=int, default=12, help="Layer NO. of text."
-    )
-    parser.add_argument(
-        "--visual_num_hidden_layers", type=int, default=12, help="Layer NO. of visual."
-    )
-    parser.add_argument(
-        "--cross_num_hidden_layers", type=int, default=4, help="Layer NO. of cross."
-    )
-
-    parser.add_argument(
-        "--loose_type",
-        action="store_true",
-        help="Default using tight type for retrieval.",
-    )
-    parser.add_argument("--expand_msrvtt_sentences", action="store_true", help="")
-
-    parser.add_argument(
-        "--train_frame_order",
-        type=int,
-        default=0,
-        choices=[0, 1, 2],
-        help="Frame order, 0: ordinary order; 1: reverse order; 2: random order.",
-    )
-    parser.add_argument(
-        "--eval_frame_order",
-        type=int,
-        default=0,
-        choices=[0, 1, 2],
-        help="Frame order, 0: ordinary order; 1: reverse order; 2: random order.",
-    )
-
-    parser.add_argument(
-        "--freeze_layer_num",
-        type=int,
-        default=0,
-        help="Layer NO. of CLIP need to freeze.",
-    )
-    parser.add_argument(
-        "--slice_framepos",
-        type=int,
-        default=0,
-        choices=[0, 1, 2, 3],
-        help="0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly; 3: sample randomly from uniform intervals.",
-    )
-    parser.add_argument(
-        "--test_slice_framepos",
-        type=int,
-        default=0,
-        choices=[0, 1, 2, 3],
-        help="0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly; 3: sample randomly from uniform intervals.",
-    )
-    parser.add_argument(
-        "--linear_patch",
-        type=str,
-        default="2d",
-        choices=["2d", "3d"],
-        help="linear projection of flattened patches.",
-    )
-    parser.add_argument(
-        "--sim_header",
-        type=str,
-        default="meanP",
-        choices=["meanP", "seqLSTM", "seqTransf", "tightTransf"],
-        help="choice a similarity header.",
-    )
-
-    parser.add_argument(
-        "--pretrained_clip_name",
-        default="ViT-B/32",
-        type=str,
-        help="Choose a CLIP version",
-    )
-
-    args = parser.parse_args()
-
+    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path='/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/', features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='minttusofia', wandb_project='nlr', cross_model='cross-base', init_model=None, resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
+    args = parser.parse_args(namespace=c4c_args)
+    print(args)
 
     args.loose_type = args.sim_header != "tightTransf"
     if args.test_datatype is None:
@@ -577,18 +199,33 @@ def _make_envs_common(
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
-        if not terminate_on_success:
-            tasks = tasks[env_id:(env_id+5)]
-        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks, True)
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
-
-    return gym.vector.AsyncVectorEnv(
+    print(benchmark.train_classes.items())
+    return gym.vector.SyncVectorEnv(
         [
             partial(init_each_env, env_cls=env_cls, name=list(benchmark.train_classes.keys())[0], env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
+
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+def _transform(n_px):
+        return Compose(
+            [
+                Resize(n_px, interpolation=Image.Resampling.BICUBIC),
+                CenterCrop(n_px),
+                lambda image: image.convert("RGB"),
+                ToTensor(),
+                Normalize(
+                    (0.48145466, 0.4578275, 0.40821073),
+                    (0.26862954, 0.26130258, 0.27577711),
+                ),
+            ]
+)
+
 
 
 LOG_STD_MAX = 1.5
@@ -640,9 +277,11 @@ if __name__ == "__main__":
         for i in range(1, 10):
             benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
+    args.ppo_batch_size = args.num_envs * args.num_steps
+
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
     envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
-    eval_envs = make_eval_envs(eval_benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
+    eval_envs = make_eval_envs(benchmark if ("MT10" in args.env_id or "MT50" in args.env_id) else eval_benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
@@ -652,8 +291,8 @@ if __name__ == "__main__":
     reward_model = RewardCalculator(args=args)
     reward_model.model.eval()
 
-    frames = np.zeros((args.num_envs, 500, 480, 480, 3))
-
+    frames = np.zeros((args.num_envs, args.num_steps, 480, 480, 3))
+    new_frames = torch.zeros((args.num_envs, args.num_steps, 3, 224, 224))
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -847,36 +486,30 @@ if __name__ == "__main__":
     global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
     global_episodic_length: Deque[int] = deque([], maxlen=20 * args.num_envs)
 
-    text_description = 'pick the red object up and place it on the blue goal'
+    task_desc = 'Grasp the puck from one bin and place it into another bin'
+    pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
+    pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
+    video_mask = torch.from_numpy(np.asarray([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])).unsqueeze(0).unsqueeze(0).repeat(20, 1, 1).to('cuda:0')
+    new_images = torch.zeros((args.num_envs, args.num_steps, 3, 224, 224))
+
+    transform = _transform(224)
+
+    kwargs = {"render_mode":"rgb_array", "camera_name":"camera2"}
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
-            images_needed = np.linspace(0, step%500, num=12, dtype=int)
+            print(f'step: {step}')
             global_step += 1 * args.num_envs
             storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
             # TRY NOT TO MODIFY: execute the game and log data.
             
             next_obs, _, truncate, terminate, infos = envs.step(action)
-            current_frames = envs.call('render')
-            for idx, f in enumerate(current_frames):
-                frames[idx, step % 500] = f
-                # frames = np.zeros((args.num_envs, 500, 480, 480, 3))
 
-            current_videos = frames[:, images_needed]
-            data = []
-            reward = []
-            batch_list_t = []
-            batch_list_v = []
-            batch_sequence_output_list, batch_visual_output_list = [], []
-            for env_num in range(args.num_envs):
-                input_ids, input_mask, segment_ids, video, video_mask = reward_model.dataloader.get_encoded_data(current_videos[env_num], text_description)
-                sequence_output, visual_output = reward_model.model.get_sequence_visual_output(torch.from_numpy(input_ids).to('cuda:0'), torch.from_numpy(segment_ids).to('cuda:0'), torch.from_numpy(input_mask).to('cuda:0'),
-                         torch.from_numpy(video).unsqueeze(0).to('cuda:0'), torch.from_numpy(video_mask).to('cuda:0'))
-                res = reward_model.model.get_similarity_logits(sequence_output, visual_output,  torch.from_numpy(input_mask).to('cuda:0'),  torch.from_numpy(video_mask).to('cuda:0'), loose_type=reward_model.model.loose_type)
-                res = res[0].cpu().detach().numpy()[0][0]
-                reward.append(res)
+            current_frames = envs.call('render', kwargs=kwargs)
+            
+            for idx, f in enumerate(current_frames):
+                frames[idx, step] = np.rot90(np.rot90(f))
             next_done = np.logical_or(truncate, terminate)
-            storage = storage.replace(rewards=storage.rewards.at[step].set(jnp.asarray(reward)))
             if "final_info" not in infos:
                 continue
 
@@ -886,8 +519,9 @@ if __name__ == "__main__":
                     continue
                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 #print(i, info)
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                global_episodic_return.append(info["episode"]["r"])
+                global_episodic_length.append(info["episode"]["l"])
+
         return agent_state, next_obs, next_done, storage, key, global_step
 
     #print(f'num updates {args.num_updates}')
@@ -945,6 +579,28 @@ if __name__ == "__main__":
         agent_state, next_obs, next_done, storage, key, global_step = rollout(
             agent_state, next_obs, next_done, storage, key, global_step
         )
+        batches = torch.zeros((args.num_envs, args.num_steps, 1, 12, 1, 3, 224, 224))
+
+        for i in range(args.num_envs):
+            for j in range(args.num_steps):
+                new_frames[i][j] = transform(Image.fromarray(frames[i][j].astype(np.uint8)))
+                images = torch.linspace(0, j, 12, dtype=torch.int)
+                curr_video = new_frames[i][images]
+                curr_video = curr_video.unsqueeze(1)
+                curr_video = curr_video.unsqueeze(0)
+                curr_video = curr_video.unsqueeze(0)
+                curr_video = curr_video
+                batches[i][0] = curr_video
+
+        batches = torch.reshape(batches, (args.num_envs, 25, 20, 1, 12, 1, 3, 224, 224))
+        
+        for i in range(args.num_envs):
+            for j in range(25):
+                with torch.no_grad():
+                    a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches[i][j].to('cuda:0'), video_mask)
+                    scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
+                scores = scores[:,:,-1:].squeeze()
+                storage = storage.replace(rewards=storage.rewards.at[j:(j+20), i].set(jnp.array(scores.cpu().numpy())))
         #print(update)
         storage = compute_gae(agent_state, next_obs, next_done, storage)
         #print(jax.make_jaxpr(update_ppo)(agent_state, storage, key))
