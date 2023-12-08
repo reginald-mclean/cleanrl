@@ -497,7 +497,6 @@ if __name__ == "__main__":
     kwargs = {"render_mode":"rgb_array", "camera_name":"camera2"}
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
-            print(f'step: {step}')
             global_step += 1 * args.num_envs
             storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
