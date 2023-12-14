@@ -1,5 +1,7 @@
 import argparse
 import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="6"
 import random
 import time
 from distutils.util import strtobool
@@ -8,7 +10,7 @@ from functools import partial
 import functools
 from collections import deque
 import sys
-sys.path.append('/mnt/nvme/cleanrl')
+sys.path.append('/home/reggiemclean/clip4clip/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -100,9 +102,10 @@ def parse_args():
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
 
-    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path='/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/', features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='minttusofia', wandb_project='nlr', cross_model='cross-base', init_model=None, resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
+    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path='/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/', features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='reggies-phd-research', wandb_project='VLM-PPO-State-Based', cross_model='cross-base', init_model=None, resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
     args = parser.parse_args(namespace=c4c_args)
-    print(args)
+    
+    print(args.init_model)
 
     args.loose_type = args.sim_header != "tightTransf"
     if args.test_datatype is None:
@@ -123,7 +126,7 @@ def parse_args():
     args.ppo_batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.ppo_batch_size // args.num_minibatches)
     args.num_updates = int(int(args.total_timesteps) // args.ppo_batch_size)
-
+    args.init_model = '/home/reggiemclean/clip4clip/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
     # fmt: on
     return args
 
@@ -226,10 +229,55 @@ def _transform(n_px):
             ]
 )
 
+def scale(x, out_range=(-1, 1), axis=None):
+    domain = np.min(x, axis), np.max(x, axis)
+    y = (x - (domain[1] + domain[0]) / 2) / (domain[1] - domain[0])
+    return y * (out_range[1] - out_range[0]) + (out_range[1] + out_range[0]) / 2
+
+class RunningMeanStd:
+    """Tracks the mean, variance and count of values."""
+
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    def __init__(self, epsilon=1e-4, shape=()):
+        """Tracks the mean, variance and count of values."""
+        self.mean = jnp.zeros(shape)
+        self.var = jnp.ones(shape)
+        self.count = epsilon
+
+    def update(self, x):
+        """Updates the mean, var and count from a batch of samples."""
+        batch_mean = jnp.mean(x, axis=0)
+        batch_var = jnp.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Updates from batch mean, variance and count moments."""
+        self.mean, self.var, self.count = update_mean_var_count_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
 
 
-LOG_STD_MAX = 1.5
-LOG_STD_MIN = 0.5
+def update_mean_var_count_from_moments(
+    mean, var, count, batch_mean, batch_var, batch_count
+):
+    """Updates the mean, var and count using the previous mean, var, count and batch values."""
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    new_var = M2 / tot_count
+    new_count = tot_count
+
+    return new_mean, new_var, new_count
+
+
+
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
 
 if __name__ == "__main__":
     args = parse_args()
@@ -495,6 +543,11 @@ if __name__ == "__main__":
     transform = _transform(224)
 
     kwargs = {"render_mode":"rgb_array", "camera_name":"camera2"}
+
+    gamma = 0.99
+    epsilon = 1e-8
+    returns = jnp.zeros(args.num_envs)
+    return_rms = RunningMeanStd(shape=())
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
@@ -523,6 +576,10 @@ if __name__ == "__main__":
 
         return agent_state, next_obs, next_done, storage, key, global_step
 
+    def scale(x, out_range=(-1, 1), axis=None):
+        domain = jnp.min(x, axis), jnp.max(x, axis)
+        vals = (out_range[1] - out_range[0]) * ((x - domain[0]) / (domain[1] - domain[0])) + out_range[0]
+        return vals
     #print(f'num updates {args.num_updates}')
 
     for update in range(1, args.num_updates + 1):
@@ -591,18 +648,27 @@ if __name__ == "__main__":
                 curr_video = curr_video
                 batches[i][0] = curr_video
 
-        batches = torch.reshape(batches, (args.num_envs, 25, 20, 1, 12, 1, 3, 224, 224))
-        
+        batches = torch.reshape(batches, (args.num_envs, 50, 20, 1, 12, 1, 3, 224, 224))
+        x_max = None
+        x_min = None
         for i in range(args.num_envs):
-            for j in range(25):
+            for j in range(50):
                 with torch.no_grad():
                     a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches[i][j].to('cuda:0'), video_mask)
                     scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
                 scores = scores[:,:,-1:].squeeze()
                 storage = storage.replace(rewards=storage.rewards.at[j:(j+20), i].set(jnp.array(scores.cpu().numpy())))
-        #print(update)
+
+        for i in range(11, args.num_steps):
+            terminated = 1 if i % 500 == 499 else 0
+            returns = returns * gamma * (1 - terminated) + storage.rewards[i]
+            return_rms.update(returns)
+            rewards = storage.rewards[i] / jnp.sqrt(return_rms.var + epsilon)
+            storage = storage.replace(rewards=storage.rewards.at[i].set(rewards))
+        storage = storage.replace(rewards=storage.rewards.at[:11].set(0.0))
+        
+        #print(jnp.min(storage.rewards), jnp.max(storage.rewards))
         storage = compute_gae(agent_state, next_obs, next_done, storage)
-        #print(jax.make_jaxpr(update_ppo)(agent_state, storage, key))
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
             agent_state,
             storage,

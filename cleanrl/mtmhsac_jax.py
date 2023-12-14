@@ -1,15 +1,20 @@
 # ruff: noqa: E402
+import os 
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import argparse
-import os
 import random
 import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import Deque, NamedTuple, Optional, Tuple, Union
+from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+import sys
+sys.path.append('/home/reggiemclean/clip4clip/cleanrl')
+from argparse import Namespace
 import distrax
 import flax
 import flax.linen as nn
@@ -28,7 +33,8 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-
+from clip4clip.reward import RewardCalculator
+import torch
 
 def parse_args():
     # fmt: off
@@ -39,9 +45,9 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="MTSAC-State-VLM-Reward",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
+    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
@@ -74,9 +80,66 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-    args = parser.parse_args()
+
+    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path='/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/', features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='reggies-phd-research', wandb_project='VLM-PPO-State-Based', cross_model='cross-base', init_model='', resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
+    args = parser.parse_args(namespace=c4c_args)
+    args.init_model = '/home/reggiemclean/clip4clip/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
     # fmt: on
     return args
+
+
+import metaworld
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
+from cleanrl_utils.wrappers import metaworld_wrappers
+
+def _make_envs_common(
+    benchmark: metaworld.Benchmark,
+    seed: int,
+    max_episode_steps: Optional[int] = None,
+    use_one_hot: bool = True,
+    terminate_on_success: bool = False,
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+        env = env_cls(render_mode='rgb_array')
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        if terminate_on_success:
+            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if use_one_hot:
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
+        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env.action_space.seed(seed)
+        return env
+    print(benchmark.train_classes.items())
+    return gym.vector.SyncVectorEnv(
+        [
+            partial(init_each_env, env_cls=env_cls, name=list(benchmark.train_classes.keys())[0], env_id=env_id)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from PIL import Image
+def _transform(n_px):
+        return Compose(
+            [
+                Resize(n_px, interpolation=Image.Resampling.BICUBIC),
+                CenterCrop(n_px),
+                lambda image: image.convert("RGB"),
+                ToTensor(),
+                Normalize(
+                    (0.48145466, 0.4578275, 0.40821073),
+                    (0.26862954, 0.26130258, 0.27577711),
+                ),
+            ]
+)
+
+def scale(x, out_range=(-1, 1), axis=None):
+    domain = np.min(x, axis), np.max(x, axis)
+    y = (x - (domain[1] + domain[0]) / 2) / (domain[1] - domain[0])
+    return y * (out_range[1] - out_range[0]) + (out_range[1] + out_range[0]) / 2
+
 
 
 def split_obs_task_id(
@@ -476,16 +539,24 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
 
     # env setup
+    make_envs = partial(_make_envs_common, terminate_on_success=False)
+    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
+        args.num_envs = 10
     elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
+        args.num_envs = 50
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+        eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+        args.num_envs = 10
+        for i in range(1, 10):
+            benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    )
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
+
     envs = make_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
     )
@@ -502,7 +573,7 @@ if __name__ == "__main__":
     # agent setup
     rb = MultiTaskReplayBuffer(
         total_capacity=args.buffer_size,
-        num_tasks=NUM_TASKS,
+        num_tasks=NUM_TASKS if (args.env_id == "MT10" or args.env_id == "MT50") else 1,
         envs=envs,
         use_torch=False,
         seed=args.seed,
@@ -524,13 +595,26 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
+    reward_model = RewardCalculator(args=args)
+    reward_model.model.eval()
+
+    print(args.num_envs, args.max_episode_steps, 3, 224, 224)
+    frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
+
+    task_desc = 'Grasp the puck from one bin and place it into another bin'
+    pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
+    pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
+    video_mask = torch.from_numpy(np.asarray([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
+    new_images = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
+    
+    transform = _transform(224)
 
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
         total_steps = global_step * NUM_TASKS
-
+        print(global_step, total_steps)
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
@@ -540,8 +624,30 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
+        current_frames = envs.call('render')
 
+        for idx, f in enumerate(current_frames):
+            frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
+        batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
+
+        for i in range(args.num_envs):
+            images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
+            curr_video = frames[i][images]
+            curr_video = curr_video.unsqueeze(1)
+            curr_video = curr_video.unsqueeze(0)
+            curr_video = curr_video.unsqueeze(0)
+            batches[i][0] = curr_video
+
+        #for i in range(args.num_envs):
+        with torch.no_grad():
+            a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
+            scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
+        rewards = scores[:,:,-1:].squeeze().cpu().numpy()
+        print(np.mean(og_rewards), np.mean(rewards))
+
+        writer.add_scalar("charts/reward_original", np.mean(og_rewards))
+        writer.add_scalar("charts/reward_vlm", np.mean(rewards))
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
