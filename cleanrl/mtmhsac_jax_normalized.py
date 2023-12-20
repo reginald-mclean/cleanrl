@@ -1,7 +1,7 @@
 # ruff: noqa: E402
 import os 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
+os.environ["CUDA_VISIBLE_DEVICES"]="6"
 import argparse
 import random
 import time
@@ -502,6 +502,46 @@ def update(
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
+class RunningMeanStd:
+    """Tracks the mean, variance and count of values."""
+
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    def __init__(self, epsilon=1e-4, shape=()):
+        """Tracks the mean, variance and count of values."""
+        self.mean = jnp.zeros(shape)
+        self.var = jnp.ones(shape)
+        self.count = epsilon
+
+    def update(self, x):
+        """Updates the mean, var and count from a batch of samples."""
+        batch_mean = jnp.mean(x, axis=0)
+        batch_var = jnp.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Updates from batch mean, variance and count moments."""
+        self.mean, self.var, self.count = update_mean_var_count_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
+
+
+def update_mean_var_count_from_moments(
+    mean, var, count, batch_mean, batch_var, batch_count
+):
+    """Updates the mean, var and count using the previous mean, var, count and batch values."""
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    new_var = M2 / tot_count
+    new_count = tot_count
+
+    return new_mean, new_var, new_count
+
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
@@ -616,6 +656,10 @@ if __name__ == "__main__":
     new_images = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
     
     transform = _transform(224)
+    gamma = args.gamma
+    epsilon = 1e-8
+    returns = jnp.zeros(args.num_envs)
+    return_rms = RunningMeanStd(shape=())
 
     start_time = time.time()
 
@@ -651,9 +695,14 @@ if __name__ == "__main__":
             a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
             scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
         rewards = scores[:,:,-1:].squeeze().cpu().numpy()
-
+        
+        # REWARD NORMALIZATION USING: Gymnasium wrapper logic
+        terminated = 1 - terminations
+        returns = returns * gamma * (1 - terminated) + rewards
+        return_rms.update(returns)
+        rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
         writer.add_scalar("charts/reward_original", np.mean(og_rewards))
-        writer.add_scalar("charts/reward_vlm", np.mean(rewards))
+        writer.add_scalar("charts/reward_vlm", np.mean(np.array(rewards)))
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:

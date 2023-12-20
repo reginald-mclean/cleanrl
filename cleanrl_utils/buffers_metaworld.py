@@ -122,7 +122,6 @@ class MultiTaskReplayBuffer:
         Returns:
             ReplayBufferSamples: A batch of samples of batch shape (batch_size,).
         """
-        print(batch_size, self.num_tasks, batch_size % self.num_tasks)
         assert batch_size % self.num_tasks == 0, "Batch size must be divisible by the number of tasks."
         single_task_batch_size = batch_size // self.num_tasks
 

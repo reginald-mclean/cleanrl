@@ -9,6 +9,8 @@ from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
+from argparse import Namespace
+
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -33,9 +35,6 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-from clip4clip.reward import RewardCalculator
-import torch
-import pickle
 
 def parse_args():
     # fmt: off
@@ -81,10 +80,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-
-    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path='/home/reggiemclean/clip4clip/clip4clip_data/vlm_dataset/', features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='reggies-phd-research', wandb_project='VLM-PPO-State-Based', cross_model='cross-base', init_model='', resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
-    args = parser.parse_args(namespace=c4c_args)
-    args.init_model = '/home/reggiemclean/clip4clip/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
+    args = parser.parse_args()
     # fmt: on
     return args
 
@@ -102,7 +98,7 @@ def _make_envs_common(
     terminate_on_success: bool = False,
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        env = env_cls(render_mode='rgb_array')
+        env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
@@ -119,29 +115,6 @@ def _make_envs_common(
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
-
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-from PIL import Image
-def _transform(n_px):
-        return Compose(
-            [
-                Resize(n_px, interpolation=Image.Resampling.BICUBIC),
-                CenterCrop(n_px),
-                lambda image: image.convert("RGB"),
-                ToTensor(),
-                Normalize(
-                    (0.48145466, 0.4578275, 0.40821073),
-                    (0.26862954, 0.26130258, 0.27577711),
-                ),
-            ]
-)
-
-def scale(x, out_range=(-1, 1), axis=None):
-    domain = np.min(x, axis), np.max(x, axis)
-    y = (x - (domain[1] + domain[0]) / 2) / (domain[1] - domain[0])
-    return y * (out_range[1] - out_range[0]) + (out_range[1] + out_range[0]) / 2
-
-
 
 def split_obs_task_id(
     obs: Union[jax.Array, npt.NDArray], num_tasks: int
@@ -202,7 +175,6 @@ class Actor(nn.Module):
             + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         )
         x = jnp.take_along_axis(x, indices, axis=1)
-
         log_sigma = nn.Dense(
             self.num_actions,
             kernel_init=uniform_init(1e-3),
@@ -596,27 +568,6 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
-    reward_model = RewardCalculator(args=args)
-    reward_model.model.eval()
-
-    frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
-
-    with open('/home/reggiemclean/raw-captions(1).pkl', 'rb') as f:
-        descriptions = pickle.load(f)
-    if args.env_id != 'MT10' and args.env_id != "MT50":
-        task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
-        task_desc = " ".join(task_desc)
-    else:
-        print("not implemented for mt10 or mt50")
-        exit(1)
-
-    pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
-    pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
-    video_mask = torch.from_numpy(np.asarray([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
-    new_images = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
-    
-    transform = _transform(224)
-
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -631,29 +582,8 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
-        current_frames = envs.call('render')
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        for idx, f in enumerate(current_frames):
-            frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
-        batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
-
-        for i in range(args.num_envs):
-            images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
-            curr_video = frames[i][images]
-            curr_video = curr_video.unsqueeze(1)
-            curr_video = curr_video.unsqueeze(0)
-            curr_video = curr_video.unsqueeze(0)
-            batches[i][0] = curr_video
-
-        #for i in range(args.num_envs):
-        with torch.no_grad():
-            a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
-            scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-        rewards = scores[:,:,-1:].squeeze().cpu().numpy()
-
-        writer.add_scalar("charts/reward_original", np.mean(og_rewards))
-        writer.add_scalar("charts/reward_vlm", np.mean(rewards))
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
