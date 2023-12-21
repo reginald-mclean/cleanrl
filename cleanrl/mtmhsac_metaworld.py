@@ -1,7 +1,7 @@
 # ruff: noqa: E402
 import os 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
+os.environ["CUDA_VISIBLE_DEVICES"]="4"
 import argparse
 import random
 import time
@@ -573,6 +573,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
         total_steps = global_step * NUM_TASKS
+        print(total_steps, global_step)
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(

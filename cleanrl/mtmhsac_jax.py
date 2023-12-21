@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
-    parser.add_argument("--max-episode-steps", type=int, default=None,
+    parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -502,6 +502,47 @@ def update(
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
+class RunningMeanStd:
+    """Tracks the mean, variance and count of values."""
+
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    def __init__(self, epsilon=1e-4, shape=()):
+        """Tracks the mean, variance and count of values."""
+        self.mean = jnp.zeros(shape)
+        self.var = jnp.ones(shape)
+        self.count = epsilon
+
+    def update(self, x):
+        """Updates the mean, var and count from a batch of samples."""
+        batch_mean = jnp.mean(x, axis=0)
+        batch_var = jnp.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Updates from batch mean, variance and count moments."""
+        self.mean, self.var, self.count = update_mean_var_count_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
+
+
+def update_mean_var_count_from_moments(
+    mean, var, count, batch_mean, batch_var, batch_count
+):
+    """Updates the mean, var and count using the previous mean, var, count and batch values."""
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    new_var = M2 / tot_count
+    new_count = tot_count
+
+    return new_mean, new_var, new_count
+
+
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
@@ -617,6 +658,12 @@ if __name__ == "__main__":
     
     transform = _transform(224)
 
+    gamma = args.gamma
+    epsilon = 1e-8
+    returns = jnp.zeros(args.num_envs)
+    return_rms = RunningMeanStd(shape=())
+
+
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -637,23 +684,42 @@ if __name__ == "__main__":
         for idx, f in enumerate(current_frames):
             frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
         batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
+        if global_step % args.max_episode_steps > 11:
+            for i in range(args.num_envs):
+                images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
+                curr_video = frames[i][images]
+                curr_video = curr_video.unsqueeze(1)
+                curr_video = curr_video.unsqueeze(0)
+                curr_video = curr_video.unsqueeze(0)
+                batches[i][0] = curr_video
 
-        for i in range(args.num_envs):
-            images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
-            curr_video = frames[i][images]
-            curr_video = curr_video.unsqueeze(1)
-            curr_video = curr_video.unsqueeze(0)
-            curr_video = curr_video.unsqueeze(0)
-            batches[i][0] = curr_video
+            #for i in range(args.num_envs):
+            with torch.no_grad():
+                a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
+                scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
+            rewards = scores[:,:,-1:].squeeze().cpu().numpy()
+            if args.reward_normalization == "gymnasium":
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+            elif args.reward_normalization == "step_12_offset":
+                if global_step % args.max_episode_step > 12:
+                    rewards -= offset
+                elif global_step % args.max_episode_step == 12:
+                    offset = rewards.copy()
+                    rewards -= offset
+            elif args.reward_normalization == "add_constant":
+                assert args.reward_normalization_constant is not None, "Need to set the constant to add via args"
+                rewards += args.reward_normalization_constant
 
-        #for i in range(args.num_envs):
-        with torch.no_grad():
-            a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
-            scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-        rewards = scores[:,:,-1:].squeeze().cpu().numpy()
+
+        else:
+            rewards = np.asarray([0. for _ in range(NUM_TASKS)])
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards))
         writer.add_scalar("charts/reward_vlm", np.mean(rewards))
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
