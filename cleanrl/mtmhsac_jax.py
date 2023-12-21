@@ -71,6 +71,11 @@ def parse_args():
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
+    parser.add_argument("--reward-normalization", type=str, default=None, 
+        help="the reward normalization method to use")
+    parser.add_argument("--reward-normalization-constant", type=float, default=None,
+        help="the reward normalization constant to be added to the rewards")
+
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
