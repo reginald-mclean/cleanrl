@@ -673,6 +673,7 @@ if __name__ == "__main__":
     returns = jnp.zeros(args.num_envs)
     return_rms = RunningMeanStd(shape=())
 
+    offset = None
 
     start_time = time.time()
 
@@ -694,7 +695,7 @@ if __name__ == "__main__":
         for idx, f in enumerate(current_frames):
             frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
         batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
-        if global_step % args.max_episode_steps > 11:
+        if global_step % args.max_episode_steps >= 11:
             for i in range(args.num_envs):
                 images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
                 curr_video = frames[i][images]
@@ -709,10 +710,11 @@ if __name__ == "__main__":
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
             rewards = scores[:,:,-1:].squeeze().cpu().numpy()
             if args.reward_normalization_offset:
-                if global_step % args.max_episode_step > 12:
-                    rewards -= offset
-                elif global_step % args.max_episode_step == 12:
+                print(global_step % args.max_episode_steps)
+                if global_step % args.max_episode_steps == 11:
                     offset = rewards.copy()
+                    rewards -= offset
+                elif global_step % args.max_episode_steps >= 12:
                     rewards -= offset
             if args.reward_normalization_constant:
                 assert args.reward_normalization_constant_value is not None, "Need to set the constant to add via args"
@@ -722,6 +724,7 @@ if __name__ == "__main__":
                 returns = returns * gamma * (1 - terminated) + rewards
                 return_rms.update(returns)
                 rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+                rewards = np.asarray(rewards)
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
 
