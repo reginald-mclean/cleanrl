@@ -71,9 +71,14 @@ def parse_args():
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
-    parser.add_argument("--reward-normalization", type=str, default=None, 
-        help="the reward normalization method to use")
-    parser.add_argument("--reward-normalization-constant", type=float, default=None,
+    parser.add_argument("--reward-normalization-offset", type=bool, default=False, 
+        help="use the values at the 12th step as the value added to each reward")
+    parser.add_argument("--reward-normalization-gymnasium", type=bool, default=False, 
+        help="normalize the rewards using the gymnasium logic")
+    parser.add_argument("--reward-normalization-constant", type=bool, default=False, 
+        help="add a constant to each reward")
+
+    parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
 
     # SAC
@@ -703,27 +708,25 @@ if __name__ == "__main__":
                 a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
             rewards = scores[:,:,-1:].squeeze().cpu().numpy()
-            if args.reward_normalization == "gymnasium":
-                terminated = 1 - terminations
-                returns = returns * gamma * (1 - terminated) + rewards
-                return_rms.update(returns)
-                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-            elif args.reward_normalization == "step_12_offset":
+            if args.reward_normalization_offset:
                 if global_step % args.max_episode_step > 12:
                     rewards -= offset
                 elif global_step % args.max_episode_step == 12:
                     offset = rewards.copy()
                     rewards -= offset
-            elif args.reward_normalization == "add_constant":
-                assert args.reward_normalization_constant is not None, "Need to set the constant to add via args"
-                rewards += args.reward_normalization_constant
-
-
+            if args.reward_normalization_constant:
+                assert args.reward_normalization_constant_value is not None, "Need to set the constant to add via args"
+                rewards += args.reward_normalization_constant_value
+            if args.reward_normalization_gymnasium:
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
 
-        writer.add_scalar("charts/reward_original", np.mean(og_rewards))
-        writer.add_scalar("charts/reward_vlm", np.mean(rewards))
+        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
