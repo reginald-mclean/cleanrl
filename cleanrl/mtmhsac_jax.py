@@ -1,4 +1,4 @@
-# ruff: noqa: E402
+12# ruff: noqa: E402
 import os 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="7"
@@ -111,11 +111,13 @@ def _make_envs_common(
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
 ) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, extra: int) -> gym.Env:
         env = env_cls(render_mode='rgb_array')
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+            if extra == 0:
+                env = gym.wrappers.RecordVideo(env, f'videos/{name}/')
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -123,9 +125,9 @@ def _make_envs_common(
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
-    return gym.vector.SyncVectorEnv(
+    return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0)
+            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0, extra=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -676,6 +678,17 @@ if __name__ == "__main__":
     offset = None
 
     start_time = time.time()
+
+    (
+       eval_success_rate,
+       eval_returns,
+       eval_success_per_task,
+    ) = evaluation(
+       agent=agent,
+       eval_envs=eval_envs,
+       num_episodes=args.evaluation_num_episodes,
+    )
+
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
