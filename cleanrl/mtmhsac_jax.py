@@ -708,9 +708,10 @@ if __name__ == "__main__":
         for idx, f in enumerate(current_frames):
             frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
         batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
+       
         if global_step % args.max_episode_steps >= 11:
             for i in range(args.num_envs):
-                images = torch.linspace(0, global_step % args.max_episode_steps, 12, dtype=torch.int)
+                images = np.linspace(0, global_step % args.max_episode_steps, 12, dtype=int)
                 curr_video = frames[i][images]
                 curr_video = curr_video.unsqueeze(1)
                 curr_video = curr_video.unsqueeze(0)
@@ -722,6 +723,8 @@ if __name__ == "__main__":
                 a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
             rewards = scores[:,:,-1:].squeeze().cpu().numpy()
+
+
             if args.reward_normalization_offset:
                 print(global_step % args.max_episode_steps)
                 if global_step % args.max_episode_steps == 11:
