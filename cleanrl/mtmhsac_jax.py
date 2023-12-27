@@ -562,7 +562,7 @@ def update_mean_var_count_from_moments(
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}_{args.exp_name}_{args.seed}_reward_offset_{args.reward_normalization_offset}_reward_norm_gym_{args.reward_normalization_gymnasium}_reward_norm_constant_{args.reward_normalization_constant}__{int(time.time())}"
+    run_name = f"{args.env_id}_{args.exp_name}_reward_offset_{args.reward_normalization_offset}_reward_norm_gym_{args.reward_normalization_gymnasium}_reward_norm_constant_{args.reward_normalization_constant}"
     if args.track:
         import wandb
 
