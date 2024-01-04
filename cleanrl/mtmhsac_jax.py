@@ -85,10 +85,12 @@ def parse_args():
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
-    parser.add_argument("--clip-grad-norm", type=float, default=1.0,
+    parser.add_argument("--clip-grad-norm", type=float, default=0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+
+
     c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path=DATA_PATH, features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, 
     evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, 
     n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', 
@@ -98,7 +100,7 @@ def parse_args():
     test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, 
     test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
     args = parser.parse_args(namespace=c4c_args)
-    args.init_model = f'{CHKPT_PATH}/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
+    args.init_model = f'{CHKPT_PATH}/ckpt_mw_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
     # fmt: on
     return args
 
@@ -121,7 +123,7 @@ def _make_envs_common(
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
             if extra == 0:
-                env = gym.wrappers.RecordVideo(env, f'videos/{name}/')
+                env = gym.wrappers.RecordVideo(env, f'videos/{name}_{args.seed}_{time.time()}/')
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -717,9 +719,7 @@ if __name__ == "__main__":
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
             rewards = scores[:,:,-1:].squeeze().cpu().numpy()
 
-
             if args.reward_normalization_offset:
-                print(global_step % args.max_episode_steps)
                 if global_step % args.max_episode_steps == 11:
                     offset = rewards.copy()
                     rewards -= offset
@@ -735,7 +735,7 @@ if __name__ == "__main__":
                 rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
                 rewards = np.asarray(rewards)
         else:
-            rewards = np.asarray([0. for _ in range(NUM_TASKS)])
+            rewards = np.asarray([0.01 for _ in range(NUM_TASKS)])
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
