@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 from paths import *
 import argparse
+import os
 import random
 import time
 from collections import deque
@@ -49,7 +50,7 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to save model into the `runs/{run_name}` folder")
+        help="whether to save model checkpoints")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
@@ -69,12 +70,16 @@ def parse_args():
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
-    parser.add_argument("--reward-normalization-offset", type=bool, default=False, 
+    parser.add_argument("--reward-normalization-offset", default=False, action="store_true", 
         help="use the values at the 12th step as the value added to each reward")
-    parser.add_argument("--reward-normalization-gymnasium", type=bool, default=False, 
+    parser.add_argument("--reward-normalization-gymnasium", default=False, action="store_true",
         help="normalize the rewards using the gymnasium logic")
-    parser.add_argument("--reward-normalization-constant", type=bool, default=False, 
+    parser.add_argument("--reward-normalization-constant", default=False, action="store_true",
         help="add a constant to each reward")
+    parser.add_argument("--env-reward-weight", type=float, default=0.,
+        help="the weight of the original environment reward.")
+    parser.add_argument("--sparse-reward-weight", type=float, default=0.,
+        help="the weight of the sparse task success reward.")
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
@@ -98,7 +103,7 @@ def parse_args():
     test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, 
     test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
     args = parser.parse_args(namespace=c4c_args)
-    args.init_model = f'{CHKPT_PATH}/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
+    args.init_model = f'{CHKPT_PATH}/ckpt_mw_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
     # fmt: on
     return args
 
@@ -114,14 +119,15 @@ def _make_envs_common(
     args: Namespace = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
+    run_name: str = None,
 ) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, extra: int) -> gym.Env:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, extra: int, run_name: str) -> gym.Env:
         env = env_cls(render_mode='rgb_array')
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
             if extra == 0:
-                env = gym.wrappers.RecordVideo(env, f'videos/{name}/')
+                env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/videos'))
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -131,7 +137,7 @@ def _make_envs_common(
         return env
     return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0, extra=env_id)
+            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0, extra=env_id, run_name=run_name)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -562,7 +568,17 @@ def update_mean_var_count_from_moments(
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}_{args.exp_name}_reward_offset_{args.reward_normalization_offset}_reward_norm_gym_{args.reward_normalization_gymnasium}_reward_norm_constant_{args.reward_normalization_constant}"
+    run_name = f"{args.env_id}_{args.exp_name}"
+    if args.reward_normalization_offset:
+        run_name += f"_rnorm_offset"
+    if args.reward_normalization_gymnasium:
+        run_name += f"_rnorm_gym"
+    if args.reward_normalization_constant:
+        run_name += f"_rnorm_constant_{args.reward_normalization_constant_value}"
+    if args.env_reward_weight != 0:
+        run_name += f"_renv_{args.env_reward_weight}"
+    if args.sparse_reward_weight != 0:
+        run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.track:
         import wandb
 
@@ -575,7 +591,9 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    # Add seed to non-wandb run name.
+    run_name += f'_s{args.seed}'
+    writer = SummaryWriter(os.path.join(EXP_DIR, f"runs/{run_name}/summaries"))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -588,7 +606,7 @@ if __name__ == "__main__":
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+            os.path.join(EXP_DIR, f"runs/{run_name}/checkpoints"), checkpointer, options=ckpt_options
         )
 
     # TRY NOT TO MODIFY: seeding
@@ -598,7 +616,7 @@ if __name__ == "__main__":
 
     # env setup
     make_envs = partial(_make_envs_common, terminate_on_success=False)
-    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+    make_eval_envs = partial(_make_envs_common, terminate_on_success=True, run_name=run_name)
 
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
@@ -719,7 +737,6 @@ if __name__ == "__main__":
 
 
             if args.reward_normalization_offset:
-                print(global_step % args.max_episode_steps)
                 if global_step % args.max_episode_steps == 11:
                     offset = rewards.copy()
                     rewards -= offset
@@ -739,6 +756,14 @@ if __name__ == "__main__":
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        rewards = rewards + og_rewards * args.env_reward_weight
+        if 'success' in infos:
+            success = infos['success'] * args.sparse_reward_weight
+        else:
+            success = np.zeros_like(rewards)
+        writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        rewards = rewards + success
+        writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
