@@ -129,11 +129,7 @@ def _make_envs_common(
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
             if extra == 0:
-<<<<<<< HEAD
                 env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/videos'))
-=======
-                env = gym.wrappers.RecordVideo(env, f'videos/{name}_{args.seed}_{time.time()}/')
->>>>>>> eb48ef62aa247adfb1d549f81d596f72614dae76
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -634,7 +630,7 @@ if __name__ == "__main__":
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         args.num_envs = 10
-        for i in range(1, 10):
+        for i in range(1, args.num_envs):
             benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
     use_one_hot_wrapper = True
@@ -807,7 +803,7 @@ if __name__ == "__main__":
             )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        if global_step >= args.learning_starts:
             # Sample a batch from replay buffer
             data = rb.sample(args.batch_size)
             observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
@@ -849,7 +845,7 @@ if __name__ == "__main__":
                 )
 
             # Evaluation
-            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
+            if (total_steps % args.evaluation_frequency == 0 or global_step == args.learning_starts) and global_step > 0:
                 (
                     eval_success_rate,
                     eval_returns,
