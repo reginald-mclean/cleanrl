@@ -1,16 +1,13 @@
 # ruff: noqa: E402
-import os 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="4"
+from paths import *
 import argparse
+import os
 import random
 import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
-from argparse import Namespace
-
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -50,13 +47,13 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to save model into the `runs/{run_name}` folder")
+        help="whether to save model checkpoints")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
-    parser.add_argument("--max-episode-steps", type=int, default=None,
+    parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -70,13 +67,17 @@ def parse_args():
         help="every how many timesteps to evaluate the agent. Evaluation is disabled if 0.")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="the number episodes to run per evaluation")
+    parser.add_argument("--env-reward-weight", type=float, default=0.,
+        help="the weight of the original environment reward.")
+    parser.add_argument("--sparse-reward-weight", type=float, default=0.,
+        help="the weight of the sparse task success reward.")
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
     parser.add_argument("--q-lr", type=float, default=3e-4, help="the learning rate of the Q network network optimizer")
     parser.add_argument("--target-network-frequency", type=int, default=1,
         help="the frequency of updates for the target nerworks")
-    parser.add_argument("--clip-grad-norm", type=float, default=1.0,
+    parser.add_argument("--clip-grad-norm", type=float, default=0,
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
@@ -96,12 +97,18 @@ def _make_envs_common(
     args: Namespace = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
+    run_name: str = None,
 ) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        env = env_cls()
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, extra: int, run_name: str) -> gym.Env:
+        kwargs = {}
+        if terminate_on_success and extra == 0:
+          kwargs['render_mode'] = 'rgb_array'
+        env = env_cls(**kwargs)
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+            if extra == 0:
+                env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/videos'))
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -109,9 +116,9 @@ def _make_envs_common(
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
-    return gym.vector.SyncVectorEnv(
+    return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0)
+            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0, extra=env_id, run_name=run_name)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -477,7 +484,11 @@ def update(
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}_{args.exp_name}"
+    if args.env_reward_weight != 0:
+        run_name += f"_renv_{args.env_reward_weight}"
+    if args.sparse_reward_weight != 0:
+        run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.track:
         import wandb
 
@@ -490,7 +501,9 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    # Add seed to non-wandb run name.
+    run_name += f'_s{args.seed}'
+    writer = SummaryWriter(os.path.join(EXP_DIR, f"runs/{run_name}/summaries"))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -503,7 +516,7 @@ if __name__ == "__main__":
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+            os.path.join(EXP_DIR, f"runs/{run_name}/checkpoints"), checkpointer, options=ckpt_options
         )
 
     # TRY NOT TO MODIFY: seeding
@@ -513,7 +526,7 @@ if __name__ == "__main__":
 
     # env setup
     make_envs = partial(_make_envs_common, terminate_on_success=False)
-    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+    make_eval_envs = partial(_make_envs_common, terminate_on_success=True, run_name=run_name)
 
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
@@ -525,7 +538,7 @@ if __name__ == "__main__":
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         args.num_envs = 10
-        for i in range(1, 10):
+        for i in range(1, args.num_envs):
             benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
     use_one_hot_wrapper = True
@@ -573,7 +586,6 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
         total_steps = global_step * NUM_TASKS
-        print(total_steps, global_step)
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array(
@@ -583,7 +595,16 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
+        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        rewards = og_rewards * args.env_reward_weight
+        if 'success' in infos:
+            success = infos['success'] * args.sparse_reward_weight
+        else:
+            success = np.zeros_like(rewards)
+        writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        rewards = rewards + success
+        writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -622,7 +643,7 @@ if __name__ == "__main__":
             )
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        if global_step >= args.learning_starts:
             # Sample a batch from replay buffer
             data = rb.sample(args.batch_size)
             observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
@@ -664,7 +685,7 @@ if __name__ == "__main__":
                 )
 
             # Evaluation
-            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
+            if (total_steps % args.evaluation_frequency == 0 or global_step == args.learning_starts) and global_step > 0:
                 (
                     eval_success_rate,
                     eval_returns,
