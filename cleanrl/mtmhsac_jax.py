@@ -786,7 +786,7 @@ if __name__ == "__main__":
             elif global_step % args.max_episode_steps == 0:
                 last_rewards = None
                 last_actions = None
-            else: 
+            else:
                 dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3], axis=1)
                 derivatives += (rewards.squeeze() - last_rewards.squeeze()) / dist
 
@@ -842,7 +842,10 @@ if __name__ == "__main__":
             episode_dict['next_state'].append(real_next_obs)
             episode_dict['termination'].append(terminations)
             if args.max_episode_steps + start_step == global_step:
-                with open(os.path.join(EXP_DIR, f'runs/{run_name}/full_episodes/timestep_{start_step}_{global_step}_transitions.pkl'), 'wb') as file:
+                log_path = os.path.join(EXP_DIR, f"runs/{run_name}/transitions")
+                if not os.path.isdir(log_path):
+                    os.makedirs(log_path)
+                with open(f'{log_path}/timestep_{start_step}_{global_step}_transitions.pkl', 'wb') as file:
                     pickle.dump(episode_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
                 logging = False
 
