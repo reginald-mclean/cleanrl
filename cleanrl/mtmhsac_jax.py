@@ -105,6 +105,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+    parser.add_argument("--transition-logging-freq", type=int, default=1000, help="How often to log data from training")
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
@@ -690,7 +691,7 @@ if __name__ == "__main__":
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
 
-    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
+    with open(f'{CAPTION_PATH}/raw-captions-mw.pkl', 'rb') as f:
         descriptions = pickle.load(f)
     if args.env_id != 'MT10' and args.env_id != "MT50":
         task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
@@ -714,9 +715,21 @@ if __name__ == "__main__":
     offset = None
 
     start_time = time.time()
-
+    derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
+    last_rewards = None 
+    last_actions = None
+    logging = False
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
+        if global_step % args.max_episode_steps == 0:
+             if global_step > args.learning_starts:
+                 for i in range(NUM_TASKS):
+                     writer.add_scalar(
+                        f"charts/{i}_avg_derivative_per_episode",
+                        derivatives[i]/500,
+                        global_step,
+                     )
+             derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
         total_steps = global_step * NUM_TASKS
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -766,8 +779,24 @@ if __name__ == "__main__":
                 return_rms.update(returns)
                 rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
                 rewards = np.asarray(rewards)
+            if last_rewards is None and global_step % args.max_episode_steps != 0:
+                last_rewards = rewards.copy()
+                last_actions = np.asarray(actions).copy()[:, :3]
+            elif global_step % args.max_episode_steps == 0:
+                last_rewards = None
+                last_actions = None
+            else: 
+                dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3])
+                derivatives += (rewards - last_rewards) / dist
+
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
+
+        if global_step % args.transition_logging_freq == 0:
+            logging = True
+            start_step = global_step
+            to_log = ['actions','vlm_reward', 'original_reward', 'state', 'next_state', 'termination']
+            episode_dict = {key: [] for key in to_log}
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = rewards * args.vlm_reward_weight
@@ -796,6 +825,18 @@ if __name__ == "__main__":
 
         # Store data in the buffer
         rb.add(obs, real_next_obs, actions, rewards, terminations)
+        if logging:
+            episode_dict['actions'].append(actions)
+            episode_dict['vlm_reward'].append(rewards)
+            episode_dict['original_reward'].append(og_rewards)
+            episode_dict['state'].append(obs)
+            episode_dict['next_state'].append(real_next_obs)
+            episode_dict['termination'].append(terminations)
+            if args.max_episode_steps + start_step == global_step:
+                with open(f'{EXP_DIR}/timestep_{start_step}_{global_step}_transitions.pkl', 'wb') as file:
+                    pickle.dump(episode_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
+                logging = False
+
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
