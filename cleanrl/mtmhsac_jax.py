@@ -89,6 +89,8 @@ def parse_args():
         help="the weight of the original environment reward.")
     parser.add_argument("--sparse-reward-weight", type=float, default=0.,
         help="the weight of the sparse task success reward.")
+    parser.add_argument("--vlm-reward-weight", type=float, default=1.,
+        help="the weight of the predicted reward.")
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
@@ -763,17 +765,16 @@ if __name__ == "__main__":
                 rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
                 rewards = np.asarray(rewards)
         else:
-            rewards = np.asarray([0.01 for _ in range(NUM_TASKS)])
+            rewards = np.asarray([0. for _ in range(NUM_TASKS)])
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        rewards = rewards * args.vlm_reward_weight
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
-        rewards = rewards + og_rewards * args.env_reward_weight
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
-        else:
-            success = np.zeros_like(rewards)
-        writer.add_scalar("charts/reward_success", np.mean(success), global_step)
-        rewards = rewards + success
+            rewards = rewards + success
+            writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        rewards = rewards + og_rewards * args.env_reward_weight
         writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
