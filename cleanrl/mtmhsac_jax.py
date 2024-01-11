@@ -105,7 +105,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-    parser.add_argument("--transition-logging-freq", type=int, default=1000, help="How often to log data from training")
+    parser.add_argument("--transition-logging-freq", type=int, default=50_000, help="How often to log data from training")
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
@@ -691,7 +691,7 @@ if __name__ == "__main__":
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
 
-    with open(f'{CAPTION_PATH}/raw-captions-mw.pkl', 'rb') as f:
+    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
         descriptions = pickle.load(f)
     if args.env_id != 'MT10' and args.env_id != "MT50":
         task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
@@ -763,6 +763,7 @@ if __name__ == "__main__":
             if len(scores.shape) > 2:
                 scores = scores[:, :, -1]
             rewards = scores.cpu().numpy()
+            og_vlm_rewards = rewards.copy()
 
             if args.reward_normalization_offset:
                 if global_step % args.max_episode_steps == 11:
@@ -786,21 +787,25 @@ if __name__ == "__main__":
                 last_rewards = None
                 last_actions = None
             else: 
-                dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3])
-                derivatives += (rewards - last_rewards) / dist
+                dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3], axis=1)
+                derivatives += (rewards.squeeze() - last_rewards.squeeze()) / dist
 
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
+            og_vlm_rewards = rewards.copy()
 
         if global_step % args.transition_logging_freq == 0:
             logging = True
             start_step = global_step
-            to_log = ['actions','vlm_reward', 'original_reward', 'state', 'next_state', 'termination']
+            to_log = ['actions', 'raw_vlm_reward', 'vlm_reward', 'sparse_reward', 'success', 'original_reward',
+                      'total_reward', 'state', 'next_state', 'termination']
             episode_dict = {key: [] for key in to_log}
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = rewards * args.vlm_reward_weight
+        vlm_rewards = rewards.copy()
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        success = None
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
             rewards = rewards + success
@@ -827,13 +832,17 @@ if __name__ == "__main__":
         rb.add(obs, real_next_obs, actions, rewards, terminations)
         if logging:
             episode_dict['actions'].append(actions)
-            episode_dict['vlm_reward'].append(rewards)
+            episode_dict['raw_vlm_reward'].append(og_vlm_rewards)
+            episode_dict['vlm_reward'].append(vlm_rewards)
+            episode_dict['sparse_reward'].append(success)
+            episode_dict['success'].append(infos['success'].astype(int) if 'success' in infos else np.zeros_like(rewards))
             episode_dict['original_reward'].append(og_rewards)
+            episode_dict['total_reward'].append(rewards)
             episode_dict['state'].append(obs)
             episode_dict['next_state'].append(real_next_obs)
             episode_dict['termination'].append(terminations)
             if args.max_episode_steps + start_step == global_step:
-                with open(f'{EXP_DIR}/timestep_{start_step}_{global_step}_transitions.pkl', 'wb') as file:
+                with open(os.path.join(EXP_DIR, f'runs/{run_name}/full_episodes/timestep_{start_step}_{global_step}_transitions.pkl'), 'wb') as file:
                     pickle.dump(episode_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
                 logging = False
 
