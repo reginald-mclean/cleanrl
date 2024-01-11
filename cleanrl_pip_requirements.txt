@@ -54,7 +54,7 @@ google-auth-oauthlib==1.1.0
 grpcio==1.59.2
 gym==0.26.2
 gym-notices==0.0.8
--e git+https://github.com/reginald-mclean/Gymnasium.git@d3d1eca3329da517adaa178c91ea268e0ad89617#egg=gymnasium
+# -e git+https://github.com/reginald-mclean/Gymnasium.git@d3d1eca3329da517adaa178c91ea268e0ad89617#egg=gymnasium
 huggingface-hub==0.19.4
 idna==3.4
 imageio==2.32.0
