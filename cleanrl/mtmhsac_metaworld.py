@@ -11,8 +11,6 @@ from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-import sys
-sys.path.append('/home/reggiemclean/clip4clip/cleanrl')
 from argparse import Namespace
 import distrax
 import flax
@@ -685,7 +683,7 @@ if __name__ == "__main__":
                 )
 
             # Evaluation
-            if (total_steps % args.evaluation_frequency == 0 or global_step == args.learning_starts) and global_step > 0:
+            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 (
                     eval_success_rate,
                     eval_returns,

@@ -11,8 +11,6 @@ from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-import sys
-sys.path.append('/home/reggiemclean/clip4clip/cleanrl')
 from argparse import Namespace
 import distrax
 import flax
@@ -35,6 +33,17 @@ from torch.utils.tensorboard import SummaryWriter
 from clip4clip.reward import RewardCalculator
 import torch
 import pickle
+
+
+def load_c4c_args(args):
+    init_model_path = os.path.join(REWARD_CKPT_DIR, args.c4c_ckpt)
+    c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
+    with open(c4c_args_path, 'rb') as f:
+        c4c_args = pickle.load(f)['args']
+    c4c_args.init_model = init_model_path
+    c4c_args.resume_from_latest = False
+    return c4c_args
+
 
 def parse_args():
     # fmt: off
@@ -80,6 +89,8 @@ def parse_args():
         help="the weight of the original environment reward.")
     parser.add_argument("--sparse-reward-weight", type=float, default=0.,
         help="the weight of the sparse task success reward.")
+    parser.add_argument("--vlm-reward-weight", type=float, default=1.,
+        help="the weight of the predicted reward.")
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
@@ -96,16 +107,12 @@ def parse_args():
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
     parser.add_argument("--transition-logging-freq", type=int, default=1000, help="How often to log data from training")
 
-    c4c_args = Namespace(do_pretrain=False, do_train=True, do_eval=True, eval_on_val=False, train_csv='data/.train.csv', val_csv='data/.val.csv', data_path=DATA_PATH, features_path='/scratch/work/alakuim3/nlr/metaworld/single_task/bin-picking-v2', test_data_path=None, test_features_path=None, 
-    evaluate_test_accuracy=False, dev=False, num_thread_reader=6, lr=0.0001, epochs=70, batch_size=64, batch_size_val=64, lr_decay=0.9, 
-    n_display=20, video_dim=1024, video_max_len=-1, deduplicate_captions=False, seed=3, max_words=32, max_frames=12, feature_framerate=5, margin=0.1, hard_negative_rate=0.5, augment_images=True, add_reversed_negatives=False, test_on_reversed_negatives=False, use_failures_as_negatives_only=True, success_data_only=False, loss_type='sequence_ranking_loss', 
-    dist_type='cosine', triplet_margin=0.2, progress_margin=None, ranking_loss_weight=33.0, main_eval_metric='loss', other_eval_metrics='strict_auc,tv_MeanR,vt_MedianR,vt_R1,tv_R1,tv_R10,tv_R5,labeled_auc,vt_loss', n_ckpts_to_keep=1, negative_weighting=1, n_pair=1, 
-    output_dir='/scratch/cs/larel/nlr/ckpts/1130_mw_v4_mwtest/ckpt_mw_binpicking_retrank33_1gpu_tigt_negonly_a_rf_3', wandb_entity='reggies-phd-research', wandb_project='VLM-PPO-State-Based', cross_model='cross-base', init_model='', resume_model=None, resume_from_latest=False, overwrite=False, do_lower_case=False, 
-    warmup_proportion=0.1, gradient_accumulation_steps=1, n_gpu=1, cache_dir='', fp16=False, fp16_opt_level='O1', task_type='retrieval', datatype='mw', 
-    test_datatype='mw', test_set_name='test', world_size=1, local_rank=0, rank=0, coef_lr=0.001, use_mil=False, sampled_use_mil=False, text_num_hidden_layers=12, visual_num_hidden_layers=12, cross_num_hidden_layers=4, loose_type=False, expand_msrvtt_sentences=False, train_frame_order=0, eval_frame_order=0, freeze_layer_num=0, slice_framepos=3, 
-    test_slice_framepos=2, linear_patch='2d', sim_header='tightTransf', pretrained_clip_name='ViT-B/32', return_sequence=True)
+    # C4C
+    parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
+
+    args = parser.parse_args()
+    c4c_args = load_c4c_args(args)
     args = parser.parse_args(namespace=c4c_args)
-    args.init_model = f'{CHKPT_PATH}/ckpt_mw_retrank33_1gpu_tigt_negonly_a_rf_1/pytorch_model.bin.20'
     # fmt: on
     return args
 
@@ -581,9 +588,15 @@ if __name__ == "__main__":
         run_name += f"_renv_{args.env_reward_weight}"
     if args.sparse_reward_weight != 0:
         run_name += f"_rsparse_{args.sparse_reward_weight}"
+    if args.vlm_reward_weight != 1:
+        run_name += f"_rvlm_{args.vlm_reward_weight}"
     if args.track:
         import wandb
 
+        if os.environ['SLURM_JOB_ID'] != '':
+            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+        else:
+            print('slurm job id not found')
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -747,7 +760,9 @@ if __name__ == "__main__":
             with torch.no_grad():
                 a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-            rewards = scores[:,:,-1:].squeeze().cpu().numpy()
+            if len(scores.shape) > 2:
+                scores = scores[:, :, -1]
+            rewards = scores.cpu().numpy()
 
             if args.reward_normalization_offset:
                 if global_step % args.max_episode_steps == 11:
@@ -775,7 +790,7 @@ if __name__ == "__main__":
                 derivatives += (rewards - last_rewards) / dist
 
         else:
-            rewards = np.asarray([0.01 for _ in range(NUM_TASKS)])
+            rewards = np.asarray([0. for _ in range(NUM_TASKS)])
 
         if global_step % args.transition_logging_freq == 0:
             logging = True
@@ -784,14 +799,13 @@ if __name__ == "__main__":
             episode_dict = {key: [] for key in to_log}
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        rewards = rewards * args.vlm_reward_weight
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
-        rewards = rewards + og_rewards * args.env_reward_weight
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
-        else:
-            success = np.zeros_like(rewards)
-        writer.add_scalar("charts/reward_success", np.mean(success), global_step)
-        rewards = rewards + success
+            rewards = rewards + success
+            writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        rewards = rewards + og_rewards * args.env_reward_weight
         writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
@@ -885,7 +899,7 @@ if __name__ == "__main__":
                 )
 
             # Evaluation
-            if (total_steps % args.evaluation_frequency == 0 or global_step == args.learning_starts) and global_step > 0:
+            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 (
                     eval_success_rate,
                     eval_returns,
