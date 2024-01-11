@@ -105,7 +105,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-    parser.add_argument("--transition-logging-freq", type=int, default=1000, help="How often to log data from training")
+    parser.add_argument("--transition-logging-freq", type=int, default=10000, help="How often to log data from training")
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
@@ -785,9 +785,9 @@ if __name__ == "__main__":
             elif global_step % args.max_episode_steps == 0:
                 last_rewards = None
                 last_actions = None
-            else: 
-                dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3])
-                derivatives += (rewards - last_rewards) / dist
+            else:
+                dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3], axis=1)
+                derivatives += (rewards.squeeze() - last_rewards.squeeze()) / dist
 
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
@@ -833,7 +833,10 @@ if __name__ == "__main__":
             episode_dict['next_state'].append(real_next_obs)
             episode_dict['termination'].append(terminations)
             if args.max_episode_steps + start_step == global_step:
-                with open(f'{EXP_DIR}/timestep_{start_step}_{global_step}_transitions.pkl', 'wb') as file:
+                log_path = os.path.join(EXP_DIR, f"runs/{run_name}/transitions")
+                if not os.path.isdir(log_path):
+                    os.makedirs(log_path)
+                with open(f'{log_path}/timestep_{start_step}_{global_step}_transitions.pkl', 'wb') as file:
                     pickle.dump(episode_dict, file, protocol=pickle.HIGHEST_PROTOCOL)
                 logging = False
 
