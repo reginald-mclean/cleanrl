@@ -587,6 +587,8 @@ if __name__ == "__main__":
         run_name += f"_renv_{args.env_reward_weight}"
     if args.sparse_reward_weight != 0:
         run_name += f"_rsparse_{args.sparse_reward_weight}"
+    if args.vlm_reward_weight != 1:
+        run_name += f"_rvlm_{args.vlm_reward_weight}"
     if args.track:
         import wandb
 
