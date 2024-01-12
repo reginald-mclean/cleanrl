@@ -590,10 +590,11 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
+    run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
 
-        if os.environ['SLURM_JOB_ID'] != '':
+        if 'SLURM_JOB_ID' in os.environ:
             args.slurm_job_id = os.environ["SLURM_JOB_ID"]
         else:
             print('slurm job id not found')
