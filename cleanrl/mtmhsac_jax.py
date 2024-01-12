@@ -598,7 +598,7 @@ if __name__ == "__main__":
             args.slurm_job_id = os.environ["SLURM_JOB_ID"]
         else:
             print('slurm job id not found')
-        wandb.init(
+        run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
@@ -607,6 +607,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        # Add wandb ID to non-wandb run name.
+        run_name += f'_wb_{run.id}'
     # Add seed to non-wandb run name.
     run_name += f'_s{args.seed}'
     writer = SummaryWriter(os.path.join(EXP_DIR, f"runs/{run_name}/summaries"))
