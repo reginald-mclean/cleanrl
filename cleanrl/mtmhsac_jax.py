@@ -54,7 +54,7 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project", type=str, default="MTSAC-State-VLM-Reward",
+    parser.add_argument("--wandb-project-name", type=str, default="MTSAC-State-VLM-Reward",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
@@ -105,7 +105,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-    parser.add_argument("--transition-logging-freq", type=int, default=10000, help="How often to log data from training")
+    parser.add_argument("--transition-logging-freq", type=int, default=50_000, help="How often to log data from training")
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
@@ -591,16 +591,16 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
+    run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
 
-        #if os.environ['SLURM_JOB_ID'] != '':
-        #    args.slurm_job_id = os.environ["SLURM_JOB_ID"]
-        #else:
-        #    print('slurm job id not found')
-        print(args.wandb_project, args.wandb_entity)
-        wandb.init(
-            project=args.wandb_project,
+        if 'SLURM_JOB_ID' in os.environ:
+            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+        else:
+            print('slurm job id not found')
+        run = wandb.init(
+            project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
@@ -608,6 +608,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        # Add wandb ID to non-wandb run name.
+        run_name += f'_wb_{run.id}'
     # Add seed to non-wandb run name.
     run_name += f'_s{args.seed}'
     writer = SummaryWriter(os.path.join(EXP_DIR, f"runs/{run_name}/summaries"))
@@ -693,7 +695,7 @@ if __name__ == "__main__":
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
 
-    with open(f'{CAPTION_PATH}/raw-captions-mw.pkl', 'rb') as f:
+    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
         descriptions = pickle.load(f)
     if args.env_id != 'MT10' and args.env_id != "MT50":
         task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
@@ -765,6 +767,7 @@ if __name__ == "__main__":
             if len(scores.shape) > 2:
                 scores = scores[:, :, -1]
             rewards = scores.cpu().numpy()
+            og_vlm_rewards = rewards.copy()
 
             if args.reward_normalization_offset:
                 if global_step % args.max_episode_steps == 11:
@@ -793,16 +796,20 @@ if __name__ == "__main__":
 
         else:
             rewards = np.asarray([0. for _ in range(NUM_TASKS)])
+            og_vlm_rewards = rewards.copy()
 
         if global_step % args.transition_logging_freq == 0:
             logging = True
             start_step = global_step
-            to_log = ['actions','vlm_reward', 'original_reward', 'state', 'next_state', 'termination', 'frames']
+            to_log = ['actions', 'raw_vlm_reward', 'vlm_reward', 'sparse_reward', 'success', 'original_reward',
+                      'total_reward', 'state', 'next_state', 'termination', 'frames']
             episode_dict = {key: [] for key in to_log}
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = rewards * args.vlm_reward_weight
+        vlm_rewards = rewards.copy()
         writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        success = None
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
             rewards = rewards + success
@@ -829,8 +836,12 @@ if __name__ == "__main__":
         rb.add(obs, real_next_obs, actions, rewards, terminations)
         if logging:
             episode_dict['actions'].append(actions)
-            episode_dict['vlm_reward'].append(rewards)
+            episode_dict['raw_vlm_reward'].append(og_vlm_rewards)
+            episode_dict['vlm_reward'].append(vlm_rewards)
+            episode_dict['sparse_reward'].append(success)
+            episode_dict['success'].append(infos['success'].astype(int) if 'success' in infos else np.zeros_like(rewards))
             episode_dict['original_reward'].append(og_rewards)
+            episode_dict['total_reward'].append(rewards)
             episode_dict['state'].append(obs)
             episode_dict['next_state'].append(real_next_obs)
             episode_dict['termination'].append(terminations)
