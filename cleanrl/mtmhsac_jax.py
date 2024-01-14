@@ -54,7 +54,7 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="MTSAC-State-VLM-Reward",
+    parser.add_argument("--wandb-project", type=str, default="MTSAC-State-VLM-Reward",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
@@ -136,7 +136,8 @@ def _make_envs_common(
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
             if extra == 0:
-                env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/videos'))
+                trigger = lambda t: t % 10 == 0
+                env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/eval_videos'), episode_trigger=trigger)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -593,12 +594,13 @@ if __name__ == "__main__":
     if args.track:
         import wandb
 
-        if os.environ['SLURM_JOB_ID'] != '':
-            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
-        else:
-            print('slurm job id not found')
+        #if os.environ['SLURM_JOB_ID'] != '':
+        #    args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+        #else:
+        #    print('slurm job id not found')
+        print(args.wandb_project, args.wandb_entity)
         wandb.init(
-            project=args.wandb_project_name,
+            project=args.wandb_project,
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
@@ -795,7 +797,7 @@ if __name__ == "__main__":
         if global_step % args.transition_logging_freq == 0:
             logging = True
             start_step = global_step
-            to_log = ['actions','vlm_reward', 'original_reward', 'state', 'next_state', 'termination']
+            to_log = ['actions','vlm_reward', 'original_reward', 'state', 'next_state', 'termination', 'frames']
             episode_dict = {key: [] for key in to_log}
 
         writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
@@ -832,7 +834,16 @@ if __name__ == "__main__":
             episode_dict['state'].append(obs)
             episode_dict['next_state'].append(real_next_obs)
             episode_dict['termination'].append(terminations)
+            episode_dict['frames'].append(np.rot90(np.rot90(current_frames[0])))
             if args.max_episode_steps + start_step == global_step:
+                log_img_path = os.path.join(EXP_DIR, f"runs/{run_name}/frames/timestep_{start_step}_{global_step}/")
+                if not os.path.isdir(log_img_path):
+                    os.makedirs(log_img_path)
+                for idx, f in enumerate(episode_dict['frames']):
+                    img = Image.fromarray((f).astype(np.uint8))
+                    img.save(f'{log_img_path}/frame_{idx}.png')
+                del episode_dict['frames']
+                assert 'frames' not in episode_dict, 'frames should not be in dict'
                 log_path = os.path.join(EXP_DIR, f"runs/{run_name}/transitions")
                 if not os.path.isdir(log_path):
                     os.makedirs(log_path)
