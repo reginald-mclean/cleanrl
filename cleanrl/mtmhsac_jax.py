@@ -979,7 +979,7 @@ if __name__ == "__main__":
                 for k, v in sorted(recent_history.items()):
                     print(f"{k}: {v}")
                 print(f"mean: {np.mean(recent_success_rates)}, median: {np.median(recent_success_rates)}", )
-                if total_steps > 1_000_000 and np.mean(recent_success_rates) > 0.95 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
+                if total_steps > 1_000_000 and np.mean(recent_success_rates) >= 0.98 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
                     print("Terminating early")
                     break
                 else:
