@@ -63,6 +63,7 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
+    parser.add_argument("--env-parallel", type=bool, default=False, help="run multiple copies of a single environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=500,
@@ -646,9 +647,13 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-        args.num_envs = 10
-        for i in range(1, args.num_envs):
-            benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
+        print(len(benchmark.train_classes), len(eval_benchmark.train_classes))
+        args.num_envs = 1
+        print(args.env_parallel)
+        if args.env_parallel:
+            args.num_envs = 10
+            for i in range(1, args.num_envs):
+                benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
     use_one_hot_wrapper = True
 
@@ -678,7 +683,7 @@ if __name__ == "__main__":
     global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
 
     obs, _ = envs.reset()
-
+    print(obs.shape)
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
         init_obs=obs,
@@ -695,7 +700,7 @@ if __name__ == "__main__":
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
 
-    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
+    with open(f'{CAPTION_PATH}/raw-captions-mw.pkl', 'rb') as f:
         descriptions = pickle.load(f)
     if args.env_id != 'MT10' and args.env_id != "MT50":
         task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
@@ -717,6 +722,17 @@ if __name__ == "__main__":
     return_rms = RunningMeanStd(shape=())
 
     offset = None
+
+    (
+                    eval_success_rate,
+                    eval_returns,
+        eval_success_per_task,
+    ) = evaluation(
+                    agent=agent,
+                    eval_envs=eval_envs,
+                    num_episodes=args.evaluation_num_episodes,
+    )
+
 
     start_time = time.time()
     derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
