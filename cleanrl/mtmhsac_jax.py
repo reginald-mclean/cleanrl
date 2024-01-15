@@ -111,7 +111,7 @@ def parse_args():
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
-
+    parser.add_argument('--slurm', type=bool, default=False, help='is this experiment being run on a slurm cluster')
     args = parser.parse_args()
     c4c_args = load_c4c_args(args)
     args = parser.parse_args(namespace=c4c_args)
@@ -596,11 +596,11 @@ if __name__ == "__main__":
     run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
-
-        if 'SLURM_JOB_ID' in os.environ:
-            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
-        else:
-            print('slurm job id not found')
+        if args.slurm:
+            if 'SLURM_JOB_ID' in os.environ:
+                args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+            else:
+                print('slurm job id not found')
         run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -648,9 +648,7 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-        print(len(benchmark.train_classes), len(eval_benchmark.train_classes))
         args.num_envs = 1
-        print(args.env_parallel)
         if args.env_parallel:
             args.num_envs = 10
             for i in range(1, args.num_envs):
@@ -684,7 +682,6 @@ if __name__ == "__main__":
     global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
 
     obs, _ = envs.reset()
-    print(obs.shape)
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
         init_obs=obs,
@@ -723,17 +720,6 @@ if __name__ == "__main__":
     return_rms = RunningMeanStd(shape=())
 
     offset = None
-
-    (
-                    eval_success_rate,
-                    eval_returns,
-        eval_success_per_task,
-    ) = evaluation(
-                    agent=agent,
-                    eval_envs=eval_envs,
-                    num_episodes=args.evaluation_num_episodes,
-    )
-
 
     start_time = time.time()
     derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
