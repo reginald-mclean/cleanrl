@@ -111,7 +111,6 @@ def parse_args():
 
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
-    parser.add_argument('--slurm', type=bool, default=False, help='is this experiment being run on a slurm cluster')
     args = parser.parse_args()
     c4c_args = load_c4c_args(args)
     args = parser.parse_args(namespace=c4c_args)
@@ -596,11 +595,10 @@ if __name__ == "__main__":
     run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
-        if args.slurm:
-            if 'SLURM_JOB_ID' in os.environ:
-                args.slurm_job_id = os.environ["SLURM_JOB_ID"]
-            else:
-                print('slurm job id not found')
+        if 'SLURM_JOB_ID' in os.environ:
+            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+        else:
+            print('slurm job id not found')
         run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
