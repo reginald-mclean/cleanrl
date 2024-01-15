@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 from paths import *
 import argparse
+import io
 import os
 import random
 import time
@@ -739,6 +740,7 @@ if __name__ == "__main__":
     last_rewards = None 
     last_actions = None
     logging = False
+    eval_success_rate_history = {}
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
         if global_step % args.max_episode_steps == 0:
@@ -821,17 +823,21 @@ if __name__ == "__main__":
                       'total_reward', 'state', 'next_state', 'termination', 'frames']
             episode_dict = {key: [] for key in to_log}
 
-        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        if logging:
+            writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = rewards * args.vlm_reward_weight
         vlm_rewards = rewards.copy()
-        writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        if logging:
+            writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
         success = None
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
             rewards = rewards + success
-            writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+            if logging:
+                writer.add_scalar("charts/reward_success", np.mean(success), global_step)
         rewards = rewards + og_rewards * args.env_reward_weight
-        writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
+        if logging:
+            writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -866,9 +872,12 @@ if __name__ == "__main__":
                 log_img_path = os.path.join(EXP_DIR, f"runs/{run_name}/frames/timestep_{start_step}_{global_step}/")
                 if not os.path.isdir(log_img_path):
                     os.makedirs(log_img_path)
+                episode_dict['frame_bytes'] = []
                 for idx, f in enumerate(episode_dict['frames']):
                     img = Image.fromarray((f).astype(np.uint8))
-                    img.save(f'{log_img_path}/frame_{idx}.png')
+                    img_byte_arr = io.BytesIO()
+                    img.save(img_byte_arr, format='PNG')
+                    episode_dict['frame_bytes'].append(img_byte_arr.getvalue())
                 del episode_dict['frames']
                 assert 'frames' not in episode_dict, 'frames should not be in dict'
                 log_path = os.path.join(EXP_DIR, f"runs/{run_name}/transitions")
@@ -929,10 +938,10 @@ if __name__ == "__main__":
                 agent.soft_update_target_networks(args.tau)
 
             # Logging
-            if global_step % 100 == 0:
+            if global_step % 1000 == 0:
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
-                print("SPS:", int(total_steps / (time.time() - start_time)))
+                # print("SPS:", int(total_steps / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(total_steps / (time.time() - start_time)),
@@ -978,6 +987,20 @@ if __name__ == "__main__":
                         metrics=eval_metrics,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
+
+                eval_success_rate_history[total_steps] = float(eval_success_rate)
+                recent_history = {k: v for k, v in eval_success_rate_history.items() if k >= total_steps - 1_000_000}
+                recent_success_rates = list(recent_history.values())
+                print("Recent success rates")
+                for k, v in sorted(recent_history.items()):
+                    print(f"{k}: {v}")
+                print(f"mean: {np.mean(recent_success_rates)}, median: {np.median(recent_success_rates)}", )
+                if total_steps > 1_000_000 and np.mean(recent_success_rates) >= 0.98 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
+                    print("Terminating early")
+                    break
+                else:
+                    print("Not terminating early")
+
 
     envs.close()
     writer.close()
