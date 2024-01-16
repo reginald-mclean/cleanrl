@@ -599,6 +599,8 @@ if __name__ == "__main__":
             args.slurm_job_id = os.environ["SLURM_JOB_ID"]
         else:
             print('slurm job id not found')
+        if 'SLURM_ARRAY_JOB_ID' in os.environ and 'SLURM_ARRAY_TASK_ID' in os.environ:
+            args.slurm_array_job_id = f'{os.environ["SLURM_ARRAY_JOB_ID"]}_{os.environ["SLURM_ARRAY_TASK_ID"]}'
         run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
