@@ -696,7 +696,7 @@ if __name__ == "__main__":
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
 
-    with open(f'{CAPTION_PATH}/raw-captions-mw.pkl', 'rb') as f:
+    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
         descriptions = pickle.load(f)
     if args.env_id != 'MT10' and args.env_id != "MT50":
         task_desc = descriptions.get('success_videos__' + args.env_id + '_1', [])[0]
