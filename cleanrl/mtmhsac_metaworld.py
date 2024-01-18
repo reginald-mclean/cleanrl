@@ -489,8 +489,13 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.track:
         import wandb
-
-        wandb.init(
+        if 'SLURM_JOB_ID' in os.environ:
+            args.slurm_job_id = os.environ["SLURM_JOB_ID"]
+        else:
+            print('slurm job id not found')
+        if 'SLURM_ARRAY_JOB_ID' in os.environ and 'SLURM_ARRAY_TASK_ID' in os.environ:
+            args.slurm_array_job_id = f'{os.environ["SLURM_ARRAY_JOB_ID"]}_{os.environ["SLURM_ARRAY_TASK_ID"]}'
+        run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
@@ -499,6 +504,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        # Add wandb ID to non-wandb run name.
+        run_name += f'_wb_{run.id}'
     # Add seed to non-wandb run name.
     run_name += f'_s{args.seed}'
     writer = SummaryWriter(os.path.join(EXP_DIR, f"runs/{run_name}/summaries"))
@@ -581,6 +588,7 @@ if __name__ == "__main__":
     )
     start_time = time.time()
 
+    eval_success_rate_history = {}
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
         total_steps = global_step * NUM_TASKS
@@ -594,15 +602,15 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
-        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        # writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = og_rewards * args.env_reward_weight
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight
         else:
             success = np.zeros_like(rewards)
-        writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        # writer.add_scalar("charts/reward_success", np.mean(success), global_step)
         rewards = rewards + success
-        writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
+        # writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -672,10 +680,10 @@ if __name__ == "__main__":
                 agent.soft_update_target_networks(args.tau)
 
             # Logging
-            if global_step % 100 == 0:
+            if global_step % 1000 == 0:
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
-                print("SPS:", int(total_steps / (time.time() - start_time)))
+                # print("SPS:", int(total_steps / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(total_steps / (time.time() - start_time)),
@@ -721,6 +729,19 @@ if __name__ == "__main__":
                         metrics=eval_metrics,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
+
+                eval_success_rate_history[total_steps] = float(eval_success_rate)
+                recent_history = {k: v for k, v in eval_success_rate_history.items() if k >= total_steps - 1_000_000}
+                recent_success_rates = list(recent_history.values())
+                print("Recent success rates")
+                for k, v in sorted(recent_history.items()):
+                    print(f"{k}: {v}")
+                print(f"mean: {np.mean(recent_success_rates)}, median: {np.median(recent_success_rates)}", )
+                if total_steps > 1_000_000 and np.mean(recent_success_rates) >= 0.98 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
+                    print("Terminating early")
+                    break
+                else:
+                    print("Not terminating early")
 
     envs.close()
     writer.close()
