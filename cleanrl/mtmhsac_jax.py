@@ -625,7 +625,7 @@ if __name__ == "__main__":
 
     if args.save_model:  # Orbax checkpoints
         ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
-            max_to_keep=1, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
+            max_to_keep=3, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
