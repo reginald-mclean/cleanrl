@@ -64,7 +64,7 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--env-parallel", type=bool, default=False, help="run multiple copies of a single environment")
+    parser.add_argument("--env-parallel", type=bool, default=True, help="run multiple copies of a single environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=500,
@@ -87,6 +87,8 @@ def parse_args():
         help="normalize the rewards using the gymnasium logic")
     parser.add_argument("--reward-normalization-constant", default=False, action="store_true",
         help="add a constant to each reward")
+    parser.add_argument("--predict-for-partial-videos", default=False, action="store_true", help="If true, use reward predictions for steps smaller than max frames. Else use 0.")
+    parser.add_argument("--stretch-partial-videos", default=False, action="store_true", help="If true, repeat frames for videos smaller than max frames. Only applies when predicting for partial videos.")
     parser.add_argument("--env-reward-weight", type=float, default=0.,
         help="the weight of the original environment reward.")
     parser.add_argument("--sparse-reward-weight", type=float, default=0.,
@@ -709,7 +711,6 @@ if __name__ == "__main__":
 
     pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
     pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
-    video_mask = torch.from_numpy(np.asarray([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
     new_images = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
     
     transform = _transform(224)
@@ -729,7 +730,8 @@ if __name__ == "__main__":
     eval_success_rate_history = {}
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
-        if global_step % args.max_episode_steps == 0:
+        current_t = global_step % args.max_episode_steps
+        if current_t == 0:
              if global_step > args.learning_starts:
                  for i in range(NUM_TASKS):
                      writer.add_scalar(
@@ -752,32 +754,45 @@ if __name__ == "__main__":
         current_frames = envs.call('render')
 
         for idx, f in enumerate(current_frames):
-            frames[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
-        batches = torch.zeros((args.num_envs, 1, 12, 1, 3, 224, 224))
+            frames[idx, current_t] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
+        batches = torch.zeros((args.num_envs, 1, reward_model.dataloader.max_frames, 1, 3, 224, 224))
        
-        if global_step % args.max_episode_steps >= 11:
+        offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
+        if current_t >= offset_timestep:
+            if current_t >= args.max_frames or args.stretch_partial_videos:
+                images = np.linspace(0, current_t, args.max_frames, dtype=int)
+            else:
+                images = np.arange(current_t + 1)
+            if args.frame_indices_to_use is not None and len(images) > len(args.frame_indices_to_use):
+                images = np.stack([images[j] for j in args.frame_indices_to_use])
             for i in range(args.num_envs):
-                images = np.linspace(0, global_step % args.max_episode_steps, 12, dtype=int)
                 curr_video = frames[i][images]
                 curr_video = curr_video.unsqueeze(1)
                 curr_video = curr_video.unsqueeze(0)
                 curr_video = curr_video.unsqueeze(0)
-                batches[i][0] = curr_video
+                batches[i][0][:len(images)] = curr_video
 
             #for i in range(args.num_envs):
             with torch.no_grad():
+                num_frames = len(images)
+                num_padded = reward_model.dataloader.max_frames - num_frames
+                video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
                 a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
                 scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
             if len(scores.shape) > 2:
-                scores = scores[:, :, -1]
+                video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
+                final_scores = torch.zeros(args.num_envs)
+                for i in range(args.num_envs):
+                    final_scores[i] = scores[0, i, video_lengths[i]]
+                scores = final_scores
             rewards = scores.cpu().numpy()
             og_vlm_rewards = rewards.copy()
 
             if args.reward_normalization_offset:
-                if global_step % args.max_episode_steps == 11:
+                if current_t == offset_timestep:
                     offset = rewards.copy()
                     rewards -= offset
-                elif global_step % args.max_episode_steps >= 12:
+                elif current_t > offset_timestep:
                     rewards -= offset
             if args.reward_normalization_constant:
                 assert args.reward_normalization_constant_value is not None, "Need to set the constant to add via args"
@@ -788,10 +803,10 @@ if __name__ == "__main__":
                 return_rms.update(returns)
                 rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
                 rewards = np.asarray(rewards)
-            if last_rewards is None and global_step % args.max_episode_steps != 0:
+            if last_rewards is None and current_t != 0:
                 last_rewards = rewards.copy()
                 last_actions = np.asarray(actions).copy()[:, :3]
-            elif global_step % args.max_episode_steps == 0:
+            elif current_t == 0:
                 last_rewards = None
                 last_actions = None
             else:
