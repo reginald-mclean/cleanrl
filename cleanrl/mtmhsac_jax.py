@@ -36,8 +36,9 @@ import torch
 import pickle
 
 
-def load_c4c_args(c4c_ckpt):
-    init_model_path = os.path.join(REWARD_CKPT_DIR, c4c_ckpt)
+def load_c4c_args(args):
+    print(REWARD_CKPT_DIR, args.c4c_ckpt)
+    init_model_path = os.path.join(REWARD_CKPT_DIR, args.c4c_ckpt)
     c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
     with open(c4c_args_path, 'rb') as f:
         c4c_args = pickle.load(f)['args']
@@ -717,7 +718,6 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
-<<<<<<< HEAD
 
         if args.use_vlm:
             current_frames = envs.call('render')
@@ -734,39 +734,7 @@ if __name__ == "__main__":
                     images = np.arange(current_t + 1)
                 if args.frame_indices_to_use is not None and len(images) > len(args.frame_indices_to_use):
                     images = np.stack([images[j] for j in args.frame_indices_to_use])
-=======
-        current_frames = envs.call('render')
 
-        for idx, f in enumerate(current_frames):
-            frames[idx, current_t] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
-        batches = torch.zeros((args.num_envs, 1, reward_model.dataloader.max_frames, 1, 3, 224, 224))
-       
-        offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
-        if current_t >= offset_timestep:
-            if current_t >= c4c_args.max_frames or args.stretch_partial_videos:
-                images = np.linspace(0, current_t, c4c_args.max_frames, dtype=int)
-            else:
-                images = np.arange(current_t + 1)
-            if c4c_args.frame_indices_to_use is not None and len(images) > len(c4c_args.frame_indices_to_use):
-                images = np.stack([images[j] for j in c4c_args.frame_indices_to_use])
-            for i in range(args.num_envs):
-                curr_video = frames[i][images]
-                curr_video = curr_video.unsqueeze(1)
-                curr_video = curr_video.unsqueeze(0)
-                curr_video = curr_video.unsqueeze(0)
-                batches[i][0][:len(images)] = curr_video
-
-            #for i in range(args.num_envs):
-            with torch.no_grad():
-                num_frames = len(images)
-                num_padded = reward_model.dataloader.max_frames - num_frames
-                video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
-                a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
-                scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-            if len(scores.shape) > 2:
-                video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
-                final_scores = torch.zeros(args.num_envs)
->>>>>>> 1611aca980537d591a4aa7abaf2b8fdff75e0bd3
                 for i in range(args.num_envs):
                     curr_video = frames[i][images]
                     curr_video = curr_video.unsqueeze(1)
@@ -866,7 +834,7 @@ if __name__ == "__main__":
 
         # Store data in the buffer
         rb.add(obs, real_next_obs, actions, rewards, terminations)
-        if logging:
+        if args.use_vlm and logging:
             episode_dict['actions'].append(actions)
             episode_dict['raw_vlm_reward'].append(og_vlm_rewards)
             episode_dict['vlm_reward'].append(vlm_rewards)
