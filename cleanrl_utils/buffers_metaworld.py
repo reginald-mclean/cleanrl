@@ -51,15 +51,12 @@ class MultiTaskReplayBuffer:
     def __init__(
         self,
         total_capacity: int,
-        num_tasks: int,
         envs: gym.vector.VectorEnv,
         use_torch: bool = True,
         device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        assert total_capacity % num_tasks == 0, "Total capacity must be divisible by the number of tasks."
-        self.capacity = total_capacity // num_tasks
-        self.num_tasks = num_tasks
+        self.capacity = total_capacity
         self.use_torch = use_torch
         self.device = device
         self._rng = np.random.default_rng(seed)
@@ -70,30 +67,25 @@ class MultiTaskReplayBuffer:
 
     def reset(self):
         """Reinitialize the buffer."""
-        self.obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
-        self.actions = np.zeros((self.capacity, self.num_tasks, self._action_shape), dtype=np.float32)
-        self.rewards = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
-        self.next_obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
-        self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
+        self.obs = np.zeros((self.capacity, self._obs_shape), dtype=np.float32)
+        self.actions = np.zeros((self.capacity, self._action_shape), dtype=np.float32)
+        self.rewards = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.next_obs = np.zeros((self.capacity, self._obs_shape), dtype=np.float32)
+        self.dones = np.zeros((self.capacity, 1), dtype=np.float32)
         self.pos = 0
 
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):
-        """Add a batch of samples to the buffer.
+        """Add a batch of samples to the buffer."""
 
-        It is assumed that the observation has a one-hot task embedding as its suffix."""
-        task_idx = obs[:, -self.num_tasks :].argmax(1)
-
-        self.obs[self.pos, task_idx] = obs.copy()
-        self.actions[self.pos, task_idx] = action.copy()
-        self.rewards[self.pos, task_idx] = reward.copy().reshape(-1, 1)
-        self.next_obs[self.pos, task_idx] = next_obs.copy()
-        self.dones[self.pos, task_idx] = done.copy().reshape(-1, 1)
+        self.obs[self.pos] = obs.copy()
+        self.actions[self.pos] = action.copy()
+        self.rewards[self.pos] = reward.copy().reshape(-1, 1)
+        self.next_obs[self.pos] = next_obs.copy()
+        self.dones[self.pos] = done.copy().reshape(-1, 1)
 
         self.pos = (self.pos + 1) % self.capacity
 
-    def single_task_sample(self, task_idx: int, batch_size: int) -> ReplayBufferSamples:
-        assert task_idx < self.num_tasks, "Task index out of bounds."
-
+    def single_task_sample(self, batch_size: int) -> ReplayBufferSamples:
         sample_idx = self._rng.integers(
             low=0,
             high=max(self.pos, batch_size),
@@ -101,11 +93,11 @@ class MultiTaskReplayBuffer:
         )
 
         batch = (
-            self.obs[sample_idx][task_idx],
-            self.actions[sample_idx][task_idx],
-            self.next_obs[sample_idx][task_idx],
-            self.dones[sample_idx][task_idx],
-            self.rewards[sample_idx][task_idx],
+            self.obs[sample_idx],
+            self.actions[sample_idx],
+            self.next_obs[sample_idx],
+            self.dones[sample_idx],
+            self.rewards[sample_idx],
         )
 
         if self.use_torch:
@@ -122,13 +114,10 @@ class MultiTaskReplayBuffer:
         Returns:
             ReplayBufferSamples: A batch of samples of batch shape (batch_size,).
         """
-        assert batch_size % self.num_tasks == 0, "Batch size must be divisible by the number of tasks."
-        single_task_batch_size = batch_size // self.num_tasks
-
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, single_task_batch_size),
-            size=(single_task_batch_size,),
+            high=max(self.pos, batch_size),
+            size=(batch_size,),
         )
 
         batch = (
@@ -138,9 +127,6 @@ class MultiTaskReplayBuffer:
             self.dones[sample_idx],
             self.rewards[sample_idx],
         )
-
-        mt_batch_size = single_task_batch_size * self.num_tasks
-        batch = map(lambda x: x.reshape(mt_batch_size, *x.shape[2:]), batch)  # type: ignore
 
         if self.use_torch:
             batch = map(lambda x: torch.tensor(x).to(self.device), batch)  # type: ignore
@@ -234,7 +220,7 @@ class MultiTaskRolloutBuffer:
         The timesteps are multiple rollouts flattened into one time dimension."""
         assert task_idx < self.num_tasks, "Task index out of bounds."
 
-        task_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *self.rollouts[task_idx]))
+        task_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *self.rollouts))
 
         assert task_rollouts.observations.shape[:2] == (
             self._rollouts_per_task,

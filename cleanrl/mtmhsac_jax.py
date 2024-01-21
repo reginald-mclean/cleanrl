@@ -64,7 +64,6 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--env-parallel", type=bool, default=True, help="run multiple copies of a single environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=500,
@@ -74,7 +73,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=1280,
+    parser.add_argument("--sac-batch-size", type=int, default=128,
                         help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=200_000,
@@ -128,29 +127,24 @@ def _make_envs_common(
     benchmark: metaworld.Benchmark,
     seed: int,
     max_episode_steps: Optional[int] = None,
-    args: Namespace = None,
-    use_one_hot: bool = True,
     terminate_on_success: bool = False,
     run_name: str = None,
 ) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, extra: int, run_name: str) -> gym.Env:
+    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int, run_name: str) -> gym.Env:
         env = env_cls(render_mode='rgb_array')
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
-            if extra == 0:
-                trigger = lambda t: t % 10 == 0
-                env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/eval_videos'), episode_trigger=trigger)
+            trigger = lambda t: t % 10 == 0
+            env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/eval_videos'), episode_trigger=trigger)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if use_one_hot:
-            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
         return env
     return gym.vector.AsyncVectorEnv(
         [
-            partial(init_each_env, env_cls=env_cls, name=name if '10' in args.env_id or '50' in args.env_id else list(benchmark.train_classes.keys())[0], env_id=env_id if '10' in args.env_id or '50' in args.env_id else 0, extra=env_id, run_name=run_name)
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id, run_name=run_name)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
@@ -178,19 +172,12 @@ def scale(x, out_range=(-1, 1), axis=None):
 
 
 
-def split_obs_task_id(
-    obs: Union[jax.Array, npt.NDArray], num_tasks: int
-) -> Tuple[ArrayLike, ArrayLike]:
-    return obs[..., :-num_tasks], obs[..., -num_tasks:]
-
-
 class Batch(NamedTuple):
     observations: ArrayLike
     actions: ArrayLike
     rewards: ArrayLike
     next_observations: ArrayLike
     dones: ArrayLike
-    task_ids: ArrayLike
 
 
 class TanhNormal(distrax.Transformed):
@@ -214,29 +201,23 @@ def uniform_init(bound: float):
 
 class Actor(nn.Module):
     num_actions: int
-    num_tasks: int
     hidden_dims: int = "400,400,400"
 
     LOG_STD_MIN: float = -20.0
     LOG_STD_MAX: float = 2.0
 
     @nn.compact
-    def __call__(self, x: jax.Array, task_idx):
+    def __call__(self, x: jax.Array):
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
             x = nn.Dense(
-                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                h_size,
                 kernel_init=nn.initializers.he_uniform(),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
             x = nn.relu(x)
 
         # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
-        x = jnp.take_along_axis(x, indices, axis=1)
 
         log_sigma = nn.Dense(
             self.num_actions,
@@ -256,11 +237,10 @@ class Actor(nn.Module):
 def sample_action(
     actor: TrainState,
     obs: ArrayLike,
-    task_ids: ArrayLike,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    dist = actor.apply_fn(actor.params, obs, task_ids)
+    dist = actor.apply_fn(actor.params, obs)
     action = dist.sample(seed=action_key)
     return action, key
 
@@ -270,11 +250,10 @@ def sample_and_log_prob(
     actor: TrainState,
     actor_params: flax.core.FrozenDict,
     obs: ArrayLike,
-    task_ids: ArrayLike,
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    dist = actor.apply_fn(actor_params, obs, task_ids)
+    dist = actor.apply_fn(actor_params, obs)
     action, log_prob = dist.sample_and_log_prob(seed=action_key)
     return action, log_prob, key
 
@@ -283,33 +262,25 @@ def sample_and_log_prob(
 def get_deterministic_action(
     actor: TrainState,
     obs: ArrayLike,
-    task_ids: ArrayLike,
 ) -> jax.Array:
-    dist = actor.apply_fn(actor.params, obs, task_ids)
+    dist = actor.apply_fn(actor.params, obs)
     return dist.mean()
 
 
 class Critic(nn.Module):
     hidden_dims: int = "400,400"
-    num_tasks: int = 1
 
     @nn.compact
-    def __call__(self, state, action, task_idx):
+    def __call__(self, state, action):
         x = jnp.hstack([state, action])
         hidden_lst = [int(dim) for dim in self.hidden_dims.split(",")]
         for i, h_size in enumerate(hidden_lst):
             x = nn.Dense(
-                h_size * self.num_tasks if i == len(hidden_lst) - 1 else h_size,
+                h_size,
                 kernel_init=nn.initializers.he_uniform(),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
             x = nn.relu(x)
-        # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
-        x = jnp.take_along_axis(x, indices, axis=1)
 
         return nn.Dense(
             1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
@@ -318,11 +289,10 @@ class Critic(nn.Module):
 
 class VectorCritic(nn.Module):
     n_critics: int = 2
-    num_tasks: int = 1
     hidden_dims: int = "400,400,400"
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array, task_idx) -> jax.Array:
+    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
         vmap_critic = nn.vmap(
             Critic,
             variable_axes={"params": 0},  # parameters not shared between the critics
@@ -331,7 +301,7 @@ class VectorCritic(nn.Module):
             out_axes=0,
             axis_size=self.n_critics,
         )
-        return vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
+        return vmap_critic(self.hidden_dims)(state, action)
 
 
 class CriticTrainState(TrainState):
@@ -339,8 +309,8 @@ class CriticTrainState(TrainState):
 
 
 @jax.jit
-def get_alpha(log_alpha: jax.Array, task_ids: jax.Array) -> jax.Array:
-    return jnp.exp(task_ids @ log_alpha.reshape(-1, 1))
+def get_alpha(log_alpha: jax.Array) -> jax.Array:
+    return jnp.exp(log_alpha)
 
 
 class Agent:
@@ -352,7 +322,6 @@ class Agent:
     def __init__(
         self,
         init_obs: jax.Array,
-        num_tasks: int,
         action_space: gym.spaces.Box,
         policy_lr: float,
         q_lr: float,
@@ -361,10 +330,8 @@ class Agent:
         init_key: jax.random.PRNGKeyArray,
     ):
         self._action_space = action_space
-        self._num_tasks = num_tasks
         self._gamma = gamma
 
-        just_obs, task_id = jax.device_put(split_obs_task_id(init_obs, num_tasks))
         random_action = jnp.array(
             [self._action_space.sample() for _ in range(init_obs.shape[0])]
         )
@@ -380,34 +347,33 @@ class Agent:
 
         actor_network = Actor(
             num_actions=int(np.prod(self._action_space.shape)),
-            num_tasks=num_tasks,
             hidden_dims=args.actor_network,
         )
         key, actor_init_key = jax.random.split(init_key)
         self.actor = TrainState.create(
             apply_fn=actor_network.apply,
-            params=actor_network.init(actor_init_key, just_obs, task_id),
+            params=actor_network.init(actor_init_key, init_obs),
             tx=_make_optimizer(policy_lr, clip_grad_norm),
         )
 
         _, qf_init_key = jax.random.split(key, 2)
         vector_critic_net = VectorCritic(
-            num_tasks=num_tasks, hidden_dims=args.critic_network
+            hidden_dims=args.critic_network
         )
         self.critic = CriticTrainState.create(
             apply_fn=vector_critic_net.apply,
             params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
+                qf_init_key, init_obs, random_action
             ),
             target_params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
+                qf_init_key, init_obs, random_action
             ),
             tx=_make_optimizer(q_lr, clip_grad_norm),
         )
 
         self.alpha_train_state = TrainState.create(
             apply_fn=get_alpha,
-            params=jnp.zeros(NUM_TASKS),  # Log alpha
+            params=jnp.zeros(1),  # Log alpha
             tx=_make_optimizer(q_lr, max_grad_norm=0.0),
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
@@ -415,13 +381,11 @@ class Agent:
     def get_action_train(
         self, obs: np.ndarray, key: jax.random.PRNGKeyArray
     ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
-        state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions, key = sample_action(self.actor, state, task_id, key)
+        actions, key = sample_action(self.actor, obs, key)
         return jax.device_get(actions), key
 
     def get_action_eval(self, obs: np.ndarray) -> np.ndarray:
-        state, task_id = split_obs_task_id(obs, self._num_tasks)
-        actions = get_deterministic_action(self.actor, state, task_id)
+        actions = get_deterministic_action(self.actor, obs)
         return jax.device_get(actions)
 
     @staticmethod
@@ -459,10 +423,10 @@ def update(
     Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray
 ]:
     next_actions, next_action_log_probs, key = sample_and_log_prob(
-        actor, actor.params, batch.next_observations, batch.task_ids, key
+        actor, actor.params, batch.next_observations, key
     )
     q_values = critic.apply_fn(
-        critic.target_params, batch.next_observations, next_actions, batch.task_ids
+        critic.target_params, batch.next_observations, next_actions
     )
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
@@ -474,7 +438,7 @@ def update(
         )
 
         q_pred = critic.apply_fn(
-            params, batch.observations, batch.actions, batch.task_ids
+            params, batch.observations, batch.actions
         )
         return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
@@ -491,8 +455,7 @@ def update(
         }
 
     def alpha_loss(params: jax.Array, log_probs: jax.Array):
-        log_alpha = batch.task_ids @ params.reshape(-1, 1)
-        return (-log_alpha * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
+        return (-params.reshape(-1, 1) * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
 
     def update_alpha(
         _alpha: TrainState, log_probs: jax.Array
@@ -501,7 +464,7 @@ def update(
             _alpha.params, log_probs
         )
         _alpha = _alpha.apply_gradients(grads=alpha_grads)
-        alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
+        alpha_vals = _alpha.apply_fn(_alpha.params)
         return (
             _alpha,
             alpha_vals,
@@ -512,7 +475,7 @@ def update(
 
     def actor_loss(params: flax.core.FrozenDict):
         action_samples, log_probs, _ = sample_and_log_prob(
-            actor, params, batch.observations, batch.task_ids, actor_loss_key
+            actor, params, batch.observations, actor_loss_key
         )
         _alpha, _alpha_val, alpha_logs = update_alpha(alpha, log_probs)
         _alpha_val = jax.lax.stop_gradient(_alpha_val)
@@ -520,7 +483,7 @@ def update(
         logs = {**alpha_logs, **critic_logs}
 
         q_values = _critic.apply_fn(
-            _critic.params, batch.observations, action_samples, batch.task_ids
+            _critic.params, batch.observations, action_samples
         )
         min_qf_values = jnp.min(q_values, axis=0)
         return (_alpha_val * log_probs.sum(-1).reshape(-1, 1) - min_qf_values).mean(), (
@@ -651,18 +614,12 @@ if __name__ == "__main__":
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
         args.num_envs = 1
-        if args.env_parallel:
-            args.num_envs = 10
-            for i in range(1, args.num_envs):
-                benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
-
-    use_one_hot_wrapper = True
 
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, args=args, use_one_hot=use_one_hot_wrapper
+        benchmark, args.seed, args.max_episode_steps
     )
     eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, args=args, use_one_hot=use_one_hot_wrapper
+        eval_benchmark, args.seed, args.max_episode_steps
     )
 
     NUM_TASKS = len(benchmark.train_classes)
@@ -674,20 +631,18 @@ if __name__ == "__main__":
     # agent setup
     rb = MultiTaskReplayBuffer(
         total_capacity=args.buffer_size,
-        num_tasks=NUM_TASKS if (args.env_id == "MT10" or args.env_id == "MT50") else 1,
         envs=envs,
         use_torch=False,
         seed=args.seed,
     )
 
-    global_episodic_return: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
-    global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
+    global_episodic_return: Deque[float] = deque([], maxlen=20)
+    global_episodic_length: Deque[int] = deque([], maxlen=20)
 
     obs, _ = envs.reset()
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
         init_obs=obs,
-        num_tasks=NUM_TASKS,
         action_space=envs.single_action_space,
         policy_lr=args.policy_lr,
         q_lr=args.q_lr,
@@ -910,16 +865,13 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
         if global_step >= args.learning_starts:
             # Sample a batch from replay buffer
-            data = rb.sample(args.batch_size)
-            observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-            next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
+            data = rb.sample(args.sac_batch_size)
             batch = Batch(
-                observations,
+                data.observations,
                 data.actions,
                 data.rewards,
-                next_observations,
+                data.next_observations,
                 data.dones,
-                task_ids,
             )
 
             # Update agent
@@ -940,6 +892,7 @@ if __name__ == "__main__":
 
             # Logging
             if global_step % 1000 == 0:
+                print(logs)
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
                 # print("SPS:", int(total_steps / (time.time() - start_time)))
