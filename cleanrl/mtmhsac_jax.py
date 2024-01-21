@@ -99,9 +99,6 @@ def parse_args():
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
 
-    parser.add_argument("--use-vlm", default=False,
-        help="whether to use the vlm reward model or not. Default is to use it")
-
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
         help="the learning rate of the policy network optimizer")
@@ -118,7 +115,7 @@ def parse_args():
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
     args = parser.parse_args()
     c4c_args = None
-    if args.use_vlm:
+    if args.vlm_reward_weight != 0:
         c4c_args = load_c4c_args(args)
         args = parser.parse_args(namespace=c4c_args)
 
@@ -570,7 +567,7 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
-    if args.use_vlm:
+    if args.:
         run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
@@ -665,7 +662,7 @@ if __name__ == "__main__":
         init_key=key,
     )
 
-    if args.use_vlm:
+    if args.vlm_reward_weight != 0:
         reward_model = RewardCalculator(args=c4c_args)
         reward_model.model.eval()
 
@@ -719,7 +716,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
 
-        if args.use_vlm:
+        if args.vlm_reward_weight != 0:
             current_frames = envs.call('render')
 
             for idx, f in enumerate(current_frames):
@@ -834,7 +831,7 @@ if __name__ == "__main__":
 
         # Store data in the buffer
         rb.add(obs, real_next_obs, actions, rewards, terminations)
-        if args.use_vlm and logging:
+        if args.vlm_reward_weight != 0 and logging:
             episode_dict['actions'].append(actions)
             episode_dict['raw_vlm_reward'].append(og_vlm_rewards)
             episode_dict['vlm_reward'].append(vlm_rewards)
