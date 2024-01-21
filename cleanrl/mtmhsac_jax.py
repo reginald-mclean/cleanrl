@@ -36,8 +36,8 @@ import torch
 import pickle
 
 
-def load_c4c_args(args):
-    init_model_path = os.path.join(REWARD_CKPT_DIR, args.c4c_ckpt)
+def load_c4c_args(c4c_ckpt):
+    init_model_path = os.path.join(REWARD_CKPT_DIR, c4c_ckpt)
     c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
     with open(c4c_args_path, 'rb') as f:
         c4c_args = pickle.load(f)['args']
@@ -113,10 +113,16 @@ def parse_args():
     # C4C
     parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
     args = parser.parse_args()
-    c4c_args = load_c4c_args(args)
-    args = parser.parse_args(namespace=c4c_args)
+    c4c_args = load_c4c_args(args.c4c_ckpt)
+    c4c_args = parser.parse_args(namespace=c4c_args)
     # fmt: on
-    return args
+    print("C4C args:")
+    for key in sorted(c4c_args.__dict__):
+        print("  <<< {}: {}".format(key, c4c_args.__dict__[key]))
+    print("RL args:")
+    for key in sorted(args.__dict__):
+        print("  <<< {}: {}".format(key, args.__dict__[key]))
+    return args, c4c_args
 
 
 import metaworld
@@ -543,8 +549,8 @@ def update_mean_var_count_from_moments(
 
 # Training loop
 if __name__ == "__main__":
-    args = parse_args()
-    run_name = f"{args.env_id}_{args.exp_name}"
+    args, c4c_args = parse_args()
+    run_name = f"{args.env_id}_{args.exp_name}_envfix"
     if args.reward_normalization_offset:
         run_name += f"_rnorm_offset"
     if args.reward_normalization_gymnasium:
@@ -650,7 +656,7 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
-    reward_model = RewardCalculator(args=args)
+    reward_model = RewardCalculator(args=c4c_args)
     reward_model.model.eval()
 
     frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
@@ -714,12 +720,12 @@ if __name__ == "__main__":
        
         offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
         if current_t >= offset_timestep:
-            if current_t >= args.max_frames or args.stretch_partial_videos:
-                images = np.linspace(0, current_t, args.max_frames, dtype=int)
+            if current_t >= c4c_args.max_frames or args.stretch_partial_videos:
+                images = np.linspace(0, current_t, c4c_args.max_frames, dtype=int)
             else:
                 images = np.arange(current_t + 1)
-            if args.frame_indices_to_use is not None and len(images) > len(args.frame_indices_to_use):
-                images = np.stack([images[j] for j in args.frame_indices_to_use])
+            if c4c_args.frame_indices_to_use is not None and len(images) > len(c4c_args.frame_indices_to_use):
+                images = np.stack([images[j] for j in c4c_args.frame_indices_to_use])
             for i in range(args.num_envs):
                 curr_video = frames[i][images]
                 curr_video = curr_video.unsqueeze(1)
