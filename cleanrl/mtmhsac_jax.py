@@ -949,13 +949,13 @@ if __name__ == "__main__":
                     print(f"model saved to {ckpt_manager.directory}")
 
                 eval_success_rate_history[total_steps] = float(eval_success_rate)
-                recent_history = {k: v for k, v in eval_success_rate_history.items() if k >= total_steps - 1_000_000}
+                recent_history = {k: v for k, v in eval_success_rate_history.items() if k >= total_steps - 10 * args.evaluation_frequency}
                 recent_success_rates = list(recent_history.values())
                 print("Recent success rates")
                 for k, v in sorted(recent_history.items()):
                     print(f"{k}: {v}")
                 print(f"mean: {np.mean(recent_success_rates)}, median: {np.median(recent_success_rates)}", )
-                if total_steps > 1_000_000 and np.mean(recent_success_rates) >= 0.98 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
+                if total_steps > 10 * args.evaluation_frequency and np.mean(recent_success_rates) >= 0.98 and np.median(recent_success_rates) == 1 and float(eval_success_rate) >= 0.9:
                     print("Terminating early")
                     break
                 else:
