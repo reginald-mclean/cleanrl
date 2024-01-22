@@ -36,16 +36,14 @@ import torch
 import pickle
 
 
-def load_c4c_args(args):
-    print(REWARD_CKPT_DIR, args.c4c_ckpt)
-    init_model_path = os.path.join(REWARD_CKPT_DIR, args.c4c_ckpt)
+def load_c4c_args(c4c_ckpt):
+    init_model_path = os.path.join(REWARD_CKPT_DIR, c4c_ckpt)
     c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
     with open(c4c_args_path, 'rb') as f:
         c4c_args = pickle.load(f)['args']
     c4c_args.init_model = init_model_path
     c4c_args.resume_from_latest = False
     return c4c_args
-
 
 def parse_args():
     # fmt: off
@@ -116,8 +114,8 @@ def parse_args():
     args = parser.parse_args()
     c4c_args = None
     if args.vlm_reward_weight != 0:
-        c4c_args = load_c4c_args(args)
-        args = parser.parse_args(namespace=c4c_args)
+        c4c_args = load_c4c_args(args.c4c_ckpt)
+        c4c_args = parser.parse_args(namespace=c4c_args)
 
         # fmt: on
         print("C4C args:")
