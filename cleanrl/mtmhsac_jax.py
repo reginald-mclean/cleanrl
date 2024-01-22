@@ -723,12 +723,12 @@ if __name__ == "__main__":
 
             offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
             if current_t >= offset_timestep:
-                if current_t >= args.max_frames or args.stretch_partial_videos:
-                    images = np.linspace(0, current_t, args.max_frames, dtype=int)
+                if current_t >= c4c_args.max_frames or args.stretch_partial_videos:
+                    images = np.linspace(0, current_t, c4c_args.max_frames, dtype=int)
                 else:
                     images = np.arange(current_t + 1)
-                if args.frame_indices_to_use is not None and len(images) > len(args.frame_indices_to_use):
-                    images = np.stack([images[j] for j in args.frame_indices_to_use])
+                if c4c_args.frame_indices_to_use is not None and len(images) > len(c4c_args.frame_indices_to_use):
+                    images = np.stack([images[j] for j in c4c_args.frame_indices_to_use])
 
                 for i in range(args.num_envs):
                     curr_video = frames[i][images]
