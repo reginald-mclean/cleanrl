@@ -668,9 +668,10 @@ if __name__ == "__main__":
 
         with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
             descriptions = pickle.load(f)
-        success_captions = [v for k, v in descriptions.items() if 'success_videos__' + args.env_id in k]
-        task_desc = success_captions[0]
+        task_desc = [v for k, v in descriptions.items() if 'success_videos__' + args.env_id in k][0][0]
         task_desc = " ".join(task_desc)
+        print('Caption:', task_desc)
+        del descriptions
 
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
