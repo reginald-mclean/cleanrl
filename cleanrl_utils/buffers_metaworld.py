@@ -62,6 +62,8 @@ class MultiTaskReplayBuffer:
         self._rng = np.random.default_rng(seed)
         self._obs_shape = np.array(envs.single_observation_space.shape).prod()
         self._action_shape = np.array(envs.single_action_space.shape).prod()
+        self.full = False
+
 
         self.reset()  # Init buffer
 
@@ -82,13 +84,20 @@ class MultiTaskReplayBuffer:
         self.rewards[self.pos] = reward.copy().reshape(-1, 1)
         self.next_obs[self.pos] = next_obs.copy()
         self.dones[self.pos] = done.copy().reshape(-1, 1)
+        
 
-        self.pos = (self.pos + 1) % self.capacity
+        self.pos += 1
+
+        if self.pos == self.capacity:
+            self.full = True
+
+        self.pos = self.pos % self.capacity
 
     def single_task_sample(self, batch_size: int) -> ReplayBufferSamples:
+
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, batch_size),
+            high=max(self.pos if not self.full else self.capacity, batch_size),
             size=(batch_size,),
         )
 
@@ -116,7 +125,7 @@ class MultiTaskReplayBuffer:
         """
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, batch_size),
+            high=max(self.pos if not self.full else self.capacity, batch_size),
             size=(batch_size,),
         )
 
