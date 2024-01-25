@@ -552,7 +552,7 @@ def update_mean_var_count_from_moments(
 # Training loop
 if __name__ == "__main__":
     args, c4c_args = parse_args()
-    run_name = f"{args.env_id}_{args.exp_name}_envfix"
+    run_name = f"{args.env_id}_{args.exp_name}_rbfix"
     if args.reward_normalization_offset:
         run_name += f"_rnorm_offset"
     if args.reward_normalization_gymnasium:
