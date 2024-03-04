@@ -65,7 +65,7 @@ class MultiTaskReplayBuffer:
         self._rng = np.random.default_rng(seed)
         self._obs_shape = np.array(envs.single_observation_space.shape).prod()
         self._action_shape = np.array(envs.single_action_space.shape).prod()
-
+        self.full = False
         self.reset()  # Init buffer
 
     def reset(self):
@@ -76,6 +76,7 @@ class MultiTaskReplayBuffer:
         self.next_obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
         self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
         self.pos = 0
+        
 
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):
         """Add a batch of samples to the buffer.
@@ -89,14 +90,18 @@ class MultiTaskReplayBuffer:
         self.next_obs[self.pos, task_idx] = next_obs.copy()
         self.dones[self.pos, task_idx] = done.copy().reshape(-1, 1)
 
-        self.pos = (self.pos + 1) % self.capacity
+        self.pos = self.pos + 1
+        if self.pos == self.capacity:
+            self.full = True
+
+        self.pos = self.pos % self.capacity
 
     def single_task_sample(self, task_idx: int, batch_size: int) -> ReplayBufferSamples:
         assert task_idx < self.num_tasks, "Task index out of bounds."
 
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, batch_size),
+            high=max(self.pos if not self.full else self.capacity, batch_size),
             size=(batch_size,),
         )
 
@@ -127,7 +132,7 @@ class MultiTaskReplayBuffer:
 
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, single_task_batch_size),
+            high=max(self.pos if not self.full else self.capacity, single_task_batch_size),
             size=(single_task_batch_size,),
         )
 
