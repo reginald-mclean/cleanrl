@@ -51,17 +51,16 @@ class MultiTaskReplayBuffer:
     def __init__(
         self,
         total_capacity: int,
-        num_tasks: int,
         envs: gym.vector.VectorEnv,
         use_torch: bool = True,
         device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        assert total_capacity % num_tasks == 0, "Total capacity must be divisible by the number of tasks."
-        self.capacity = total_capacity // num_tasks
-        self.num_tasks = num_tasks
+        self.capacity = total_capacity
+        self.num_tasks = 1
         self.use_torch = use_torch
         self.device = device
+        self.full = False
         self._rng = np.random.default_rng(seed)
         self._obs_shape = np.array(envs.single_observation_space.shape).prod()
         self._action_shape = np.array(envs.single_action_space.shape).prod()
@@ -81,25 +80,24 @@ class MultiTaskReplayBuffer:
         """Add a batch of samples to the buffer.
 
         It is assumed that the observation has a one-hot task embedding as its suffix."""
-        task_idx = obs[:, -self.num_tasks :].argmax(1)
+        task_idx = 0
 
         self.obs[self.pos, task_idx] = obs.copy()
         self.actions[self.pos, task_idx] = action.copy()
         self.rewards[self.pos, task_idx] = reward.copy().reshape(-1, 1)
         self.next_obs[self.pos, task_idx] = next_obs.copy()
         self.dones[self.pos, task_idx] = done.copy().reshape(-1, 1)
-
+        if self.pos + 1 == self.capacity:
+            self.full = True
         self.pos = (self.pos + 1) % self.capacity
 
     def single_task_sample(self, task_idx: int, batch_size: int) -> ReplayBufferSamples:
-        assert task_idx < self.num_tasks, "Task index out of bounds."
-
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, batch_size),
+            high=max(self.pos if not self.full else self.capacity, batch_size),
             size=(batch_size,),
         )
-
+        task_idx = 0
         batch = (
             self.obs[sample_idx][task_idx],
             self.actions[sample_idx][task_idx],
@@ -127,7 +125,7 @@ class MultiTaskReplayBuffer:
 
         sample_idx = self._rng.integers(
             low=0,
-            high=max(self.pos, single_task_batch_size),
+            high=max(self.pos if not self.full else self.capacity, batch_size),
             size=(single_task_batch_size,),
         )
 
