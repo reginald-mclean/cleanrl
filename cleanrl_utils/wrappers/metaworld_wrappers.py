@@ -12,6 +12,86 @@ from gymnasium.wrappers.time_limit import TimeLimit
 from numpy.typing import NDArray
 
 
+class ObsModification(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
+    def __init__(self, env: Env, args : dict, task_idx : int, num_tasks : int):
+        gym.utils.RecordConstructorArgs.__init__(self)
+        gym.ObservationWrapper.__init__(self, env)
+
+        # need to create observation space for gym
+        #
+
+
+        self.args = args
+
+        if self.args['original']:
+            self._observation_space = self.env.observation_space
+        elif not isinstance(self.env.observation_space, Box):
+            print(self.env.observation_space)
+            obs_space_lb = self.env.observation_space['observation'].low
+            obs_space_ub = self.env.observation_space['observation'].high
+            one_hot_ub = np.ones(num_tasks)
+            one_hot_lb = np.zeros(num_tasks)
+
+            self.one_hot = np.zeros(num_tasks)
+            self.one_hot[task_idx] = 1.0
+
+            self._observation_space = gym.spaces.Box(
+                np.concatenate([obs_space_lb, -1 * np.ones(3), one_hot_lb]), np.concatenate([obs_space_ub, np.ones(3), one_hot_ub])
+            )
+
+            print(self._observation_space)
+        else:
+            env_lb = env.observation_space.low
+            env_ub = env.observation_space.high
+            one_hot_ub = np.ones(num_tasks)
+            one_hot_lb = np.zeros(num_tasks)
+
+            self.one_hot = np.zeros(num_tasks)
+            self.one_hot[task_idx] = 1.0
+
+            if self.args['only_pad']:
+                self._observation_space = gym.spaces.Box(
+                    np.concatenate([env_lb, one_hot_lb, np.zeros(23)]), np.concatenate([env_ub, one_hot_ub, np.zeros(23)])
+                )
+            else:
+                self._observation_space = gym.spaces.Box(
+                    np.concatenate([env_lb[:36], np.zeros(23), env_lb[36:], one_hot_lb]),
+                    np.concatenate([env_ub[:36], np.zeros(23), env_ub[36:], one_hot_ub])
+                )
+    def observation(self, observation: Union[NDArray, Dict]) -> NDArray:
+        """Returns a modified observation.
+
+        Args:
+            observation: The :attr:`env` observation
+
+        Returns:
+            The modified observation
+
+        obs = {
+            "observation": np.concatenate((robot_obs, obj_qpos, obj_qvel, OBS_ELEMENT_GOALS[task])),
+            "achieved_goal": achieved_goal,
+            "desired_goal": self.goal,
+            }
+
+        """
+
+        if self.args['original']:
+            return observation
+        if isinstance(observation, Dict):
+            observation = np.concatenate([observation['observation'], self.one_hot])
+        else:
+            if self.args['only_pad']:
+                observation = np.concatenate([observation, self.one_hot, np.zeros(23)])
+            else:
+                observation = np.concatenate([observation[:36], np.zeros(23), observation[36:], self.one_hot])
+
+        return observation
+
+    @property
+    def observation_space(self) -> gym.spaces.Space:
+        return self._observation_space
+
+
 class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: Env, task_idx: int, num_tasks: int):
         gym.utils.RecordConstructorArgs.__init__(self)

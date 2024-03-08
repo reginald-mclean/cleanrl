@@ -6,7 +6,12 @@ import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import Deque, NamedTuple, Optional, Tuple, Union
+from typing import Deque, NamedTuple, Optional, Tuple, Union, List
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from cleanrl_utils.wrappers import metaworld_wrappers
+from metaworld import Benchmark, Task
+from gymnasium_robotics.envs.franka_kitchen.kitchen_env import KitchenEnv
+from gymnasium.wrappers.time_limit import TimeLimit
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -438,6 +443,66 @@ def update(
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
+
+def _make_envs_common(
+    benchmark: Benchmark,
+    seed: int,
+    max_episode_steps: Optional[int] = 500,
+    use_one_hot: bool = True,
+    terminate_on_success: bool = False,
+) -> gym.vector.VectorEnv:
+    def init_each_env(env_cls: Union[SawyerXYZEnv, KitchenEnv], name: str, env_id: int) -> gym.Env:
+        """
+        @type env_cls: Union[SawyerXYZEnv, KitchenEnv]
+        """
+        print(env_cls)
+        if not isinstance(env_cls, TimeLimit):
+            env = env_cls()
+        else:
+            env = env_cls
+        env = gym.wrappers.TimeLimit(env, max_episode_steps)
+        if terminate_on_success:
+            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = metaworld_wrappers.ObsModification(env, {'original' : False, 'only_pad' : False}, env_id, 10)
+
+        if isinstance(env_cls, SawyerXYZEnv):
+            tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+            env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env.action_space.seed(seed)
+        return env
+
+    return gym.vector.AsyncVectorEnv(
+        [
+            partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
+            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
+        ]
+    )
+
+
+class FK_Benchmark(Benchmark):
+    def __init__(self):
+        super().__init__()
+        tasks = ['bottom burner', 'top burner', 'light switch', 'slide cabinet', 'hinge cabinet', 'microwave', 'kettle'] #  ['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']
+        self._train_classes = {name : gym.make('FrankaKitchen-v1', tasks_to_complete=[name], render_mode='rgb_array') for name in tasks} # obs_space='original'
+
+
+class MW_FK(Benchmark):
+    def __init__(self, seed):
+        self.mt10 = metaworld.MT10(seed=seed)
+        self.fk = FK_Benchmark()
+        self.fk.train_classes.update(dict(self.mt10.train_classes))
+
+    @property
+    def train_classes(self) -> "Dict[EnvName, Type]":
+        return self.fk.train_classes
+
+    @property
+    def train_tasks(self) -> List[Task]:
+        return self.mt10.train_tasks
+
+
+
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
@@ -476,12 +541,19 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
 
     # env setup
+
+    make_envs = partial(_make_envs_common, terminate_on_success=False)
+    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
+
+
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == "MT50":
-        benchmark = metaworld.MT50(seed=args.seed)
+    elif args.env_id == "FK":
+        benchmark = FK_Benchmark()
+    elif args.env_id == "MT10+FK":
+        benchmark = MW_FK(args.seed)
     else:
-        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+        benchmark = None
 
     use_one_hot_wrapper = (
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
