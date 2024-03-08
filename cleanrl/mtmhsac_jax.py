@@ -3,6 +3,9 @@ import argparse
 import os
 import random
 import time
+import sys
+sys.path.append('/mnt/nvme/multitask_transfer/cleanrl')
+
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
@@ -460,7 +463,7 @@ def _make_envs_common(
             env = env_cls()
         else:
             env = env_cls
-        env = gym.wrappers.TimeLimit(env, max_episode_steps)
+        env = gym.wrappers.TimeLimit(env, 500)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -472,7 +475,7 @@ def _make_envs_common(
         env.action_space.seed(seed)
         return env
 
-    return gym.vector.AsyncVectorEnv(
+    return gym.vector.SyncVectorEnv(
         [
             partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
@@ -483,8 +486,8 @@ def _make_envs_common(
 class FK_Benchmark(Benchmark):
     def __init__(self):
         super().__init__()
-        tasks = ['bottom burner', 'top burner', 'light switch', 'slide cabinet', 'hinge cabinet', 'microwave', 'kettle'] #  ['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']
-        self._train_classes = {name : gym.make('FrankaKitchen-v1', tasks_to_complete=[name], render_mode='rgb_array') for name in tasks} # obs_space='original'
+        tasks = ['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']
+        self._train_classes = {name : gym.make('FrankaKitchen-v1', tasks_to_complete=[name], render_mode='rgb_array', obs_space='original') for name in tasks} # obs_space='original'
 
 
 class MW_FK(Benchmark):
@@ -612,7 +615,7 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions, np.asarray(['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']))
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:

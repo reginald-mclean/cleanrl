@@ -36,7 +36,7 @@ class ObsModification(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
             self.one_hot[task_idx] = 1.0
 
             self._observation_space = gym.spaces.Box(
-                np.concatenate([obs_space_lb, -1 * np.ones(3), one_hot_lb]), np.concatenate([obs_space_ub, np.ones(3), one_hot_ub])
+                np.concatenate([obs_space_lb, one_hot_lb]), np.concatenate([obs_space_ub, one_hot_ub])
             )
 
             print(self._observation_space)
