@@ -47,7 +47,7 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="MW-FK-Transfer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -461,9 +461,9 @@ def _make_envs_common(
         print(env_cls)
         if not isinstance(env_cls, TimeLimit):
             env = env_cls()
+            env = gym.wrappers.TimeLimit(env, 500)
         else:
             env = env_cls
-        env = gym.wrappers.TimeLimit(env, 500)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
@@ -473,9 +473,10 @@ def _make_envs_common(
             tasks = [task for task in benchmark.train_tasks if task.env_name == name]
             env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
+        print(env)
         return env
 
-    return gym.vector.SyncVectorEnv(
+    return gym.vector.AsyncVectorEnv(
         [
             partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
@@ -600,6 +601,12 @@ if __name__ == "__main__":
         init_key=key,
     )
 
+    if args.env_id == 'FK':
+        tasks = np.asarray(['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner'])
+    elif args.env_id == 'MT10':
+        tasks = np.asarray([None for _ in range(10)])
+    else:
+        raise NotImplementedError()
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -615,7 +622,7 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions, np.asarray(['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner']))
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions, tasks)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -705,6 +712,7 @@ if __name__ == "__main__":
                     agent=agent,
                     eval_envs=eval_envs,
                     num_episodes=args.evaluation_num_episodes,
+                    tasks=tasks
                 )
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
