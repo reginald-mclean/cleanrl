@@ -9,7 +9,7 @@ sys.path.append('/mnt/nvme/multitask_transfer/cleanrl')
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
-from typing import Deque, NamedTuple, Optional, Tuple, Union, List
+from typing import Deque, NamedTuple, Optional, Tuple, Union, List, Type
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from cleanrl_utils.wrappers import metaworld_wrappers
 from metaworld import Benchmark, Task
