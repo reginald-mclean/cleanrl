@@ -1,8 +1,6 @@
 # ruff: noqa: E402
 import argparse
 import os
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import random
 import time
 from collections import deque
@@ -10,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 import sys
-sys.path.append('/home/reggiemclean/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
