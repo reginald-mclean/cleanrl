@@ -36,7 +36,7 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-
+from argparse import Namespace
 
 def parse_args():
     # fmt: off
@@ -82,6 +82,13 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+
+    # Obs Wrapper
+    parser.add_argument("--original", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help='use the original state space')
+    parser.add_argument("--only-pad", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help='if using MW, naively pad the state space (True) or align the inputs as well (False)')
+
     args = parser.parse_args()
     # fmt: on
     return args
@@ -453,6 +460,7 @@ def _make_envs_common(
     max_episode_steps: Optional[int] = 500,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
+    args : Namespace = None
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Union[SawyerXYZEnv, KitchenEnv], name: str, env_id: int) -> gym.Env:
         """
@@ -467,7 +475,8 @@ def _make_envs_common(
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = metaworld_wrappers.ObsModification(env, {'original' : False, 'only_pad' : False}, env_id, 10)
+        if args:
+            env = metaworld_wrappers.ObsModification(env, {'original' : args.original, 'only_pad' : args.only_pad}, env_id, 10)
 
         if isinstance(env_cls, SawyerXYZEnv):
             tasks = [task for task in benchmark.train_tasks if task.env_name == name]
@@ -563,10 +572,10 @@ if __name__ == "__main__":
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
     )
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, args=args
     )
     eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, args=args
     )
 
     NUM_TASKS = len(benchmark.train_classes)
