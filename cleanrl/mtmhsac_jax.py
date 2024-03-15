@@ -149,13 +149,13 @@ class Actor(nn.Module):
 
         log_sigma = nn.Dense(
             self.num_actions,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
         )(x)
         mu = nn.Dense(
             self.num_actions,
-            kernel_init=uniform_init(1e-3),
-            bias_init=uniform_init(1e-3),
+            kernel_init=nn.initializers.he_uniform(),
+            bias_init=nn.initializers.constant(0.1),
         )(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
         return TanhNormal(mu, jnp.exp(log_sigma))
@@ -221,7 +221,7 @@ class Critic(nn.Module):
         x = jnp.take_along_axis(x, indices, axis=1)
 
         return nn.Dense(
-            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
+            1, kernel_init=nn.initializers.he_uniform(), bias_init=nn.initializers.constant(0.1)
         )(x)
 
 
