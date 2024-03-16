@@ -1,10 +1,12 @@
 # ruff: noqa: E402
 import argparse
 import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="5"
 import random
 import time
 import sys
-sys.path.append('/mnt/nvme/multitask_transfer/cleanrl')
+sys.path.append('/home/reggiemclean/multitask_transfer/cleanrl')
 
 from collections import deque
 from distutils.util import strtobool
@@ -16,7 +18,9 @@ from metaworld import Benchmark, Task
 from gymnasium_robotics.envs.franka_kitchen.kitchen_env import KitchenEnv
 from gymnasium.wrappers.time_limit import TimeLimit
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ[
+    "XLA_PYTHON_CLIENT_MEM_FRACTION"
+] = "0.06"
 
 import distrax
 import flax
@@ -466,9 +470,8 @@ def _make_envs_common(
         """
         @type env_cls: Union[SawyerXYZEnv, KitchenEnv]
         """
-        print(env_cls)
         if not isinstance(env_cls, TimeLimit):
-            env = env_cls()
+            env = env_cls(reward_func_version='v2')
             env = gym.wrappers.TimeLimit(env, 500)
         else:
             env = env_cls
@@ -478,11 +481,10 @@ def _make_envs_common(
         if args:
             env = metaworld_wrappers.ObsModification(env, {'original' : args.original, 'only_pad' : args.only_pad}, env_id, 10)
 
-        if isinstance(env_cls, SawyerXYZEnv):
+        if isinstance(env.unwrapped, SawyerXYZEnv):
             tasks = [task for task in benchmark.train_tasks if task.env_name == name]
             env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
-        env.action_space.seed(seed)
-        print(env)
+        env.action_space.seed(seed + env_id)
         return env
 
     return gym.vector.AsyncVectorEnv(
@@ -519,7 +521,7 @@ class MW_FK(Benchmark):
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
         import wandb
 
@@ -528,7 +530,7 @@ if __name__ == "__main__":
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
-            name=run_name,
+            name=args.exp_name,
             monitor_gym=True,
             save_code=True,
         )
@@ -545,7 +547,7 @@ if __name__ == "__main__":
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+            f"/home/reggiemclean/multitask_transfer/runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
         )
 
     # TRY NOT TO MODIFY: seeding
@@ -558,6 +560,7 @@ if __name__ == "__main__":
     make_envs = partial(_make_envs_common, terminate_on_success=False)
     make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
 
+    print('making envs:', args.env_id)
 
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
@@ -598,6 +601,8 @@ if __name__ == "__main__":
 
     obs, _ = envs.reset()
 
+    print(obs)
+
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
         init_obs=obs,
@@ -610,6 +615,8 @@ if __name__ == "__main__":
         init_key=key,
     )
 
+    print(envs.single_action_space)
+    print(envs.single_observation_space)
     if args.env_id == 'FK':
         tasks = np.asarray(['microwave', 'kettle', 'right_hinge_cabinet', 'left_hinge_cabinet', 'slide_cabinet', 'light_switch', 'top_left_burner', 'top_right_burner', 'bottom_left_burner', 'bottom_right_burner'])
     elif args.env_id == 'MT10':
