@@ -112,20 +112,19 @@ def parse_args():
 
 class Actor(nn.Module):
     action_dim: Sequence[int]
-
     @nn.compact
     def __call__(self, x):
         x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
         x = nn.Dense(512, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(0.0, dtype=jnp.float32))(x)
         x = nn.tanh(x)
-        #log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
-        #log_std = self.param('log_std', log_std_init, (self.action_dim,))
-        #expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
-        #expanded_log_std = jnp.clip(expanded_log_std, LOG_STD_MIN, LOG_STD_MAX)
-        #std = jnp.exp(expanded_log_std)
-        return nn.Dense(2*self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(1.0, dtype=jnp.float32))(x)
-
+        log_std_init = functools.partial(nn.initializers.ones, dtype=jnp.float32)
+        log_std = self.param('log_std', log_std_init, (self.action_dim,))
+        expanded_log_std = jnp.tile(log_std[None, :], (x.shape[0], 1))
+        expanded_log_std = jnp.clip(expanded_log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = jnp.exp(expanded_log_std)
+        mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01, dtype=jnp.float32), bias_init=constant(1.0, dtype=jnp.float32))(x)
+        return mean, std
 
 class Critic(nn.Module):
     @nn.compact
@@ -266,15 +265,9 @@ if __name__ == "__main__":
         key: jax.random.PRNGKey,
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
-        output = actor.apply(state.params.actor_params, next_obs)
-        #print(output.shape)
-        mean, std = output[:, :4], output[:, 4:]
-        #print(mean.shape, std.shape)
-        std = jnp.clip(std, LOG_STD_MIN, LOG_STD_MAX) # LOG_STD_MAX
-        std = jnp.exp(std)
-        #exit(0)
-        key, subkey = jax.random.split(key)
+        mean, std = actor.apply(state.params.actor_params, next_obs)
         dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
+        key, subkey = jax.random.split(key)
         action = dist.sample(seed=subkey)
         logprob = dist.log_prob(action)
         value = critic.apply(state.params.critic_params, next_obs)
@@ -295,10 +288,7 @@ if __name__ == "__main__":
         action: np.ndarray,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
-        output = actor.apply(params.actor_params, x)
-        mean, std = output[:, :4], output[:, 4:]
-        std = jnp.clip(std, LOG_STD_MIN, LOG_STD_MAX) # LOG_STD_MAX
-        std = jnp.exp(std)
+        mean, std = actor.apply(params.actor_params, x)
         dist = distrax.MultivariateNormalDiag(loc=mean, scale_diag=std)
         value = critic.apply(params.critic_params, x)
         logprob = dist.log_prob(action)
@@ -405,16 +395,19 @@ if __name__ == "__main__":
     global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
     global_episodic_length: Deque[int] = deque([], maxlen=20 * args.num_envs)
 
+    @jax.jit
+    def get_act(agent_state, next_obs, next_done, storage, step, key):
+        return get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
             if step % 500 == 0:
                 print(step)
             global_step += 1 * args.num_envs
-            storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
+            storage, action, key = get_act(agent_state, next_obs, next_done, storage, step, key)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            
+            action = np.array(action)
             next_obs, reward, truncate, terminate, infos = envs.step(action)
             next_done = np.logical_or(truncate, terminate)
             storage = storage.replace(rewards=storage.rewards.at[step].set(reward))

@@ -38,8 +38,8 @@ def evaluation(
 
     while not eval_done(episodic_returns):
         if actor:
-            output = actor.apply(agent.params.actor_params, obs)
-            actions = output[:, :4]
+            mean, std = actor.apply(agent.params.actor_params, obs)
+            actions = mean
             actions = jax.device_get(actions)
         else:
             actions = agent.get_action_eval(obs)
