@@ -1,14 +1,20 @@
 # ruff: noqa: E402
 import argparse
 import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import random
 import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
+import sys
+sys.path.append('/home/reggiemclean/cleanrl')
 
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ[
+    "XLA_PYTHON_CLIENT_MEM_FRACTION"
+] = "0.048"
 
 import distrax
 import flax
@@ -39,15 +45,16 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Metaworld-CleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking (Updated)",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default=None,
+    parser.add_argument("--wandb-entity", type=str, default="reggies-phd-research",
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
+    parser.add_argument("--reward-version", type=str, default="v2", help="the reward function of the environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=None,
@@ -486,11 +493,12 @@ if __name__ == "__main__":
     use_one_hot_wrapper = (
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
     )
+
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
     )
     eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
     )
 
     NUM_TASKS = len(benchmark.train_classes)
@@ -525,10 +533,57 @@ if __name__ == "__main__":
         init_key=key,
     )
 
+    (   
+        eval_success_rate,
+        eval_returns,
+        eval_success_per_task,
+    ) = evaluation(
+        agent=agent,
+        eval_envs=eval_envs,
+        num_episodes=args.evaluation_num_episodes,
+    )
+    eval_metrics = {
+        "charts/mean_success_rate": float(eval_success_rate),
+        "charts/mean_evaluation_return": float(eval_returns),
+    } | {
+        f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+        for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+    }
+
+    for k, v in eval_metrics.items():
+        writer.add_scalar(k, v, 0)
+    print(
+        f"total_steps=0, mean evaluation success rate: {eval_success_rate:.4f}"
+        + f" return: {eval_returns:.4f}"
+    )
+
+
+    env_names = list(benchmark.train_classes.keys())
+
     start_time = time.time()
+    derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
+    last_rewards = None 
+    last_actions = None
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
+        for k in agent.actor.params['params']:
+            if 'Dense' in k:
+                writer.add_scalar(f'actor_{k}', np.float64(jnp.linalg.norm(agent.actor.params['params'][k]['kernel'])), global_step)
+        for k in agent.critic.params['params']['VmapCritic_0']:
+            if 'Dense' in k:
+                writer.add_scalar(f'critic_{k}', np.float64(jnp.linalg.norm(agent.critic.params['params']['VmapCritic_0'][k]['kernel'])), global_step)
+
+        if global_step % args.max_episode_steps == 0:
+             if global_step > args.learning_starts:
+                 for i in range(NUM_TASKS):
+                     writer.add_scalar(
+                        f"charts/{env_names[i]}_avg_derivative_per_episode",
+                        derivatives[i]/args.max_episode_steps,
+                        global_step,
+                     )
+             derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
+
         total_steps = global_step * NUM_TASKS
 
         # ALGO LOGIC: put action logic here
@@ -541,7 +596,15 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-
+        if last_rewards is None and global_step % args.max_episode_steps != 0:
+            last_rewards = rewards.copy()
+            last_actions = np.asarray(actions).copy()[:, :3]
+        elif global_step % args.max_episode_steps == 0:
+            last_rewards = None
+            last_actions = None
+        else: 
+            dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3])
+            derivatives += (rewards - last_rewards) / dist
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:

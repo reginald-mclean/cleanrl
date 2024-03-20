@@ -1,5 +1,7 @@
 import argparse
 import os
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="5"
 import random
 import time
 from distutils.util import strtobool
@@ -8,14 +10,14 @@ from functools import partial
 import functools
 from collections import deque
 import sys
-sys.path.append('/home/reggie/Desktop/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 ] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 
-
+import metaworld
 import flax
 import flax.linen as nn
 import gymnasium as gym
@@ -27,7 +29,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 import distrax
-from cleanrl_utils.evals.metaworld_jax_eval import ppo_evaluation
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from jax.config import config
 
 # config.update('jax_disable_jit', True)
@@ -56,6 +58,8 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
+    parser.add_argument("--reward-version", type=str, default="v2",
+        help="environment reward function to use")
     parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
@@ -158,38 +162,7 @@ class EpisodeStatistics:
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
 
-import metaworld
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
-from cleanrl_utils.wrappers import metaworld_wrappers
-
-def _make_envs_common(
-    benchmark: metaworld.Benchmark,
-    seed: int,
-    max_episode_steps: Optional[int] = None,
-    use_one_hot: bool = True,
-    terminate_on_success: bool = False,
-) -> gym.vector.VectorEnv:
-    def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        env = env_cls()
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
-        if terminate_on_success:
-            env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        if use_one_hot:
-            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
-        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
-        if not terminate_on_success:
-            tasks = tasks[env_id:(env_id+5)]
-        env = metaworld_wrappers.PseudoRandomTaskSelectWrapper(env, tasks)
-        env.action_space.seed(seed)
-        return env
-
-    return gym.vector.AsyncVectorEnv(
-        [
-            partial(init_each_env, env_cls=env_cls, name=list(benchmark.train_classes.keys())[0], env_id=env_id)
-            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
-        ]
-    )
+from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 
 
 LOG_STD_MAX = 1.5
@@ -223,26 +196,18 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(args.seed)
     key, actor_key, critic_key = jax.random.split(key, 3)
 
-    # env setup
-    make_envs = partial(_make_envs_common, terminate_on_success=False)
-    make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
-
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
         args.num_envs = 10
     elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
         args.num_envs = 50
-    else:
-        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-        eval_benchmark = metaworld.MT1(args.env_id, seed=args.seed)
-        args.num_envs = 10
-        for i in range(1, 10):
-            benchmark.train_classes[str(args.env_id) + f' {i}'] = benchmark.train_classes[args.env_id]
 
     use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
-    eval_envs = make_eval_envs(eval_benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper)
+
+    envs = make_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version)
+    eval_envs = make_eval_envs(benchmark, args.seed, args.num_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version)
+
     episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
         episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
@@ -339,30 +304,6 @@ if __name__ == "__main__":
         logprob = dist.log_prob(action)
         return logprob, dist.entropy(), value
 
-    '''@jax.jit
-    def compute_gae(
-        agent_state: TrainState,
-        next_obs: np.ndarray,
-        next_done: np.ndarray,
-        storage: Storage,
-    ):
-        storage = storage.replace(advantages=storage.advantages.at[:].set(0.0))
-        next_value = critic.apply(
-            agent_state.params.critic_params,next_obs).squeeze()
-        lastgaelam = 0
-        for t in reversed(range(args.num_steps)):
-            if t == args.num_steps - 1:
-                nextnonterminal = 1.0 - next_done
-                nextvalues = next_value
-            else:
-                nextnonterminal = 1.0 - storage.dones[t + 1]
-                nextvalues = storage.values[t + 1]
-            delta = storage.rewards[t] + args.gamma * nextvalues * nextnonterminal - storage.values[t]
-            lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            storage = storage.replace(advantages=storage.advantages.at[t].set(lastgaelam))
-        storage = storage.replace(returns=storage.advantages + storage.values)
-        return storage'''
-
     def compute_gae_once(carry, inp, gamma, gae_lambda):
         advantages = carry
         nextdone, nextvalues, curvalues, reward = inp
@@ -383,7 +324,6 @@ if __name__ == "__main__":
         storage: Storage,
     ):
         next_value = critic.apply(agent_state.params.critic_params, next_obs).squeeze()
-        print(next_value.shape)
         advantages = jnp.zeros((args.num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         print(storage.values.shape, next_value.shape)
@@ -460,7 +400,6 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, info = envs.reset()
-    print(f'next obs {next_obs.shape}')
     next_done = np.zeros(args.num_envs)
 
     global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
@@ -469,6 +408,8 @@ if __name__ == "__main__":
 
     def rollout(agent_state, next_obs, next_done, storage, key, global_step):
         for step in range(0, args.num_steps):
+            if step % 500 == 0:
+                print(step)
             global_step += 1 * args.num_envs
             storage, action, key = get_action_and_value(agent_state, next_obs, next_done, storage, step, key)
 
@@ -484,7 +425,6 @@ if __name__ == "__main__":
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 #print(i, info)
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
@@ -506,13 +446,15 @@ if __name__ == "__main__":
                 print(jnp.linalg.norm(agent_state.params.critic_params['params'][k]['kernel']))
 
         if (update - 1) % args.eval_freq == 0:
-            eval_success_rate, eval_returns, eval_success_per_task, key = ppo_evaluation(
-                    agent_state=agent_state,
-                    actor=actor,
+            (
+                    eval_success_rate,
+                    eval_returns,
+                    eval_success_per_task,
+            ) = evaluation(
+                    agent=agent_state,
                     eval_envs=eval_envs,
                     num_episodes=args.evaluation_num_episodes,
-                    key=key,
-                    #task_names=list(benchmark.train_classes.keys())
+                    actor=actor
             )
             print(eval_success_rate, eval_returns, eval_success_per_task)
             eval_metrics = {
@@ -520,7 +462,7 @@ if __name__ == "__main__":
                     "charts/mean_evaluation_return": float(eval_returns),
                 } | {
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-                    for i, (env_name, _) in enumerate(eval_benchmark.train_classes.items())
+                    for i, (env_name, _) in enumerate(benchmark.train_classes.items())
             }
             #print(eval_metrics)
             for k, v in eval_metrics.items():

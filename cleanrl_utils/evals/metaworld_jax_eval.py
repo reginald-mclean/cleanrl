@@ -15,6 +15,7 @@ def evaluation(
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     task_names: Optional[List[str]] = None,
+    actor = None
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
     print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
@@ -36,7 +37,12 @@ def evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        actions = agent.get_action_eval(obs)
+        if actor:
+            output = actor.apply(agent.params.actor_params, obs)
+            actions = output[:, :4]
+            actions = jax.device_get(actions)
+        else:
+            actions = agent.get_action_eval(obs)
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
