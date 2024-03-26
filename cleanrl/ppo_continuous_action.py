@@ -6,10 +6,11 @@ import time
 from distutils.util import strtobool
 
 import sys
-sys.path.append('/home/reginaldkmclean/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
-from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
+from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 import gymnasium as gym
 import numpy as np
 import torch
@@ -43,6 +44,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
+    parser.add_argument("--reward-version", type=str, default="v2", help="the reward function of the environment")
     parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
@@ -77,6 +79,8 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--eval-freq", type=int, default=2,
         help="how many updates to do before evaluating the agent")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=50,
+        help="how many episodes per environment to run an evaluation for")
     args = parser.parse_args()
     
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -111,6 +115,12 @@ class Agent(nn.Module):
 
     def get_value(self, x):
         return self.critic(x)
+
+    def get_action_eval(self, x, device='cuda:0'):
+        x = torch.from_numpy(x).to(device)
+        action_mean = self.actor_mean(x)
+        return torch.tanh(action_mean).cpu().detach().numpy()
+
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
@@ -161,12 +171,20 @@ if __name__ == "__main__":
         benchmark = metaworld.MT50(seed=args.seed)
 
     use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
-
+    print(use_one_hot_wrapper)
     # env setup
-    envs = SyncVectorEnv(
-        benchmark.train_classes, benchmark.train_tasks, use_one_hot_wrapper=use_one_hot_wrapper
+
+    envs = make_envs(
+        benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
     )
+
+    eval_envs = make_eval_envs(
+        benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
+    )
+
     keys = list(benchmark.train_classes.keys())
+
+    args.num_envs = len(keys)
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -192,12 +210,29 @@ if __name__ == "__main__":
 
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
-            ### NEED TO SET TRAIN OR TEST TASKS
-            agent = agent.to('cpu')
             agent.eval()
-            evaluation_procedure(num_envs=args.num_envs, writer=writer, agent=agent,
-                                 update=update, keys=keys, classes=benchmark.train_classes, tasks=benchmark.train_tasks)
-            agent = agent.to(device)
+            (
+                eval_success_rate,
+                eval_returns,
+                eval_success_per_task,
+            ) = evaluation(
+                agent=agent,
+                eval_envs=eval_envs,
+                num_episodes=args.evaluation_num_episodes,
+            )
+            eval_metrics = {
+                "charts/mean_success_rate": float(eval_success_rate),
+                "charts/mean_evaluation_return": float(eval_returns),
+            } | {
+                f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
+                for i, (env_name, _) in enumerate(benchmark.train_classes.items())
+            }
+            for k, v in eval_metrics.items():
+                writer.add_scalar(k, v, global_step)
+            print(
+                f"total_steps={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
+                + f" return: {eval_returns:.4f}"
+            )
             agent.train()
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
