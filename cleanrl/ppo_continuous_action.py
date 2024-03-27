@@ -4,9 +4,10 @@ import os
 import random
 import time
 from distutils.util import strtobool
-
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import sys
-sys.path.append('/mnt/nvme/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
