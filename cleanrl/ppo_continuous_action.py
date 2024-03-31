@@ -4,8 +4,6 @@ import os
 import random
 import time
 from distutils.util import strtobool
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import sys
 sys.path.append('/home/reggiemclean/cleanrl')
 
@@ -35,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking (Updated)",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
@@ -119,8 +117,8 @@ class Agent(nn.Module):
 
     def get_action_eval(self, x, device='cuda:0'):
         x = torch.from_numpy(x).to(device)
-        action_mean = self.actor_mean(x)
-        return torch.tanh(action_mean).cpu().detach().numpy()
+        action, _, _, _ = self.get_action_and_value(x)
+        return action.cpu().detach().numpy()
 
 
     def get_action_and_value(self, x, action=None):
@@ -139,6 +137,10 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     import torch.multiprocessing as mp
     mp.set_start_method('spawn', force=True)
+
+    print(os.environ['CUDA_DEVICE_ORDER'])
+    print(os.environ['CUDA_VISIBLE_DEVICES'])
+
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -179,10 +181,6 @@ if __name__ == "__main__":
         benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
     )
 
-    eval_envs = make_eval_envs(
-        benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
-    )
-
     keys = list(benchmark.train_classes.keys())
 
     args.num_envs = len(keys)
@@ -212,13 +210,14 @@ if __name__ == "__main__":
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
             agent.eval()
+            envs.set_attr('terminate_on_success', True)
             (
                 eval_success_rate,
                 eval_returns,
                 eval_success_per_task,
             ) = evaluation(
                 agent=agent,
-                eval_envs=eval_envs,
+                eval_envs=envs,
                 num_episodes=args.evaluation_num_episodes,
             )
             eval_metrics = {
@@ -234,6 +233,9 @@ if __name__ == "__main__":
                 f"total_steps={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
+            envs.set_attr('terminate_on_success', False)
+            next_obs, info = envs.reset()
+            next_obs = torch.Tensor(next_obs).to(device)
             agent.train()
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
