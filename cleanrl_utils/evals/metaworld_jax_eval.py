@@ -36,12 +36,7 @@ def evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        if actor:
-            mean, std = actor.apply(agent.params.actor_params, obs)
-            actions = mean
-            actions = jax.device_get(actions)
-        else:
-            actions = agent.get_action_eval(obs)
+        actions = agent.get_action_eval(obs)
         obs, _, _, _, infos = eval_envs.step(actions)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
