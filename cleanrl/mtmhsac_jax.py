@@ -1,8 +1,6 @@
 # ruff: noqa: E402
 import argparse
 import os
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="7"
 import random
 import time
 from collections import deque
@@ -10,11 +8,11 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reggiemclean/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.048"
+] = "0.1"
 
 import distrax
 import flax
@@ -497,9 +495,6 @@ if __name__ == "__main__":
     envs = make_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
     )
-    eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
-    )
 
     NUM_TASKS = len(benchmark.train_classes)
 
@@ -533,15 +528,18 @@ if __name__ == "__main__":
         init_key=key,
     )
 
+
+    envs.set_attr('terminate_on_success', True)
     (   
         eval_success_rate,
         eval_returns,
         eval_success_per_task,
     ) = evaluation(
         agent=agent,
-        eval_envs=eval_envs,
+        eval_envs=envs,
         num_episodes=args.evaluation_num_episodes,
     )
+    envs.set_attr('terminate_on_success', False)
     eval_metrics = {
         "charts/mean_success_rate": float(eval_success_rate),
         "charts/mean_evaluation_return": float(eval_returns),
@@ -685,15 +683,17 @@ if __name__ == "__main__":
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
+                envs.set_attr('terminate_on_success', True)
                 (
                     eval_success_rate,
                     eval_returns,
                     eval_success_per_task,
                 ) = evaluation(
                     agent=agent,
-                    eval_envs=eval_envs,
+                    eval_envs=envs,
                     num_episodes=args.evaluation_num_episodes,
                 )
+                envs.set_attr('terminate_on_success', False)
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
                     "charts/mean_evaluation_return": float(eval_returns),

@@ -34,7 +34,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking",
+    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking (Updated)",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
@@ -117,10 +117,8 @@ class Agent(nn.Module):
         return self.critic(x)
 
     def get_action_eval(self, x, device='cuda:0'):
-        x = torch.from_numpy(x).to(device)
-        action_mean = self.actor_mean(x)
-        return torch.tanh(action_mean).cpu().detach().numpy()
-
+        action, _, _, _ = self.get_action_and_value(torch.from_numpy(x).to(device))
+        return action.cpu().numpy()
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)

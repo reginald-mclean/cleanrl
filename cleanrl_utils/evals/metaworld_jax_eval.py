@@ -19,7 +19,6 @@ def evaluation(
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
     print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
-
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
         episodic_returns = {task_name: [] for task_name in set(task_names)}
