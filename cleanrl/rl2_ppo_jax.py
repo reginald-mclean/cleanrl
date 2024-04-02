@@ -8,23 +8,25 @@ from flax.training.train_state import TrainState
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-from cleanrl_utils.wrappers import metaworld_wrappers
+from functools import partial
+from typing import Callable, List, Optional, Tuple, Type
+
+import distrax
+import flax.linen as nn
 import gymnasium as gym
-import numpy as np
-import orbax
-import orbax.checkpoint
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
-from typing import Optional, Type, Tuple, List, Callable
-from functools import partial
-from flax.core.frozen_dict import FrozenDict
-from torch.utils.tensorboard import SummaryWriter
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 import metaworld
-from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
-import distrax
+import numpy as np
 import optax
+import orbax
+import orbax.checkpoint
+from flax.core.frozen_dict import FrozenDict
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from torch.utils.tensorboard import SummaryWriter
+
+from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 gym.logger.set_level(40)
 
@@ -289,14 +291,18 @@ class RL2Policy(nn.Module):
                 self.args.recurrent_state_size, parent=None
             ).initialize_carry(jax.random.PRNGKey(0), carry_shape)
 
+
     @nn.compact
     def __call__(self, x, carry) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
         if self.args.recurrent_type == "gru":
-            carry, x = nn.GRUCell(features=self.args.recurrent_state_size)(carry, x)
+            carry, x = nn.RNN(
+                nn.GRUCell(features=self.args.recurrent_state_size), return_carry=True
+            )(x, initial_carry=carry, time_major=False)
         elif self.args.recurrent_type == "lstm":
-            carry, x = nn.OptimizedLSTMCell(features=self.args.recurrent_state_size)(
-                carry, x
-            )
+            carry, x = nn.RNN(
+                nn.OptimizedLSTMCell(features=self.args.recurrent_state_size),
+                return_carry=True,
+            )(x, initial_carry=carry, time_major=False)
 
         x = nn.Dense(args.hidden_size)(x)
         x = nn.relu(x)
@@ -323,6 +329,8 @@ def exploit(
     carry: jax.Array,
 ) -> Tuple[jax.Array, jax.Array]:
     mu, _, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    # get last output of RNN
+    mu = mu[:, -1]
     # action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
     # return action_dist.mode(), carry
     return mu, carry
@@ -337,6 +345,9 @@ def sample_action_logprob(
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
     mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    # get last output of RNN
+    mu = mu[:, -1]
+    log_sigma = log_sigma[:, -1]
     action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
     return action, log_prob.reshape(-1, 1), carry, key
@@ -396,8 +407,7 @@ def update_rl2_ppo(
         )
         for i in rollout_inds:
             rollouts = meta_rollouts[i]
-            # TODO
-            carry = agent.initialize_carry((rollouts.observations.shape[0], 1))
+            carry = agent.initialize_carry((rollouts.observations.shape[0], ))
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
                 rollouts.observations,
