@@ -344,10 +344,10 @@ def sample_action_logprob(
     key: jax.random.PRNGKeyArray,
 ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
     key, action_key = jax.random.split(key)
-    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, obs, carry)
+    mu, log_sigma, carry = agent_state.apply_fn(agent_state.params, jnp.expand_dims(obs, axis=1), carry)
     # get last output of RNN
-    mu = mu[:, -1]
-    log_sigma = log_sigma[:, -1]
+    mu = jnp.squeeze(mu, axis=1)
+    log_sigma = jnp.squeeze(log_sigma, axis=1)
     action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
     action, log_prob = action_dist.sample_and_log_prob(seed=action_key)
     return action, log_prob.reshape(-1, 1), carry, key
