@@ -76,7 +76,7 @@ class MultiTaskReplayBuffer:
         self.next_obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
         self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
         self.pos = 0
-        
+
 
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):
         """Add a batch of samples to the buffer.
@@ -289,6 +289,7 @@ class MultiTaskRolloutBuffer:
         baseline: Optional[Callable] = None,
         fit_baseline: Optional[Callable] = None,
         normalize_advantages: bool = False,
+        trial_mode: bool = False,
     ) -> Rollout:
         """Compute returns and advantages for the collected rollouts.
 
@@ -312,8 +313,12 @@ class MultiTaskRolloutBuffer:
         # 0) Get episode rewards for logging
         all_rollouts = all_rollouts._replace(episode_returns=np.sum(all_rollouts.rewards, axis=2))  # type: ignore
 
-        # 1) Get returns
-        all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
+        if trial_mode:
+            # 1) Flatten rollouts to be one big trial (RL2)
+            all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
+        else:
+            # 1) Get returns
+            all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
 
         # 2.1) (Optional) Fit baseline
         if fit_baseline is not None:
@@ -332,8 +337,12 @@ class MultiTaskRolloutBuffer:
         if normalize_advantages:
             all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
 
-        # 4) Flatten rollout and time dimensions
-        all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
+        if trial_mode:
+            # 4) Get return for trial
+            all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
+        else:
+            # 4) Flatten rollout and time dimensions
+            all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
 
         return self._to_torch(all_rollouts) if self._use_torch else all_rollouts
 

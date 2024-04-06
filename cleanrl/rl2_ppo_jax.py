@@ -577,6 +577,7 @@ if __name__ == "__main__":
         "gae_lambda": args.gae_lambda,
         "fit_baseline": fit_baseline,
         "normalize_advantages": args.norm_advantage,
+        "trial_mode": True,
     }
     total_steps = 0
     steps_per_iter = (
