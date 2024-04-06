@@ -316,31 +316,45 @@ class MultiTaskRolloutBuffer:
         if trial_mode:
             # 1) Flatten rollouts to be one big trial (RL2)
             all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
+            all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
+
+            # 2.1) (Optional) Fit baseline
+            if fit_baseline is not None:
+                baseline = fit_baseline(all_rollouts)
+
+            # 2.2) Apply baseline
+            # NOTE baseline is responsible for any data conversions / moving to the GPU
+            assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
+            baselines = baseline(all_rollouts)
+
+            # 3) Compute advantages
+            advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
+            all_rollouts = all_rollouts._replace(advantages=advantages)
+
+            # 3.1) (Optional) Normalize advantages
+            if normalize_advantages:
+                all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
         else:
             # 1) Get returns
             all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
 
-        # 2.1) (Optional) Fit baseline
-        if fit_baseline is not None:
-            baseline = fit_baseline(all_rollouts)
+            # 2.1) (Optional) Fit baseline
+            if fit_baseline is not None:
+                baseline = fit_baseline(all_rollouts)
 
-        # 2.2) Apply baseline
-        # NOTE baseline is responsible for any data conversions / moving to the GPU
-        assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
-        baselines = baseline(all_rollouts)
+            # 2.2) Apply baseline
+            # NOTE baseline is responsible for any data conversions / moving to the GPU
+            assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
+            baselines = baseline(all_rollouts)
 
-        # 3) Compute advantages
-        advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
-        all_rollouts = all_rollouts._replace(advantages=advantages)
+            # 3) Compute advantages
+            advantages = self._compute_advantage(all_rollouts.rewards, baselines, gamma, gae_lambda)  # type: ignore
+            all_rollouts = all_rollouts._replace(advantages=advantages)
 
-        # 3.1) (Optional) Normalize advantages
-        if normalize_advantages:
-            all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
+            # 3.1) (Optional) Normalize advantages
+            if normalize_advantages:
+                all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
 
-        if trial_mode:
-            # 4) Get return for trial
-            all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
-        else:
             # 4) Flatten rollout and time dimensions
             all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
 

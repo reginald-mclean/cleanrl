@@ -426,15 +426,13 @@ def update_rl2_ppo(
 
 class LinearFeatureBaseline:
     @staticmethod
-    def _extract_features(obs: np.ndarray, reshape=True):
+    def _extract_features(obs: np.ndarray):
         obs = np.clip(obs, -10, 10)
         ones = jnp.ones((*obs.shape[:-1], 1))
         time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
         features = np.concatenate(
             [obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1
         )
-        if reshape:
-            features = features.reshape(features.shape[0], -1, features.shape[-1])
         return features
 
     @classmethod
@@ -458,7 +456,7 @@ class LinearFeatureBaseline:
                     break
                 reg_coeff *= 10
 
-            coeffs.append(np.expand_dims(task_coeffs, axis=0))
+            coeffs.append(task_coeffs)
 
         return np.stack(coeffs)
 
@@ -467,7 +465,7 @@ class LinearFeatureBaseline:
         coeffs = cls._fit_baseline(rollouts.observations, rollouts.returns)
 
         def baseline(rollouts: Rollout) -> np.ndarray:
-            features = cls._extract_features(rollouts.observations, reshape=False)
+            features = cls._extract_features(rollouts.observations)
             return features @ coeffs
 
         return baseline
