@@ -76,6 +76,7 @@ class MultiTaskReplayBuffer:
         self.next_obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
         self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
         self.pos = 0
+        self.full = False
         
 
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):

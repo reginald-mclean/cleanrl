@@ -43,7 +43,7 @@ def parse_args():
         help="seed of the experiment")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking (Updated)",
+    parser.add_argument("--wandb-project-name", type=str, default="Reward Smoothing",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default="reggies-phd-research",
         help="the entity (team) of wandb's project")
@@ -52,10 +52,10 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--reward-version", type=str, default="v2", help="the reward function of the environment")
+    parser.add_argument("--reward-version", type=str, default="v1", help="the reward function of the environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
-    parser.add_argument("--max-episode-steps", type=int, default=None,
+    parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -79,6 +79,19 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
+    parser.add_argument('--gradient-steps', type=int, default=500)
+
+    # reward smoothing
+    parser.add_argument("--reward-filter", type=str, default=None)
+    parser.add_argument('--filter-mode', type=str, default=None)
+    parser.add_argument('--sigma', type=float, default=None)
+    parser.add_argument('--alpha', type=float, default=0.0)
+    parser.add_argument('--delta', type=float, default=0.0)
+    parser.add_argument('--kernel-type', type=str, default=None)
+
+    # reward normalization
+    parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False)
+
     args = parser.parse_args()
     # fmt: on
     return args
@@ -442,14 +455,72 @@ def update(
 
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
+@flax.struct.dataclass
+class Storage:
+    obs: jnp.array
+    actions: jnp.array
+    dones: jnp.array
+    rewards: jnp.array
+    next_obs: jnp.array
+
+class RunningMeanStd:
+    """Tracks the mean, variance and count of values."""
+
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    def __init__(self, epsilon=1e-4, shape=()):
+        """Tracks the mean, variance and count of values."""
+        self.mean = jnp.zeros(shape)
+        self.var = jnp.ones(shape)
+        self.count = epsilon
+
+    def update(self, x):
+        """Updates the mean, var and count from a batch of samples."""
+        batch_mean = jnp.mean(x, axis=0)
+        batch_var = jnp.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Updates from batch mean, variance and count moments."""
+        self.mean, self.var, self.count = update_mean_var_count_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
+
+def update_mean_var_count_from_moments(
+    mean, var, count, batch_mean, batch_var, batch_count
+):
+    """Updates the mean, var and count using the previous mean, var, count and batch values."""
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
+    new_var = M2 / tot_count
+    new_count = tot_count
+
+    return new_mean, new_var, new_count
 
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.exp_name}"
+
+    if args.reward_filter == 'gaussian':
+        run_name += f"_gaussian_filtering__{args.filter_mode}"
+    elif args.reward_filter == 'exponential':
+        assert args.alpha > 0, "make sure EMA constant > 0"
+        assert args.alpha < 1, "make sure EMA constant < 1"
+        run_name += f"__exponential_filtering__alpha_{args.alpha}"
+    elif args.reward_filter == 'uniform':
+        assert args.delta > 0, 'delta must be greater than 0'
+        run_name += f'__uniform_filtering_{args.kernel_type}_{args.delta}_{args.filter_mode}'
+    elif args.reward_filter:
+        raise NotImplementedError(f"Filtering not implemented for {args.reward_filter}")
+
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -459,6 +530,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+    run_name += f"_{args.seed}_{time.time()}"
+
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -527,41 +600,25 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
-
-
-    envs.set_attr('terminate_on_success', True)
-    (   
-        eval_success_rate,
-        eval_returns,
-        eval_success_per_task,
-    ) = evaluation(
-        agent=agent,
-        eval_envs=envs,
-        num_episodes=args.evaluation_num_episodes,
-    )
-    envs.set_attr('terminate_on_success', False)
-    eval_metrics = {
-        "charts/mean_success_rate": float(eval_success_rate),
-        "charts/mean_evaluation_return": float(eval_returns),
-    } | {
-        f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
-        for i, (env_name, _) in enumerate(benchmark.train_classes.items())
-    }
-
-    for k, v in eval_metrics.items():
-        writer.add_scalar(k, v, 0)
-    print(
-        f"total_steps=0, mean evaluation success rate: {eval_success_rate:.4f}"
-        + f" return: {eval_returns:.4f}"
-    )
-
-
     env_names = list(benchmark.train_classes.keys())
 
     start_time = time.time()
     derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
     last_rewards = None 
     last_actions = None
+
+    episodic_storage = Storage(
+        obs=jnp.zeros((args.max_episode_steps, envs.num_envs) + envs.single_observation_space.shape, dtype=jnp.float32),
+        actions=jnp.zeros((args.max_episode_steps, envs.num_envs) + envs.single_action_space.shape, dtype=jnp.float32),
+        dones=jnp.zeros((args.max_episode_steps, envs.num_envs), dtype=jnp.float32),
+        rewards=jnp.zeros((args.max_episode_steps, envs.num_envs), dtype=jnp.float32),
+        next_obs=jnp.zeros((args.max_episode_steps, envs.num_envs) + envs.single_observation_space.shape, dtype=jnp.float32),
+    )
+
+    gamma = args.gamma
+    epsilon = 1e-8
+    returns = jnp.zeros(envs.num_envs)
+    return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
@@ -618,13 +675,66 @@ if __name__ == "__main__":
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
 
-        # Store data in the buffer
-        rb.add(obs, real_next_obs, actions, rewards, terminations)
+        # Store data in the episodic buffer
+
+        next_done = np.logical_or(truncations, terminations)
+        episodic_storage = episodic_storage.replace(
+            obs=episodic_storage.obs.at[global_step % args.max_episode_steps].set(obs),
+            dones=episodic_storage.dones.at[global_step % args.max_episode_steps].set(next_done),
+            actions=episodic_storage.actions.at[global_step % args.max_episode_steps].set(actions),
+            rewards=episodic_storage.rewards.at[global_step % args.max_episode_steps].set(rewards),
+            next_obs=episodic_storage.next_obs.at[global_step % args.max_episode_steps].set(real_next_obs)
+        )
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
+            # Sample a batch from replay buffer
+            before_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+            for i in range(envs.num_envs):
+                writer.add_scalar(f'Mean before smoothing', before_rewards[i])
+            if args.reward_filter == 'gaussian':
+                rewards = gaussian_filter1d(np.array(episodic_storage.rewards), args.sigma, mode=args.filter_mode,
+                                            axis=0)
+            elif args.reward_filter == 'exponential':
+                raise NotImplementedError("Reggie look into this one")
+                rewards_raw = np.array(episodic_storage.rewards)
+                rewards = np.zeros_like(rewards_raw)
+                rewards[-1] = rewards_raw[0]
+                beta = 1 - args.alpha
+                for i, rew_raw in enumerate(rewards_raw):
+                    rewards = args.alpha * rewards[i - 1] + beta * rew_raw
+            elif args.reward_filter == 'uniform':
+                if args.kernel_type == 'uniform':
+                    filter = (1.0 / args.delta) * np.array([1] * args.delta)
+                elif args.kernel_type == 'uniform_before':
+                    filter = (1.0 / args.delta) * np.array([1] * args.delta + [0] * (args.delta - 1))
+                elif args.kernel_type == 'uniform_after':
+                    filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
+                else:
+                    raise NotImplementedError('Invalid kernel type for uniform smoothing')
+                rewards = convolve1d(np.array(episodic_storage.rewards), filter, mode=args.filter_mode, axis=0)
+
+            if args.normalize_rewards:
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+                rewards = np.asarray(rewards)
+
+            episodic_storage = episodic_storage.replace(rewards=episodic_storage.rewards.at[:].set(rewards))
+            after_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+            for i in range(envs.num_envs):
+                writer.add_scalar(f'Mean after smoothing', after_rewards[i])
+            for i in range(args.max_episode_steps):
+                rb.add(
+                    episodic_storage.obs[i, :],
+                    episodic_storage.next_obs[i, :],
+                    episodic_storage.actions[i, :],
+                    episodic_storage.rewards[i, :],
+                    episodic_storage.dones[i, :]
+                )
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
             )
@@ -639,32 +749,37 @@ if __name__ == "__main__":
                 total_steps,
             )
 
-        # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
-            # Sample a batch from replay buffer
-            data = rb.sample(args.batch_size)
-            observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
-            next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-            batch = Batch(
-                observations,
-                data.actions,
-                data.rewards,
-                next_observations,
-                data.dones,
-                task_ids,
-            )
+        from scipy.ndimage import convolve1d, gaussian_filter1d
 
-            # Update agent
-            (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
-                agent.actor,
-                agent.critic,
-                agent.alpha_train_state,
-                batch,
-                agent.target_entropy,
-                args.gamma,
-                key,
-            )
-            logs = jax.device_get(logs)
+        # ALGO LOGIC: training.
+        if global_step > args.learning_starts and global_episodic_return:
+
+            for i in range(args.gradient_steps):
+                if i % 100 == 0 and i > 0:
+                    print(f'gradient step {i}')
+                data = rb.sample(args.batch_size)
+                observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
+                next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
+                batch = Batch(
+                    observations,
+                    data.actions,
+                    data.rewards,
+                    next_observations,
+                    data.dones,
+                    task_ids,
+                )
+
+                # Update agent
+                (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
+                    agent.actor,
+                    agent.critic,
+                    agent.alpha_train_state,
+                    batch,
+                    agent.target_entropy,
+                    args.gamma,
+                    key,
+                )
+                logs = jax.device_get(logs)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
