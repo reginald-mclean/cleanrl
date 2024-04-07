@@ -28,7 +28,7 @@ def _make_envs_common(
             )
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
-        env.action_space.seed(seed)
+        env.action_space.seed(seed + env_id)
         return env
 
     return gym.vector.AsyncVectorEnv(
