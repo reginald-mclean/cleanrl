@@ -14,13 +14,16 @@ def _make_envs_common(
     max_episode_steps: Optional[int] = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
-    reward_func_version: str = 'v2'
+    reward_func_version: str = 'v2',
+    normalize_rewards: bool = False
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls(reward_func_version=reward_func_version)
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
+        elif normalize_rewards:
+            env = gym.wrappers.normalize.NormalizeReward(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
             env = metaworld_wrappers.OneHotWrapper(

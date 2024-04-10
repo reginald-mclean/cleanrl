@@ -8,11 +8,11 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/mnt/nvme/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.1"
+] = "0.05"
 
 import distrax
 import flax
@@ -79,7 +79,7 @@ def parse_args():
         help="the value to clip the gradient norm to. Disabled if 0. Not applied to alpha gradients.")
     parser.add_argument("--actor-network", type=str, default="400,400,400", help="The architecture of the actor network")
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
-    parser.add_argument('--gradient-steps', type=int, default=500)
+    parser.add_argument('--gradient-steps', type=int, default=1)
 
     # reward smoothing
     parser.add_argument("--reward-filter", type=str, default=None)
@@ -463,44 +463,6 @@ class Storage:
     rewards: jnp.array
     next_obs: jnp.array
 
-class RunningMeanStd:
-    """Tracks the mean, variance and count of values."""
-
-    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-    def __init__(self, epsilon=1e-4, shape=()):
-        """Tracks the mean, variance and count of values."""
-        self.mean = jnp.zeros(shape)
-        self.var = jnp.ones(shape)
-        self.count = epsilon
-
-    def update(self, x):
-        """Updates the mean, var and count from a batch of samples."""
-        batch_mean = jnp.mean(x, axis=0)
-        batch_var = jnp.var(x, axis=0)
-        batch_count = x.shape[0]
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        """Updates from batch mean, variance and count moments."""
-        self.mean, self.var, self.count = update_mean_var_count_from_moments(
-            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
-        )
-
-def update_mean_var_count_from_moments(
-    mean, var, count, batch_mean, batch_var, batch_count
-):
-    """Updates the mean, var and count using the previous mean, var, count and batch values."""
-    delta = batch_mean - mean
-    tot_count = count + batch_count
-
-    new_mean = mean + delta * batch_count / tot_count
-    m_a = var * count
-    m_b = batch_var * batch_count
-    M2 = m_a + m_b + jnp.square(delta) * count * batch_count / tot_count
-    new_var = M2 / tot_count
-    new_count = tot_count
-
-    return new_mean, new_var, new_count
 
 # Training loop
 if __name__ == "__main__":
@@ -530,6 +492,8 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        wandb.run.log_code("/home/reggiemclean/cleanrl/cleanrl/")
+        wandb.run.log_code("/home/reggiemclean/cleanrl/cleanrl_utils")
     run_name += f"_{args.seed}_{time.time()}"
 
     writer = SummaryWriter(f"runs/{run_name}")
@@ -566,7 +530,10 @@ if __name__ == "__main__":
     )
 
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=args.normalize_rewards
+    )
+    eval_envs = make_eval_envs(
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False
     )
 
     NUM_TASKS = len(benchmark.train_classes)
@@ -614,11 +581,6 @@ if __name__ == "__main__":
         rewards=jnp.zeros((args.max_episode_steps, envs.num_envs), dtype=jnp.float32),
         next_obs=jnp.zeros((args.max_episode_steps, envs.num_envs) + envs.single_observation_space.shape, dtype=jnp.float32),
     )
-
-    gamma = args.gamma
-    epsilon = 1e-8
-    returns = jnp.zeros(envs.num_envs)
-    return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
@@ -677,64 +639,63 @@ if __name__ == "__main__":
 
         # Store data in the episodic buffer
 
-        next_done = np.logical_or(truncations, terminations)
-        episodic_storage = episodic_storage.replace(
-            obs=episodic_storage.obs.at[global_step % args.max_episode_steps].set(obs),
-            dones=episodic_storage.dones.at[global_step % args.max_episode_steps].set(next_done),
-            actions=episodic_storage.actions.at[global_step % args.max_episode_steps].set(actions),
-            rewards=episodic_storage.rewards.at[global_step % args.max_episode_steps].set(rewards),
-            next_obs=episodic_storage.next_obs.at[global_step % args.max_episode_steps].set(real_next_obs)
-        )
+        if not args.reward_filter:
+             rb.add(obs, real_next_obs, actions, rewards, terminations)
+        else:
+            next_done = np.logical_or(truncations, terminations)
+            episodic_storage = episodic_storage.replace(
+                obs=episodic_storage.obs.at[global_step % args.max_episode_steps].set(obs),
+                dones=episodic_storage.dones.at[global_step % args.max_episode_steps].set(next_done),
+                actions=episodic_storage.actions.at[global_step % args.max_episode_steps].set(actions),
+                rewards=episodic_storage.rewards.at[global_step % args.max_episode_steps].set(rewards),
+                next_obs=episodic_storage.next_obs.at[global_step % args.max_episode_steps].set(real_next_obs)
+            )
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
             # Sample a batch from replay buffer
-            before_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
-            for i in range(envs.num_envs):
-                writer.add_scalar(f'Mean before smoothing', before_rewards[i])
-            if args.reward_filter == 'gaussian':
-                rewards = gaussian_filter1d(np.array(episodic_storage.rewards), args.sigma, mode=args.filter_mode,
+            if args.reward_filter:
+                before_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+                for i in range(envs.num_envs):
+                    writer.add_scalar(f'Mean before smoothing', before_rewards[i])
+                if args.reward_filter == 'gaussian':
+                    rewards = gaussian_filter1d(np.array(episodic_storage.rewards), args.sigma, mode=args.filter_mode,
                                             axis=0)
-            elif args.reward_filter == 'exponential':
-                raise NotImplementedError("Reggie look into this one")
-                rewards_raw = np.array(episodic_storage.rewards)
-                rewards = np.zeros_like(rewards_raw)
-                rewards[-1] = rewards_raw[0]
-                beta = 1 - args.alpha
-                for i, rew_raw in enumerate(rewards_raw):
-                    rewards = args.alpha * rewards[i - 1] + beta * rew_raw
-            elif args.reward_filter == 'uniform':
-                if args.kernel_type == 'uniform':
-                    filter = (1.0 / args.delta) * np.array([1] * args.delta)
-                elif args.kernel_type == 'uniform_before':
-                    filter = (1.0 / args.delta) * np.array([1] * args.delta + [0] * (args.delta - 1))
-                elif args.kernel_type == 'uniform_after':
-                    filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
-                else:
-                    raise NotImplementedError('Invalid kernel type for uniform smoothing')
-                rewards = convolve1d(np.array(episodic_storage.rewards), filter, mode=args.filter_mode, axis=0)
+                elif args.reward_filter == 'exponential':
+                    raise NotImplementedError("Reggie look into this one")
+                    rewards_raw = np.array(episodic_storage.rewards)
+                    rewards = np.zeros_like(rewards_raw)
+                    rewards[-1] = rewards_raw[0]
+                    beta = 1 - args.alpha
+                    for i, rew_raw in enumerate(rewards_raw):
+                        rewards = args.alpha * rewards[i - 1] + beta * rew_raw
+                elif args.reward_filter == 'uniform':
+                    if args.kernel_type == 'uniform':
+                        filter = (1.0 / args.delta) * np.array([1] * args.delta)
+                    elif args.kernel_type == 'uniform_before':
+                        filter = (1.0 / args.delta) * np.array([1] * args.delta + [0] * (args.delta - 1))
+                    elif args.kernel_type == 'uniform_after':
+                        filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
+                    else:
+                        raise NotImplementedError('Invalid kernel type for uniform smoothing')
+                    rewards = convolve1d(np.array(episodic_storage.rewards), filter, mode=args.filter_mode, axis=0)
 
-            if args.normalize_rewards:
-                terminated = 1 - terminations
-                returns = returns * gamma * (1 - terminated) + rewards
-                return_rms.update(returns)
-                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-                rewards = np.asarray(rewards)
+                episodic_storage = episodic_storage.replace(rewards=episodic_storage.rewards.at[:].set(rewards))
+                after_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+                for i in range(envs.num_envs):
+                    writer.add_scalar(f'Mean after smoothing', after_rewards[i])
 
-            episodic_storage = episodic_storage.replace(rewards=episodic_storage.rewards.at[:].set(rewards))
-            after_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
-            for i in range(envs.num_envs):
-                writer.add_scalar(f'Mean after smoothing', after_rewards[i])
-            for i in range(args.max_episode_steps):
-                rb.add(
-                    episodic_storage.obs[i, :],
-                    episodic_storage.next_obs[i, :],
-                    episodic_storage.actions[i, :],
-                    episodic_storage.rewards[i, :],
-                    episodic_storage.dones[i, :]
-                )
+                for i in range(args.max_episode_steps):
+                    rb.add(
+                        episodic_storage.obs[i, :],
+                        episodic_storage.next_obs[i, :],
+                        episodic_storage.actions[i, :],
+                        episodic_storage.rewards[i, :],
+                        episodic_storage.dones[i, :]
+                    )
+
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
             )
@@ -798,17 +759,15 @@ if __name__ == "__main__":
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                envs.set_attr('terminate_on_success', True)
                 (
                     eval_success_rate,
                     eval_returns,
                     eval_success_per_task,
                 ) = evaluation(
                     agent=agent,
-                    eval_envs=envs,
+                    eval_envs=eval_envs,
                     num_episodes=args.evaluation_num_episodes,
                 )
-                envs.set_attr('terminate_on_success', False)
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
                     "charts/mean_evaluation_return": float(eval_returns),
