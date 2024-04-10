@@ -595,7 +595,7 @@ if __name__ == "__main__":
              if global_step > args.learning_starts:
                  for i in range(NUM_TASKS):
                      writer.add_scalar(
-                        f"charts/{env_names[i]}_avg_derivative_per_episode",
+                        f"charts/{env_names[i]}_real_reward_change_per_unit_displace",
                         derivatives[i]/args.max_episode_steps,
                         global_step,
                      )
@@ -613,15 +613,16 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if last_rewards is None and global_step % args.max_episode_steps != 0:
+
+        if global_step % args.max_episode_steps == 0:
             last_rewards = rewards.copy()
             last_actions = np.asarray(actions).copy()[:, :3]
-        elif global_step % args.max_episode_steps == 0:
-            last_rewards = None
-            last_actions = None
-        else: 
+        else:
             dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3])
             derivatives += (rewards - last_rewards) / dist
+            last_rewards = rewards.copy()
+            last_actions = np.asarray(actions).copy()[:, :3]
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
@@ -656,46 +657,68 @@ if __name__ == "__main__":
 
         if global_step % 500 == 0 and global_episodic_return:
             # Sample a batch from replay buffer
-            if args.reward_filter:
-                before_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
-                for i in range(envs.num_envs):
-                    writer.add_scalar(f'Mean before smoothing', before_rewards[i])
-                if args.reward_filter == 'gaussian':
-                    rewards = gaussian_filter1d(np.array(episodic_storage.rewards), args.sigma, mode=args.filter_mode,
+            before_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+            for i in range(envs.num_envs):
+                writer.add_scalar(f'Mean before smoothing env {i}', before_rewards[i])
+            if args.reward_filter == 'gaussian':
+                rewards = gaussian_filter1d(np.array(episodic_storage.rewards), args.sigma, mode=args.filter_mode,
                                             axis=0)
-                elif args.reward_filter == 'exponential':
-                    raise NotImplementedError("Reggie look into this one")
-                    rewards_raw = np.array(episodic_storage.rewards)
-                    rewards = np.zeros_like(rewards_raw)
-                    rewards[-1] = rewards_raw[0]
-                    beta = 1 - args.alpha
-                    for i, rew_raw in enumerate(rewards_raw):
-                        rewards = args.alpha * rewards[i - 1] + beta * rew_raw
-                elif args.reward_filter == 'uniform':
-                    if args.kernel_type == 'uniform':
-                        filter = (1.0 / args.delta) * np.array([1] * args.delta)
-                    elif args.kernel_type == 'uniform_before':
-                        filter = (1.0 / args.delta) * np.array([1] * args.delta + [0] * (args.delta - 1))
-                    elif args.kernel_type == 'uniform_after':
-                        filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
-                    else:
-                        raise NotImplementedError('Invalid kernel type for uniform smoothing')
-                    rewards = convolve1d(np.array(episodic_storage.rewards), filter, mode=args.filter_mode, axis=0)
+            elif args.reward_filter == 'exponential':
+                raise NotImplementedError("Reggie look into this one")
+                rewards_raw = np.array(episodic_storage.rewards)
+                rewards = np.zeros_like(rewards_raw)
+                rewards[-1] = rewards_raw[0]
+                beta = 1 - args.alpha
+                for i, rew_raw in enumerate(rewards_raw):
+                    rewards = args.alpha * rewards[i - 1] + beta * rew_raw
+            elif args.reward_filter == 'uniform':
+                if args.kernel_type == 'uniform':
+                    filter = (1.0 / args.delta) * np.array([1] * args.delta)
+                elif args.kernel_type == 'uniform_before':
+                    filter = (1.0 / args.delta) * np.array([1] * args.delta + [0] * (args.delta - 1))
+                elif args.kernel_type == 'uniform_after':
+                    filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
+                else:
+                    raise NotImplementedError('Invalid kernel type for uniform smoothing')
+                rewards = convolve1d(np.array(episodic_storage.rewards), filter, mode=args.filter_mode, axis=0)
 
-                episodic_storage = episodic_storage.replace(rewards=episodic_storage.rewards.at[:].set(rewards))
-                after_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
-                for i in range(envs.num_envs):
-                    writer.add_scalar(f'Mean after smoothing', after_rewards[i])
+            smoothing_change = np.array([0.0 for _ in range(envs.num_envs)])
+            for i in range(args.max_episode_steps):
+                if i == 0:
+                    l_rew = np.array(episodic_storage.rewards.at[i, :])
+                    l_act = np.array(episodic_storage.actions.at[i, :])
+                else:
+                    act_dist = np.linalg.norm(l_act - np.array(episodic_storage.actions.at[i, :])[:, :3])
+                    smoothing_change += (np.array(episodic_storage.rewards.at[i, :]) - l_rew) / act_dist
+                    l_rew = np.array(episodic_storage.rewards.at[i, :])
+                    l_act = np.array(episodic_storage.actions.at[i, :])
 
-                for i in range(args.max_episode_steps):
-                    rb.add(
-                        episodic_storage.obs[i, :],
-                        episodic_storage.next_obs[i, :],
-                        episodic_storage.actions[i, :],
-                        episodic_storage.rewards[i, :],
-                        episodic_storage.dones[i, :]
-                    )
+            for i in range(envs.num_envs):
+                writer.add_scalar(
+                    f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace",
+                    smoothing_change[i] / args.max_episode_steps,
+                    global_step,
+                )
 
+            if args.normalize_rewards:
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+                rewards = np.asarray(rewards)
+
+            episodic_storage = episodic_storage.replace(rewards=episodic_storage.rewards.at[:].set(rewards))
+            after_rewards = np.mean(np.array(episodic_storage.rewards), axis=0)
+            for i in range(envs.num_envs):
+                writer.add_scalar(f'Mean after smoothing env {i}', after_rewards[i])
+            for i in range(args.max_episode_steps):
+                rb.add(
+                    episodic_storage.obs[i, :],
+                    episodic_storage.next_obs[i, :],
+                    episodic_storage.actions[i, :],
+                    episodic_storage.rewards[i, :],
+                    episodic_storage.dones[i, :]
+                )
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
             )
