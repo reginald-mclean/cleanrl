@@ -13,20 +13,41 @@ from numpy.typing import NDArray
 
 
 class ObsModification(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
-    def __init__(self, env: Env, args : dict, task_idx : int, num_tasks : int):
+    def __init__(self, env: Env, args : dict, task_idx : int, num_tasks : int, name: str, map:dict=None):
         gym.utils.RecordConstructorArgs.__init__(self)
         gym.ObservationWrapper.__init__(self, env)
-
-        # need to create observation space for gym
-        #
-
 
         self.args = args
 
         if self.args['original']:
-            self._observation_space = self.env.observation_space
-        elif not isinstance(self.env.observation_space, Box):
-            print(self.env.observation_space)
+            self._observation_space = self.env.observation_space if not isinstance(self.env.observation_space, dict) else self.env.observation_space['observation']
+
+        if self.args['map'] and map:
+            ub = [np.inf for _ in range(73)]
+            lb = [-np.inf for _ in range(73)]
+            self._observation_space = gym.spaces.Box(
+                np.array(lb), np.array(ub)
+            )
+            self.map = map
+
+            self.one_hot = np.zeros(num_tasks)
+            self.one_hot[map[name]] = 1
+            self.name = name
+            return
+        if self.args['one-hot'] and isinstance(self.env.observation_space, Box):
+            obs_space_lb = self.env.observation_space.low
+            obs_space_ub = self.env.observation_space.high
+            one_hot_ub = np.ones(num_tasks)
+            one_hot_lb = np.zeros(num_tasks)
+
+            self.one_hot = np.zeros(num_tasks)
+            self.one_hot[task_idx] = 1.0
+
+            self._observation_space = gym.spaces.Box(
+                np.concatenate([obs_space_lb, one_hot_lb]), np.concatenate([obs_space_ub, one_hot_ub])
+            )
+
+        elif self.args['one-hot'] and not isinstance(self.env.observation_space, Box):
             obs_space_lb = self.env.observation_space['observation'].low
             obs_space_ub = self.env.observation_space['observation'].high
             one_hot_ub = np.ones(num_tasks)
@@ -39,7 +60,6 @@ class ObsModification(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
                 np.concatenate([obs_space_lb, one_hot_lb]), np.concatenate([obs_space_ub, one_hot_ub])
             )
 
-            print(self._observation_space)
         else:
             env_lb = env.observation_space.low
             env_ub = env.observation_space.high
@@ -67,21 +87,27 @@ class ObsModification(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         Returns:
             The modified observation
 
-        obs = {
-            "observation": np.concatenate((robot_obs, obj_qpos, obj_qvel, OBS_ELEMENT_GOALS[task])),
-            "achieved_goal": achieved_goal,
-            "desired_goal": self.goal,
-            }
-
         """
 
         if self.args['original']:
             return observation
+        if self.args['map']:
+            if isinstance(observation, Dict):
+                observation = np.concatenate([observation['observation'], self.one_hot])
+                return observation
+            else:
+                observation = np.concatenate([observation[:36], np.zeros(23), observation[36:], self.one_hot])
+                return observation
+        elif self.args['one-hot']:
+            if not isinstance(observation, dict):
+                return np.concatenate([observation, self.one_hot])
+            else:
+                return np.concatenate([observation['observation'], self.one_hot])
         if isinstance(observation, Dict):
             observation = np.concatenate([observation['observation'], self.one_hot])
         else:
             if self.args['only_pad']:
-                observation = np.concatenate([observation, self.one_hot, np.zeros(23)])
+                observation = np.concatenate([observation[:36], np.zeros(23), observation[36:], self.one_hot])
             else:
                 observation = np.concatenate([observation[:36], np.zeros(23), observation[36:], self.one_hot])
 

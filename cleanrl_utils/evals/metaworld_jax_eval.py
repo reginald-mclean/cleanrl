@@ -12,6 +12,7 @@ from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer
 
 def evaluation(
     agent,
+    seal,
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     task_names: Optional[List[str]] = None,
@@ -19,7 +20,7 @@ def evaluation(
 ) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
     print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
-
+    print(obs[0].shape)
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
         episodic_returns = {task_name: [] for task_name in set(task_names)}
@@ -37,7 +38,7 @@ def evaluation(
             return all(len(r) >= num_episodes for r in returns)
 
     while not eval_done(episodic_returns):
-        actions = agent.get_action_eval(obs)
+        actions = agent.get_action_eval(obs, seal)
         obs, _, _, _, infos = eval_envs.step(actions, tasks)
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
@@ -74,7 +75,7 @@ def evaluation(
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(episodic_returns)
 
-    return mean_success_rate, mean_returns, success_rate_per_task
+    return mean_success_rate, mean_returns, success_rate_per_task, successes
 
 
 def metalearning_evaluation(

@@ -132,6 +132,17 @@ def uniform_init(bound: float):
 
     return _init
 
+@flax.struct.dataclass
+class SEAL:
+    translation_layer : flax.core.FrozenDict
+    action_head : flax.core.FrozenDict
+
+class TranslationLayerAndActionHead(nn.Module):
+    input_size: int
+    output_size: int
+    hidden_dims: int "400, 400, 400"
+    @nn.compact
+    def __call__(self, x: jax.Array, 
 
 class Actor(nn.Module):
     num_actions: int
