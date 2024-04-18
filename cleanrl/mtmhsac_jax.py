@@ -91,8 +91,8 @@ def parse_args():
     parser.add_argument('--kernel-type', type=str, default=None)
 
     # reward normalization
-    parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False)
-
+    parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize after smoothing')
+    parser.add_argument('--normalize-rewards-env', type=lambda x: bool(strtobool(x)), default=False, help='use the normalization wrapper around each env')
     args = parser.parse_args()
     # fmt: on
     return args
@@ -536,8 +536,6 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-        wandb.run.log_code("/home/reggiemclean/cleanrl/cleanrl/")
-        wandb.run.log_code("/home/reggiemclean/cleanrl/cleanrl_utils")
     run_name += f"_{args.seed}_{time.time()}"
 
     writer = SummaryWriter(f"runs/{run_name}")
@@ -574,7 +572,7 @@ if __name__ == "__main__":
     )
 
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=args.normalize_rewards_env # normalize-rewards-env
     )
     eval_envs = make_eval_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False
@@ -670,20 +668,6 @@ if __name__ == "__main__":
             derivatives += (rewards - last_rewards) / dist
             last_rewards = rewards.copy()
             last_actions = np.asarray(actions).copy()[:, :3]
-
-        '''
-                       for i in range(args.max_episode_steps):
-                   if i == 0:
-                       l_rew = np.asarray(rewards_buffer[i])
-                       l_act = np.asarray(actions_buffer[i, :, :-1])
-                   else:
-                       act_dist = np.linalg.norm(l_act - actions_buffer[i, :, :-1], axis=1)
-                       smoothing_change += (rewards_buffer[i] - l_rew) / act_dist
-                       l_rew = rewards_buffer[i]
-                       l_act = actions_buffer[i, :, :-1]
-        
-        '''
-
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
