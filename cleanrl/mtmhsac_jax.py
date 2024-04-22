@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reggiemclean/cleanrl')
+sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -530,7 +530,7 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            #sync_tensorboard=True,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
