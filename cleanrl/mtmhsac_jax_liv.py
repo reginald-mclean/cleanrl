@@ -37,7 +37,7 @@ import torch
 import pickle
 import clip
 import torchvision.transforms as T
-from PIL import Image 
+from PIL import Image
 from liv import load_liv
 
 def parse_args():
