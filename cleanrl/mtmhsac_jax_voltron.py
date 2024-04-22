@@ -657,7 +657,7 @@ if __name__ == "__main__":
     del descriptions
 
     vgen, preprocess = load("v-gen", device="cuda", freeze=True)
-    vgen.state_dict(torch.load('/home/reggiemclean/voltron-robotics/runs/train/v-gen+dataset-something-something-v2/epoch_9.pt'))
+    vgen.state_dict(torch.load(f'{REWARD_CKPT_DIR}/epoch_9.pt'))
     vgen.eval()
     print('vgen state dict loaded!')
     tokens = vgen.tokenizer(task_desc, return_tensors="pt", max_length=20, padding="max_length", truncation=True)

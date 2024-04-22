@@ -656,7 +656,7 @@ if __name__ == "__main__":
         del descriptions
         liv = load_liv()
 
-        liv.module.load_state_dict(torch.load('/home/reggiemclean/LIV/liv/train_liv_mw_40/2024-03-22_13-51-32/snapshot.pt')['liv'])
+        liv.module.load_state_dict(torch.load(f'{REWARD_CKPT_DIR}/snapshot.pt')['liv'])
         print('LIV State Dict loaded!')
         liv.eval()
         transform = T.Compose([T.ToTensor()])
