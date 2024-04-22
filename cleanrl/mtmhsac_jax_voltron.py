@@ -33,7 +33,6 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-from clip4clip.reward import RewardCalculator
 import torch
 import pickle
 from torchvision.io import read_image
