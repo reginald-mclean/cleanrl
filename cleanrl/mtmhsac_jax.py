@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 import sys
-sys.path.append('/home/reggie/Desktop/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -784,10 +784,8 @@ if __name__ == "__main__":
 
             # Logging
             if global_step % 100 == 0:
-                for _key, value in logs.items():
-                    writer.add_scalar(_key, value, total_steps)
                 print("SPS:", int(total_steps / (time.time() - start_time)))
-
+                wandb.log(logs, commit=False)
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 eval_success_rate, eval_returns, eval_success_per_task = evaluation(
