@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 import sys
-sys.path.append('/home/reggiemclean/cleanrl')
+sys.path.append('/home/reggie/Desktop/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -629,15 +629,17 @@ if __name__ == "__main__":
         for k in agent.critic.params['params']['VmapCritic_0']:
             if 'Dense' in k:
                 cri_params[f'critic_{k}']= np.float64(jnp.linalg.norm(agent.critic.params['params']['VmapCritic_0'][k]['kernel']))
-        wandb.log(act_params, commit=False)
-        wandb.log(cri_params, commit=False)
+        if args.track:
+            wandb.log(act_params, commit=False)
+            wandb.log(cri_params, commit=False)
  
         if global_step % args.max_episode_steps == 0:
              derivs = {}
              if global_step > args.learning_starts:
                  for i in range(NUM_TASKS):
-                    derivs[f"charts/{args.env_id}_real_reward_change_per_unit_displace"] = derivatives[i]/args.max_episode_steps
-                 wandb.log(derivs, commit=False)
+                     derivs[f"charts/{args.env_id}_real_reward_change_per_unit_displace"] = derivatives[i]/args.max_episode_steps
+                 if args.track:
+                     wandb.log(derivs, commit=False)
              derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
              
         total_steps = global_step
@@ -691,13 +693,12 @@ if __name__ == "__main__":
                    rewards = gaussian_filter1d(rewards_buffer, args.sigma, mode=args.filter_mode,
                                            axis=0)
                elif args.reward_filter == 'exponential':
-                   raise NotImplementedError("Reggie look into this one")
-                   rewards_raw = np.array(episodic_storage.rewards)
-                   rewards = np.zeros_like(rewards_raw)
-                   rewards[-1] = rewards_raw[0]
+                   rewards = np.zeros_like(rewards_buffer)
+                   rewards[-1, :] = rewards_buffer[0, :]
                    beta = 1 - args.alpha
-                   for i, rew_raw in enumerate(rewards_raw):
-                       rewards = args.alpha * rewards[i - 1] + beta * rew_raw
+                   for i, rew_raw in enumerate(rewards_buffer):
+                       rewards[i, :] = args.alpha * rewards[i - 1, :] + beta * rew_raw
+
                elif args.reward_filter == 'uniform':
                    if args.kernel_type == 'uniform':
                        filter = (1.0 / args.delta) * np.array([1] * args.delta)
@@ -721,8 +722,9 @@ if __name__ == "__main__":
                        l_act = actions_buffer[i, :, :-1]
                smoothed_res = {}
                for i in range(envs.num_envs):
-                    smoothed_res[f"charts/{args.env_id}_smoothed_reward_change_per_unit_displace"] = smoothing_change[i] / args.max_episode_steps,
-               wandb.log(smoothed_res, commit=False)
+                   smoothed_res[f"charts/{args.env_id}_smoothed_reward_change_per_unit_displace"] = smoothing_change[i] / args.max_episode_steps,
+               if args.track:
+                   wandb.log(smoothed_res, commit=False)
 
                if args.normalize_rewards:
                    terminated = 1 - terminations
@@ -751,8 +753,9 @@ if __name__ == "__main__":
             print(
                 f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
             )
-            wandb.log({"charts/mean_episodic_return": np.mean(list(global_episodic_return))}, commit=False)
-            wandb.log({"charts/mean_episodic_length": np.mean(list(global_episodic_length))}, commit=not (total_steps % args.evaluation_frequency == 0 and global_step > 0))
+            if args.track:
+                wandb.log({"charts/mean_episodic_return": np.mean(list(global_episodic_return))}, commit=False)
+                wandb.log({"charts/mean_episodic_length": np.mean(list(global_episodic_length))}, commit=not (total_steps % args.evaluation_frequency == 0 and global_step > 0))
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
@@ -785,7 +788,8 @@ if __name__ == "__main__":
             # Logging
             if global_step % 100 == 0:
                 print("SPS:", int(total_steps / (time.time() - start_time)))
-                wandb.log(logs, commit=False)
+                if args.track:
+                    wandb.log(logs, commit=False)
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 eval_success_rate, eval_returns, eval_success_per_task = evaluation(
@@ -800,8 +804,8 @@ if __name__ == "__main__":
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
                 }
-
-                wandb.log(eval_metrics)
+                if args.track:
+                    wandb.log(eval_metrics)
 
                 print(
                     f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
