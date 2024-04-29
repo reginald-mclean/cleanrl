@@ -8,7 +8,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reggie/Desktop/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -95,6 +95,7 @@ def parse_args():
     parser.add_argument('--normalize-rewards-env', type=lambda x: bool(strtobool(x)), default=False, help='use the normalization wrapper around each env')
     args = parser.parse_args()
     # fmt: on
+    print(args)
     return args
 
 
@@ -630,21 +631,23 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
+        act_params = {}
+        cri_params= {}
         for k in agent.actor.params['params']:
             if 'Dense' in k:
-                writer.add_scalar(f'actor_{k}', np.float64(jnp.linalg.norm(agent.actor.params['params'][k]['kernel'])), global_step)
+                act_params[f'actor_{k}'] = np.float64(jnp.linalg.norm(agent.actor.params['params'][k]['kernel']))
         for k in agent.critic.params['params']['VmapCritic_0']:
             if 'Dense' in k:
-                writer.add_scalar(f'critic_{k}', np.float64(jnp.linalg.norm(agent.critic.params['params']['VmapCritic_0'][k]['kernel'])), global_step)
+                cri_params[f'critic_{k}'] = np.float64(jnp.linalg.norm(agent.critic.params['params']['VmapCritic_0'][k]['kernel']))
 
+        if args.track:
+            wandb.log(act_params, commit=False)
+            wandb.log(cri_params, commit=False)
         if global_step % args.max_episode_steps == 0:
              if global_step > args.learning_starts:
+                 reward_dict = {}
                  for i in range(NUM_TASKS):
-                     writer.add_scalar(
-                        f"charts/{env_names[i]}_real_reward_change_per_unit_displace",
-                        derivatives[i]/args.max_episode_steps,
-                        global_step,
-                     )
+                     reward_dict[f"charts/{env_names[i]}_real_reward_change_per_unit_displace"] = derivatives[i]/args.max_episode_steps
              derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
 
         total_steps = global_step * NUM_TASKS
@@ -704,19 +707,18 @@ if __name__ == "__main__":
            if args.reward_filter:
                # Sample a batch from replay buffer
                before_rewards = np.mean(rewards_buffer, axis=0)
-               for i in range(envs.num_envs):
-                   writer.add_scalar(f'Mean before smoothing env {i}', before_rewards[i])
+               if args.track:
+                   for i in range(envs.num_envs):
+                       wandb.log({f'Mean before smoothing env {i}':before_rewards[i]}, commit=False)
                if args.reward_filter == 'gaussian':
                    rewards = gaussian_filter1d(rewards_buffer, args.sigma, mode=args.filter_mode,
                                            axis=0)
                elif args.reward_filter == 'exponential':
-                   raise NotImplementedError("Reggie look into this one")
-                   rewards_raw = np.array(episodic_storage.rewards)
-                   rewards = np.zeros_like(rewards_raw)
-                   rewards[-1] = rewards_raw[0]
+                   rewards = np.zeros_like(rewards_buffer)
+                   rewards[-1, :] = rewards_buffer[0, :]
                    beta = 1 - args.alpha
-                   for i, rew_raw in enumerate(rewards_raw):
-                       rewards = args.alpha * rewards[i - 1] + beta * rew_raw
+                   for i, rew_raw in enumerate(rewards_buffer):
+                       rewards[i, :] = args.alpha * rewards[i - 1, :] + beta * rew_raw
                elif args.reward_filter == 'uniform':
                    if args.kernel_type == 'uniform':
                        filter = (1.0 / args.delta) * np.array([1] * args.delta)
@@ -739,14 +741,9 @@ if __name__ == "__main__":
                        l_rew = rewards_buffer[i]
                        l_act = actions_buffer[i, :, :-1]
 
-               print(smoothing_change/args.max_episode_steps)
-
-               for i in range(envs.num_envs):
-                   writer.add_scalar(
-                        f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace",
-                        smoothing_change[i] / args.max_episode_steps,
-                        global_step,
-                   )
+               if args.track:
+                   for i in range(envs.num_envs):
+                       wandb.log({f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace":smoothing_change[i] / args.max_episode_steps}, commit=False)
 
                if args.normalize_rewards:
                    terminated = 1 - terminations
@@ -757,9 +754,9 @@ if __name__ == "__main__":
 
                rewards_buffer = rewards
                after_rewards = np.mean(rewards_buffer, axis=0)
-
-               for i in range(envs.num_envs):
-                   writer.add_scalar(f'Mean after smoothing env {i}', after_rewards[i])
+               if args.track:
+                   for i in range(envs.num_envs):
+                       wandb.log({f'Mean after smoothing env {i}': after_rewards[i]}, commit=False)
 
                for i in range(args.max_episode_steps):
                    rb.add(
@@ -779,24 +776,15 @@ if __name__ == "__main__":
            print(
                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
            )
-           writer.add_scalar(
-               "charts/mean_episodic_return",
-               np.mean(list(global_episodic_return)),
-               total_steps,
-           )
-           writer.add_scalar(
-               "charts/mean_episodic_length",
-               np.mean(list(global_episodic_length)),
-               total_steps,
-           )
+           if args.track:
+               wandb.log({"charts/mean_episodic_return": np.mean(list(global_episodic_return))}, commit=False)
+               wandb.log({"charts/mean_episodic_length": np.mean(list(global_episodic_length))}, commit=global_step < args.learning_starts)
 
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts and global_episodic_return:
 
             for i in range(args.gradient_steps):
-                if i % 100 == 0 and i > 0:
-                    print(f'gradient step {i}')
                 data = rb.sample(args.batch_size)
                 observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
                 next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
@@ -827,14 +815,7 @@ if __name__ == "__main__":
 
             # Logging
             if global_step % 100 == 0:
-                for _key, value in logs.items():
-                    writer.add_scalar(_key, value, total_steps)
                 print("SPS:", int(total_steps / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(total_steps / (time.time() - start_time)),
-                    total_steps,
-                )
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
@@ -854,9 +835,9 @@ if __name__ == "__main__":
                     f"charts/{env_name}_success_rate": float(eval_success_per_task[i])
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
                 }
-
-                for k, v in eval_metrics.items():
-                    writer.add_scalar(k, v, total_steps)
+                if args.track:
+                    wandb.log(logs, commit=False)
+                    wandb.log(eval_metrics)
                 print(
                     f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                     + f" return: {eval_returns:.4f}"
