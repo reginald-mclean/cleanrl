@@ -33,19 +33,10 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-from clip4clip.reward import RewardCalculator
 import torch
 import pickle
-
-
-def load_c4c_args(c4c_ckpt):
-    init_model_path = os.path.join(REWARD_CKPT_DIR, c4c_ckpt)
-    c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
-    with open(c4c_args_path, 'rb') as f:
-        c4c_args = pickle.load(f)['args']
-    c4c_args.init_model = init_model_path
-    c4c_args.resume_from_latest = False
-    return c4c_args
+from torchvision.io import read_image
+from voltron import instantiate_extractor, load
 
 def parse_args():
     # fmt: off
@@ -98,7 +89,6 @@ def parse_args():
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
-    parser.add_argument("--reward-episode-end-only", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="If True, use r=0 for non-terminal time steps.")
 
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
@@ -112,22 +102,13 @@ def parse_args():
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
     parser.add_argument("--transition-logging-freq", type=int, default=50_000, help="How often to log data from training")
 
-    # C4C
-    parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
     args = parser.parse_args()
-    c4c_args = None
-    if args.vlm_reward_weight != 0:
-        c4c_args = load_c4c_args(args.c4c_ckpt)
-        c4c_args = parser.parse_args(namespace=c4c_args)
 
-        # fmt: on
-        print("C4C args:")
-        for key in sorted(c4c_args.__dict__):
-            print("  <<< {}: {}".format(key, c4c_args.__dict__[key]))
+    # C4C
     print("RL args:")
     for key in sorted(args.__dict__):
         print("  <<< {}: {}".format(key, args.__dict__[key]))
-    return args, c4c_args
+    return args
 
 
 import metaworld
@@ -162,6 +143,10 @@ def _make_envs_common(
 
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from PIL import Image
+import torchvision.transforms as transforms
+
+
+
 def _transform(n_px):
         return Compose(
             [
@@ -554,7 +539,7 @@ def update_mean_var_count_from_moments(
 
 # Training loop
 if __name__ == "__main__":
-    args, c4c_args = parse_args()
+    args = parse_args()
     run_name = f"{args.env_id}_{args.exp_name}_rbfix"
     if args.reward_normalization_offset:
         run_name += f"_rnorm_offset"
@@ -568,10 +553,8 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
-    if args.vlm_reward_weight != 0 and args.reward_episode_end_only:
-        run_name += f"_endonly"
     if args.vlm_reward_weight != 0:
-        run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
+        run_name += f'_Voltron'
     if args.track:
         import wandb
         if 'SLURM_JOB_ID' in os.environ:
@@ -665,24 +648,23 @@ if __name__ == "__main__":
         init_key=key,
     )
 
-    if args.vlm_reward_weight != 0:
-        reward_model = RewardCalculator(args=c4c_args)
-        reward_model.model.eval()
+    with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
+        descriptions = pickle.load(f)
+    task_desc = [v for k, v in descriptions.items() if 'success_videos__' + args.env_id in k][0][0]
+    task_desc = " ".join(task_desc)
+    print('Caption:', task_desc)
+    del descriptions
 
-        frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
+    vgen, preprocess = load("v-gen", device="cuda", freeze=True)
+    vgen.load_state_dict(torch.load(f'{REWARD_CKPT_DIR}/epoch_9.pt'))
+    vgen.eval()
+    print('vgen state dict loaded!')
+    tokens = vgen.tokenizer(task_desc, return_tensors="pt", max_length=20, padding="max_length", truncation=True)
+    lang, lang_mask = tokens["input_ids"].to(vgen.lm.device), tokens["attention_mask"].to(vgen.lm.device)
 
-        with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
-            descriptions = pickle.load(f)
-        task_desc = [v for k, v in descriptions.items() if 'success_videos__' + args.env_id in k][0][0]
-        task_desc = " ".join(task_desc)
-        print('Caption:', task_desc)
-        del descriptions
+    transform_img = transforms.Compose([transforms.ToTensor()])
 
-        pairs_text, pairs_mask, pairs_segment, choice_video_ids = reward_model.dataloader._get_text(video_id=0, caption=task_desc)
-        pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs_text)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_mask)).to('cuda:0'), torch.from_numpy(np.asarray(pairs_segment)).to('cuda:0'), torch.from_numpy(np.asarray(choice_video_ids)).to('cuda:0')
-        new_images = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
-    
-        transform = _transform(224)
+    frames = torch.zeros((500, 3, 224, 224))
 
     gamma = args.gamma
     epsilon = 1e-8
@@ -721,106 +703,31 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, og_rewards, terminations, truncations, infos = envs.step(actions)
 
-        if args.vlm_reward_weight != 0:
-            current_frames = envs.call('render')
+        current_frames = envs.call('render')
+        frames[global_step % args.max_episode_steps] = preprocess(transform_img(current_frames[0]))
+        img2 = frames[global_step % args.max_episode_steps]
+        img1 = frames[global_step % args.max_episode_steps - 2 if global_step % args.max_episode_steps >= 2 else 0]
+        imgs = torch.stack([img1, img2])[None, ...].to(vgen.lm.device)
 
-            for idx, f in enumerate(current_frames):
-                frames[idx, current_t] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
-            batches = torch.zeros((args.num_envs, 1, reward_model.dataloader.max_frames, 1, 3, 224, 224))
+        rewards = vgen.score(imgs, lang, lang_mask).cpu().numpy()
 
-            offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
-            if current_t >= offset_timestep:
-                if current_t >= c4c_args.max_frames or args.stretch_partial_videos:
-                    images = np.linspace(0, current_t, c4c_args.max_frames, dtype=int)
-                else:
-                    images = np.arange(current_t + 1)
-                if c4c_args.frame_indices_to_use is not None and len(images) > len(c4c_args.frame_indices_to_use):
-                    images = np.stack([images[j] for j in c4c_args.frame_indices_to_use])
+        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        rewards = rewards * args.vlm_reward_weight
 
-                for i in range(args.num_envs):
-                    curr_video = frames[i][images]
-                    curr_video = curr_video.unsqueeze(1)
-                    curr_video = curr_video.unsqueeze(0)
-                    curr_video = curr_video.unsqueeze(0)
-                    batches[i][0][:len(images)] = curr_video
+        terminated = 1 - terminations
+        returns = returns * gamma * (1 - terminated) + rewards
+        return_rms.update(returns)
+        rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+        rewards = np.asarray(rewards)
 
-                episode_finished = np.logical_or(terminations, truncations)
-                if np.any(episode_finished) or not args.reward_episode_end_only:
-                    with torch.no_grad():
-                        num_frames = len(images)
-                        num_padded = reward_model.dataloader.max_frames - num_frames
-                        video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
-                        a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
-                        scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-                    if len(scores.shape) > 2:
-                        video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
-                        final_scores = torch.zeros(args.num_envs)
-                        for i in range(args.num_envs):
-                            final_scores[i] = scores[0, i, video_lengths[i]]
-                        scores = final_scores
-                    rewards = scores.cpu().numpy()
-                    if args.reward_episode_end_only:
-                        rewards = np.multiply(rewards, episode_finished)
-                else:
-                    rewards = np.zeros_like(og_rewards)
-                og_vlm_rewards = rewards.copy()
-
-                if args.reward_normalization_offset:
-                    if current_t == offset_timestep:
-                        offset = rewards.copy()
-                        rewards -= offset
-                    elif current_t > offset_timestep:
-                        rewards -= offset
-                if args.reward_normalization_constant:
-                    assert args.reward_normalization_constant_value is not None, "Need to set the constant to add via args"
-                    rewards += args.reward_normalization_constant_value
-                if args.reward_normalization_gymnasium:
-                    terminated = 1 - terminations
-                    returns = returns * gamma * (1 - terminated) + rewards
-                    return_rms.update(returns)
-                    rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-                    rewards = np.asarray(rewards)
-                if last_rewards is None and current_t != 0:
-                    last_rewards = rewards.copy()
-                    last_actions = np.asarray(actions).copy()[:, :3]
-                elif current_t == 0:
-                    last_rewards = None
-                    last_actions = None
-                else:
-                    dist = np.linalg.norm(last_actions - np.asarray(actions)[:, :3], axis=1)
-                    derivatives += (rewards.squeeze() - last_rewards.squeeze()) / dist
-
-            else:
-                rewards = np.asarray([0. for _ in range(NUM_TASKS)])
-                og_vlm_rewards = rewards.copy()
-
-            if global_step % args.transition_logging_freq == 0:
-                logging = True
-                start_step = global_step
-                to_log = ['actions', 'raw_vlm_reward', 'vlm_reward', 'sparse_reward', 'success', 'original_reward',
-                      'total_reward', 'state', 'next_state', 'termination', 'frames']
-                episode_dict = {key: [] for key in to_log}
-
-            if logging:
-                writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
-            rewards = rewards * args.vlm_reward_weight
-            vlm_rewards = rewards.copy()
-            if logging:
-                writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
-            success = None
-            if 'success' in infos:
-                success = infos['success'] * args.sparse_reward_weight
-                rewards = rewards + success
-                if logging:
-                    writer.add_scalar("charts/reward_success", np.mean(success), global_step)
-            rewards = rewards + og_rewards * args.env_reward_weight
-        else:
-            rewards = og_rewards * args.env_reward_weight
-            if 'success' in infos:
-                success = infos['success'] * args.sparse_reward_weight
-            else:
-                success = np.zeros_like(rewards)
+        writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        success = None
+        if 'success' in infos:
+            success = infos['success'] * args.sparse_reward_weight
             rewards = rewards + success
+            if logging:
+                writer.add_scalar("charts/reward_success", np.mean(success), global_step)
+        rewards = rewards + og_rewards * args.env_reward_weight
 
         if logging:
             writer.add_scalar("charts/reward_total", np.mean(rewards), global_step)
