@@ -96,6 +96,7 @@ def parse_args():
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
+    parser.add_argument("--reward-episode-end-only", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="If True, use r=0 for non-terminal time steps.")
 
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
@@ -565,6 +566,8 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
+    if args.vlm_reward_weight != 0 and args.reward_episode_end_only:
+        run_name += f"_endonly"
     if args.vlm_reward_weight != 0:
         run_name += f'_ckpt_{args.c4c_ckpt.replace("/", "__")}'
     if args.track:
@@ -739,19 +742,25 @@ if __name__ == "__main__":
                     curr_video = curr_video.unsqueeze(0)
                     batches[i][0][:len(images)] = curr_video
 
-                with torch.no_grad():
-                    num_frames = len(images)
-                    num_padded = reward_model.dataloader.max_frames - num_frames
-                    video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
-                    a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
-                    scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
-                if len(scores.shape) > 2:
-                    video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
-                    final_scores = torch.zeros(args.num_envs)
-                    for i in range(args.num_envs):
-                        final_scores[i] = scores[0, i, video_lengths[i]]
-                    scores = final_scores
-                rewards = scores.cpu().numpy()
+                episode_finished = np.logical_or(terminations, truncations)
+                if np.any(episode_finished) or not args.reward_episode_end_only:
+                    with torch.no_grad():
+                        num_frames = len(images)
+                        num_padded = reward_model.dataloader.max_frames - num_frames
+                        video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
+                        a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
+                        scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
+                    if len(scores.shape) > 2:
+                        video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
+                        final_scores = torch.zeros(args.num_envs)
+                        for i in range(args.num_envs):
+                            final_scores[i] = scores[0, i, video_lengths[i]]
+                        scores = final_scores
+                    rewards = scores.cpu().numpy()
+                    if args.reward_episode_end_only:
+                        rewards = np.multiply(rewards, episode_finished)
+                else:
+                    rewards = np.zeros_like(og_rewards)
                 og_vlm_rewards = rewards.copy()
 
                 if args.reward_normalization_offset:

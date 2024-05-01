@@ -109,6 +109,7 @@ def parse_args():
 
     parser.add_argument("--reward-normalization-constant-value", type=float, default=None,
         help="the reward normalization constant to be added to the rewards")
+    parser.add_argument("--reward-episode-end-only", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="If True, use r=0 for non-terminal time steps.")
 
     # SAC
     parser.add_argument("--policy-lr", type=float, default=3e-4,
@@ -570,6 +571,8 @@ if __name__ == "__main__":
         run_name += f"_rsparse_{args.sparse_reward_weight}"
     if args.vlm_reward_weight != 1:
         run_name += f"_rvlm_{args.vlm_reward_weight}"
+    if args.vlm_reward_weight != 0 and args.reward_episode_end_only:
+        run_name += f"_endonly"
     if args.vlm_reward_weight != 0:
         ckpt_file = args.roboclip_ckpt.split('checkpoint/')[-1]
         run_name += f'_ckpt_{args.roboclip_ckpt.replace("/", "__")}'
@@ -747,10 +750,16 @@ if __name__ == "__main__":
                     batches[i][:len(images)] = curr_video
                 batches = batches.permute(0, 2, 1, 3, 4)
 
-                with torch.no_grad():
-                    a, b = reward_model.model(batches.to('cuda:0'), pairs_text)
-                    scores = reward_model.get_similarity(a, b)
-                rewards = scores.cpu().numpy()
+                episode_finished = np.logical_or(terminations, truncations)
+                if np.any(episode_finished) or not args.reward_episode_end_only:
+                    with torch.no_grad():
+                        a, b = reward_model.model(batches.to('cuda:0'), pairs_text)
+                        scores = reward_model.get_similarity(a, b)
+                    rewards = scores.cpu().numpy()
+                    if args.reward_episode_end_only:
+                        rewards = np.multiply(rewards, episode_finished).astype(rewards.dtype)
+                else:
+                    rewards = np.zeros_like(og_rewards, dtype=og_rewards.dtype)
                 og_vlm_rewards = rewards.copy()
 
                 if args.reward_normalization_offset:
