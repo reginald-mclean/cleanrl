@@ -33,6 +33,9 @@ from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
 from scipy.ndimage import gaussian_filter1d, convolve1d
+from metaworld.envs.mujoco.env_dict import ALL_V2_ENVIRONMENTS, MT10_V2
+from metaworld import Benchmark, Task
+import pickle 
 
 
 def parse_args():
@@ -53,7 +56,7 @@ def parse_args():
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
-    parser.add_argument("--reward-version", type=str, default="v1", help="the reward function of the environment")
+    parser.add_argument("--reward-version", nargs="*", default="v1", help="the reward function of the environment")
     parser.add_argument("--total-timesteps", type=int, default=int(2e7),
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=500,
@@ -94,6 +97,10 @@ def parse_args():
     parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize after smoothing')
     parser.add_argument('--normalize-rewards-env', type=lambda x: bool(strtobool(x)), default=False, help='use the normalization wrapper around each env')
     args = parser.parse_args()
+
+    if len(args.reward_version) == 1:
+        args.reward_version = args.reward_version[0]
+
     # fmt: on
     print(args)
     return args
@@ -504,6 +511,64 @@ def update_mean_var_count_from_moments(
 
     return new_mean, new_var, new_count
 
+_N_GOALS = 50
+
+def _encode_task(env_name, data):
+    return Task(env_name=env_name, data=pickle.dumps(data))
+
+
+def _make_tasks(classes, args_kwargs, kwargs_override, seed=None):
+    if seed is not None:
+        st0 = np.random.get_state()
+        np.random.seed(seed)
+    tasks = []
+    for (env_name, args) in args_kwargs.items():
+        assert len(args['args']) == 0
+        env_cls = classes[env_name]
+        env = env_cls()
+        env._freeze_rand_vec = False
+        env._set_task_called = True
+        rand_vecs = []
+        kwargs = args['kwargs'].copy()
+        del kwargs['task_id']
+        env._set_task_inner(**kwargs)
+        for _ in range(_N_GOALS):
+            env.reset()
+            rand_vecs.append(env._last_rand_vec)
+        unique_task_rand_vecs = np.unique(np.array(rand_vecs), axis=0)
+        assert unique_task_rand_vecs.shape[0] == _N_GOALS
+
+        env.close()
+        for rand_vec in rand_vecs:
+            kwargs = args['kwargs'].copy()
+            del kwargs['task_id']
+            kwargs.update(dict(rand_vec=rand_vec, env_cls=env_cls))
+            kwargs.update(kwargs_override)
+            tasks.append(_encode_task(env_name, kwargs))
+    if seed is not None:
+        np.random.set_state(st0)
+    return tasks
+
+
+
+class Modified_MT10(Benchmark):
+    def __init__(self, seed=None):
+        super().__init__()
+
+        env_names = ['button-press-v2', 'door-close-v2', 'door-unlock-v2', 'drawer-close-v2', 'drawer-open-v2', 'handle-press-side-v2', 'handle-press-v2', 'sweep-into-v2', 'window-close-v2', 'window-open-v2']
+        self._train_classes = {name: ALL_V2_ENVIRONMENTS[name] for name in env_names}
+        self._test_classes = {}
+
+        train_kwargs = {
+              key: dict(args=[],
+              kwargs={'task_id': list(ALL_V2_ENVIRONMENTS.keys()).index(key)})
+              for key in env_names
+        }
+
+        self._train_tasks = _make_tasks(self._train_classes, train_kwargs,
+                                        dict(partially_observable=False),
+                                        seed=seed)
+        self._test_tasks = []
 
 
 # Training loop
@@ -563,8 +628,8 @@ if __name__ == "__main__":
     # env setup
     if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == "MT50":
-        benchmark = metaworld.MT50(seed=args.seed)
+    elif args.env_id == "Modified_MT10":
+        benchmark = Modified_MT10(seed=args.seed)
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
