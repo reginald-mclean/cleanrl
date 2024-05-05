@@ -49,7 +49,7 @@ def parse_args():
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="MTSAC-State-VLM-Reward",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
+    parser.add_argument("--wandb-entity", type=str, default='minttusofia',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model checkpoints")
@@ -656,7 +656,7 @@ if __name__ == "__main__":
     del descriptions
 
     vgen, preprocess = load("v-gen", device="cuda", freeze=True)
-    vgen.load_state_dict(torch.load(f'{REWARD_CKPT_DIR}/epoch_9.pt'))
+    vgen.load_state_dict(torch.load(f'{REWARD_CKPT_DIR}/0426_from_reggie/epoch_9.pt'))
     vgen.eval()
     print('vgen state dict loaded!')
     tokens = vgen.tokenizer(task_desc, return_tensors="pt", max_length=20, padding="max_length", truncation=True)
@@ -711,16 +711,27 @@ if __name__ == "__main__":
 
         rewards = vgen.score(imgs, lang, lang_mask).cpu().numpy()
 
-        writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
+        offset_timestep = 0
+        if args.reward_normalization_offset:
+            if current_t == offset_timestep:
+                offset = rewards.copy()
+                rewards -= offset
+            elif current_t > offset_timestep:
+                rewards -= offset
+
+        if args.reward_normalization_gymnasium:
+            terminated = 1 - terminations
+            returns = returns * gamma * (1 - terminated) + rewards
+            return_rms.update(returns)
+            rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+            rewards = np.asarray(rewards)
+
+        if logging:
+            writer.add_scalar("charts/reward_original", np.mean(og_rewards), global_step)
         rewards = rewards * args.vlm_reward_weight
-
-        terminated = 1 - terminations
-        returns = returns * gamma * (1 - terminated) + rewards
-        return_rms.update(returns)
-        rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-        rewards = np.asarray(rewards)
-
-        writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
+        vlm_rewards = rewards.copy()
+        if logging:
+            writer.add_scalar("charts/reward_vlm", np.mean(rewards), global_step)
         success = None
         if 'success' in infos:
             success = infos['success'] * args.sparse_reward_weight

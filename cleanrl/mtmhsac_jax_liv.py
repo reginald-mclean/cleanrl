@@ -51,7 +51,7 @@ def parse_args():
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="MTSAC-State-VLM-Reward",
         help="the wandb's project name")
-    parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
+    parser.add_argument("--wandb-entity", type=str, default='minttusofia',
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to save model checkpoints")
@@ -104,8 +104,8 @@ def parse_args():
     parser.add_argument("--critic-network", type=str, default="400,400,400", help="The architecture of the critic network")
     parser.add_argument("--transition-logging-freq", type=int, default=50_000, help="How often to log data from training")
 
-    # C4C
-    parser.add_argument('--c4c-ckpt', type=str, default=None, help='Path to clip4clip checkpoint under paths/REWARD_CKPT_DIR.')
+    # LIV
+    parser.add_argument('--liv-ckpt', type=str, default='LIV_with_negatives.pt', help='Path to LIV checkpoint.')
     args = parser.parse_args()
     print("RL args:")
     for key in sorted(args.__dict__):
@@ -553,6 +553,7 @@ if __name__ == "__main__":
         run_name += f"_rvlm_{args.vlm_reward_weight}"
     if args.vlm_reward_weight != 0:
         run_name += f'_LIV'
+        run_name += f'_ckpt_{args.liv_ckpt.replace("/", "__")}'
     if args.track:
         import wandb
         if 'SLURM_JOB_ID' in os.environ:
@@ -655,7 +656,7 @@ if __name__ == "__main__":
         del descriptions
         liv = load_liv()
 
-        liv.module.load_state_dict(torch.load(f'{REWARD_CKPT_DIR}/snapshot.pt')['liv'])
+        liv.module.load_state_dict(torch.load(os.path.join(REWARD_CKPT_DIR, args.liv_ckpt))['liv'])
         print('LIV State Dict loaded!')
         liv.eval()
         transform = T.Compose([T.ToTensor()])
@@ -708,11 +709,20 @@ if __name__ == "__main__":
                 img_embedding = liv(input=image, modality="vision")
             rewards = liv.module.sim(img_embedding, text_embedding).item()
 
-            terminated = 1 - terminations
-            returns = returns * gamma * (1 - terminated) + rewards
-            return_rms.update(returns)
-            rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-            rewards = np.asarray(rewards)
+            offset_timestep = 0
+            if args.reward_normalization_offset:
+                if current_t == offset_timestep:
+                    offset = rewards
+                    rewards -= offset
+                elif current_t > offset_timestep:
+                    rewards -= offset
+
+            if args.reward_normalization_gymnasium:
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+                rewards = np.asarray(rewards)
 
             if last_rewards is None and current_t != 0:
                 last_rewards = rewards.copy()
