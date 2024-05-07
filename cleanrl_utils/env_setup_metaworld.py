@@ -6,7 +6,7 @@ import gymnasium as gym  # type: ignore
 import metaworld  # type: ignore
 from cleanrl_utils.wrappers import metaworld_wrappers
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
-
+from gymnasium.wrappers.time_limit import TimeLimit
 
 def _make_envs_common(
     benchmark: metaworld.Benchmark,
@@ -19,9 +19,11 @@ def _make_envs_common(
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         rf_version = reward_func_version if isinstance(reward_func_version, str) else reward_func_version[env_id]
-        print(rf_version)
-        env = env_cls(reward_func_version=rf_version)
-        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
+        if not isinstance(env_cls, TimeLimit):
+            env = env_cls(reward_func_version=reward_func_version)
+            env = gym.wrappers.TimeLimit(env, 500)
+        else:
+            env = env_cls
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         elif normalize_rewards:
@@ -31,12 +33,14 @@ def _make_envs_common(
             env = metaworld_wrappers.OneHotWrapper(
                 env, env_id, len(benchmark.train_classes)
             )
-        tasks = [task for task in benchmark.train_tasks if task.env_name == name]
-        env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        if isinstance(env.unwrapped, SawyerXYZEnv):
+            tasks = [task for task in benchmark.train_tasks if task.env_name == name]
+            env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+
         env.action_space.seed(seed + env_id)
         return env
 
-    return gym.vector.AsyncVectorEnv(
+    return gym.vector.SyncVectorEnv(
         [
             partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())

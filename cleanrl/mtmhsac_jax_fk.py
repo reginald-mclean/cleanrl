@@ -570,6 +570,12 @@ class Modified_MT10(Benchmark):
                                         seed=seed)
         self._test_tasks = []
 
+class FK_Benchmark(Benchmark):
+    def __init__(self, seed):
+        super().__init__()
+        tasks = ['microwave', 'kettle', 'hinge cabinet', 'slide cabinet', 'light switch', 'top burner', 'bottom burner']
+        self._train_classes = {name : gym.make('FrankaKitchen-v1', tasks_to_complete=[name]) for name in tasks}
+
 
 # Training loop
 if __name__ == "__main__":
@@ -630,8 +636,8 @@ if __name__ == "__main__":
         benchmark = metaworld.MT10(seed=args.seed)
     elif args.env_id == "Modified_MT10":
         benchmark = Modified_MT10(seed=args.seed)
-    else:
-        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+    elif args.env_id == 'FK':
+        benchmark = FK_Benchmark(args.seed)
 
     use_one_hot_wrapper = (
         True if "MT10" in args.env_id or "MT50" in args.env_id else False
