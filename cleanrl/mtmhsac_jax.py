@@ -36,7 +36,7 @@ from scipy.ndimage import gaussian_filter1d, convolve1d
 from metaworld.envs.mujoco.env_dict import ALL_V2_ENVIRONMENTS, MT10_V2
 from metaworld import Benchmark, Task
 import pickle 
-
+import torch
 
 def parse_args():
     # fmt: off
@@ -96,6 +96,11 @@ def parse_args():
     # reward normalization
     parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize after smoothing')
     parser.add_argument('--normalize-rewards-env', type=lambda x: bool(strtobool(x)), default=False, help='use the normalization wrapper around each env')
+
+
+    parser.add_argument('--model-type', type=str, default=None, help='what vlm reward model to use')
+
+
     args = parser.parse_args()
 
     if len(args.reward_version) == 1:
@@ -571,6 +576,45 @@ class Modified_MT10(Benchmark):
         self._test_tasks = []
 
 
+def preprocess_metaworld(frames, shorten=True):
+    #(10, 480, 480, 3)
+    center = 240, 320
+    h, w = (250, 250)
+    x = int(center[1] - w/2)
+    y = int(center[0] - h/2)
+    frames = np.array([frame[y:y+h, x:x+w] for frame in frames])
+    a = frames
+    #if shorten:
+    #    frames = frames[:, :,::4,:,:]
+    # frames = frames/255
+    return frames # torch.from_numpy(frames).double()
+
+instruction_mapping = {
+    "window-open-v2": "Push and open a sliding window by its handle.",
+    "window-close-v2": "Push and close a sliding window by its handle.",
+    "door-open-v2": "Open a door with a revolving joint by the pulling door's handle.",
+    "drawer-open-v2": "Open a drawer by its handle by pulling on it.",
+    "drawer-close-v2": "Close a drawer by its handle by pushing on it.",
+    "door-unlock-v2": "Unlock the door by rotating the lock counter-clockwise.",
+    "sweep-into-v2": " Sweep a puck from the initial position into a hole.",
+    "button-press-v2": "Press a button in y coordination.",
+    "handle-press-v2": "Press a handle down.",
+    "handle-press-side-v2": "Press a handle down sideways.",
+    "reach-v2": "Reach towards a goal position.",
+    "button-press-topdown-v2": "Press a button that is on top of a box.",
+    "peg-insert-side-v2": "Move towards a stick on the ground, grasp it in the middle, and insert it into the goal",
+    "push-v2": "Move towards the object, and push the object towards a goal",
+    "pick-place-v2": "Move towards an object, grasp the object, and move it to the goal",
+    "bottom burner": "Turn the oven knob that activates the bottom burner",
+    "top burner": "Turn the oven knob that activates the top burner",
+    "light switch": "Slide the light switch",
+    "slide cabinet": "Push and open a sliding cabinet by its handle.",
+    "hinge cabinet": "Grasp the handle of the left hinge cabinet and open",
+    "microwave": "Grasp the handle of the microwave and open",
+    "kettle": "pick up the kettle by the handle and move it to the top left burner"
+}
+
+
 # Training loop
 if __name__ == "__main__":
     args = parse_args()
@@ -693,6 +737,47 @@ if __name__ == "__main__":
     returns = jnp.zeros(envs.num_envs)
     return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
+    mt10_descs = [instruction_mapping[name] for name in benchmark.train_classes]
+
+    if args.model_type == 'S3D':
+        from s3dg import S3D
+        S3D_PATH = '/home/reggiemclean/rf_smoothness/s3d/'
+        model = S3D(f'{S3D_PATH}s3d_dict.npy', 512).double()
+        model.load_state_dict(torch.load(f'{S3D_PATH}s3d_howto100m.pth'))
+        model.eval()
+        text_output = model.text_module(mt10_descs)
+        text_output = text_output['text_embedding'].to('cuda:0')
+        model = model.to('cuda:0')
+
+    elif args.model_type == 'LIV':
+        import clip
+        import torch
+        import torchvision.transforms as T
+        from PIL import Image 
+
+        from liv import load_liv
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        liv = load_liv()
+        liv.eval()
+        transform = T.Compose([T.ToTensor()])
+
+        # pre-process image and text
+        image = transform(Image.open("LIV/liv/examples/sample_video/frame_0000033601.jpg")).unsqueeze(0).to(device)
+        text = clip.tokenize(["open microwave", "close microwave", "wipe floor"]).to(device)
+
+        # compute LIV image and text embedding
+        with torch.no_grad():
+            img_embedding = liv(input=image, modality="vision")
+            text_embedding = liv(input=text, modality="text")
+
+        # compute LIV value
+        img_text_value = liv.module.sim(img_embedding, text_embedding)
+        print(img_text_value)
+        exit(0)
+
+    frame_history = np.zeros((args.max_episode_steps, envs.num_envs, 250, 250, 3))
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
@@ -724,9 +809,31 @@ if __name__ == "__main__":
             )
         else:
             actions, key = agent.get_action_train(obs, key)
-
+        #if global_step % 1000 == 0:
+        print(global_step)
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+
+        frames = envs.call('render')
+
+        frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
+
+        if args.model_type == 'S3D':
+
+            linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int).numpy()
+            start = time.time()
+            video = torch.from_numpy(frame_history[linspace, :, :, :, :].transpose(1, 4, 0, 2, 3))
+            og_rewards = rewards.copy()
+            with torch.no_grad():
+                video_output = model(video.to('cuda:0'))
+                rewards = (video_output['video_embedding'] * text_output).sum(dim=1).cpu().numpy()
+
+            if args.normalize_rewards_env:
+                terminated = 1 - terminations
+                returns = returns * gamma * (1 - terminated) + rewards
+                return_rms.update(returns)
+                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+                rewards = np.asarray(rewards)
 
         if global_step % args.max_episode_steps == 0:
             last_rewards = rewards.copy()
