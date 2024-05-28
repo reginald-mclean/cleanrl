@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 import argparse
 import os
+
 import random
 import time
 from collections import deque
@@ -8,7 +9,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/mnt/nvme/cleanrl')
+sys.path.append('/home/reggiemclean/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -682,7 +683,7 @@ if __name__ == "__main__":
     )
 
     envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=args.normalize_rewards_env # normalize-rewards-env
+        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False #args.normalize_rewards_env # normalize-rewards-env
     )
     eval_envs = make_eval_envs(
         benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False
@@ -810,14 +811,13 @@ if __name__ == "__main__":
         else:
             actions, key = agent.get_action_train(obs, key)
         #if global_step % 1000 == 0:
-        print(global_step)
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        frames = envs.call('render')
 
-        frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
-
+        if args.model_type:
+            frames = envs.call('render')
+            frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
         if args.model_type == 'S3D':
 
             linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int).numpy()
@@ -828,12 +828,14 @@ if __name__ == "__main__":
                 video_output = model(video.to('cuda:0'))
                 rewards = (video_output['video_embedding'] * text_output).sum(dim=1).cpu().numpy()
 
-            if args.normalize_rewards_env:
-                terminated = 1 - terminations
-                returns = returns * gamma * (1 - terminated) + rewards
-                return_rms.update(returns)
-                rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
-                rewards = np.asarray(rewards)
+        if args.normalize_rewards_env:
+            terminated = 1 - terminations
+            returns = returns * gamma * (1 - terminated) + rewards
+            return_rms.update(returns)
+            rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
+            rewards = np.asarray(rewards)
+
+
 
         if global_step % args.max_episode_steps == 0:
             last_rewards = rewards.copy()
@@ -1008,6 +1010,11 @@ if __name__ == "__main__":
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
                 }
                 if args.track:
+                    print(np.array(returns))
+                    wandb.log({f'returns env {idx}': np.array(returns)[idx] for idx in range(len(np.array(returns)))}, commit=False)
+                    wandb.log({f'rms mean env {idx}': return_rms.mean[idx] for idx in range(len(return_rms.mean))}, commit=False)
+                    wandb.log({f'rms mean env {idx}': return_rms.var[idx] for idx in range(len(return_rms.var))}, commit=False)
+                    wandb.log({'rms count': return_rms.count}, commit=False)
                     wandb.log(logs, commit=False)
                     wandb.log(eval_metrics)
                 print(
@@ -1028,6 +1035,8 @@ if __name__ == "__main__":
                         metrics=eval_metrics,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
+
+    print(return_rms.var, return_rms.mean, return_rms.count)
 
     envs.close()
     writer.close()
