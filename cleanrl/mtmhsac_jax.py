@@ -9,7 +9,7 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/home/reggiemclean/cleanrl')
+sys.path.append('/mnt/nvme/cleanrl')
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -749,7 +749,7 @@ if __name__ == "__main__":
         text_output = model.text_module(mt10_descs)
         text_output = text_output['text_embedding'].to('cuda:0')
         model = model.to('cuda:0')
-
+        frame_history = np.zeros((args.max_episode_steps, envs.num_envs, 250, 250, 3))
     elif args.model_type == 'LIV':
         import clip
         import torch
@@ -760,25 +760,18 @@ if __name__ == "__main__":
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        liv = load_liv()
-        liv.eval()
+        model = load_liv()
+        model.eval()
         transform = T.Compose([T.ToTensor()])
-
+        text_tokens = []
         # pre-process image and text
-        image = transform(Image.open("LIV/liv/examples/sample_video/frame_0000033601.jpg")).unsqueeze(0).to(device)
-        text = clip.tokenize(["open microwave", "close microwave", "wipe floor"]).to(device)
-
-        # compute LIV image and text embedding
+        for desc in mt10_descs:
+            text = clip.tokenize([desc]).to(device)
+            text_tokens.append(text)
+        text_tokens = torch.stack(text_tokens).to(device).squeeze(1)
         with torch.no_grad():
-            img_embedding = liv(input=image, modality="vision")
-            text_embedding = liv(input=text, modality="text")
-
+            text_embedding = model(input=text_tokens, modality="text")
         # compute LIV value
-        img_text_value = liv.module.sim(img_embedding, text_embedding)
-        print(img_text_value)
-        exit(0)
-
-    frame_history = np.zeros((args.max_episode_steps, envs.num_envs, 250, 250, 3))
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
@@ -817,9 +810,9 @@ if __name__ == "__main__":
 
         if args.model_type:
             frames = envs.call('render')
-            frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
-        if args.model_type == 'S3D':
 
+        if args.model_type == 'S3D':
+            frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
             linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int).numpy()
             start = time.time()
             video = torch.from_numpy(frame_history[linspace, :, :, :, :].transpose(1, 4, 0, 2, 3))
@@ -827,6 +820,12 @@ if __name__ == "__main__":
             with torch.no_grad():
                 video_output = model(video.to('cuda:0'))
                 rewards = (video_output['video_embedding'] * text_output).sum(dim=1).cpu().numpy()
+        elif args.model_type == 'LIV':
+            frames = torch.stack([transform(img) for img in frames])
+            with torch.no_grad():
+                img_embed = model(input=frames, modality='vision')
+            rewards = model.module.sim(img_embed, text_embedding).cpu().numpy()
+
 
         if args.normalize_rewards_env:
             terminated = 1 - terminations
