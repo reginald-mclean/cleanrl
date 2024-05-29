@@ -10,9 +10,9 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
-os.environ[
-    "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+# os.environ[
+#     "XLA_PYTHON_CLIENT_MEM_FRACTION"
+# ] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 from argparse import Namespace
 import distrax

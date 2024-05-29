@@ -10,9 +10,14 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
-os.environ[
-    "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+# os.environ[
+#     "XLA_PYTHON_CLIENT_MEM_FRACTION"
+# ] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+import metaworld
+from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
+from cleanrl_utils.wrappers import metaworld_wrappers
+
+import torch
 
 from argparse import Namespace
 import distrax
@@ -33,7 +38,6 @@ from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from torch.utils.tensorboard import SummaryWriter
-import torch
 import pickle
 import clip
 import torchvision.transforms as T
@@ -112,10 +116,6 @@ def parse_args():
         print("  <<< {}: {}".format(key, args.__dict__[key]))
     return args
 
-
-import metaworld
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv
-from cleanrl_utils.wrappers import metaworld_wrappers
 
 def _make_envs_common(
     benchmark: metaworld.Benchmark,
