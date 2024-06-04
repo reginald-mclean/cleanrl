@@ -1,4 +1,5 @@
 # ruff: noqa: E402
+import multiprocessing as mp
 import argparse
 import os
 
@@ -618,6 +619,7 @@ instruction_mapping = {
 
 # Training loop
 if __name__ == "__main__":
+    mp.set_start_method('spawn')
     args = parse_args()
     run_name = f"{args.exp_name}"
 
