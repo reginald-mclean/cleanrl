@@ -815,8 +815,7 @@ if __name__ == "__main__":
 
         if args.model_type == 'S3D':
             frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
-            linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int).numpy()
-            start = time.time()
+            linspace = np.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int)
             video = torch.from_numpy(frame_history[linspace, :, :, :, :].transpose(1, 4, 0, 2, 3))
             og_rewards = rewards.copy()
             with torch.no_grad():
