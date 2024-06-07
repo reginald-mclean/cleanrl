@@ -591,31 +591,6 @@ def preprocess_metaworld(frames, shorten=True):
     # frames = frames/255
     return frames # torch.from_numpy(frames).double()
 
-instruction_mapping = {
-    "window-open-v2": "Push and open a sliding window by its handle.",
-    "window-close-v2": "Push and close a sliding window by its handle.",
-    "door-open-v2": "Open a door with a revolving joint by the pulling door's handle.",
-    "drawer-open-v2": "Open a drawer by its handle by pulling on it.",
-    "drawer-close-v2": "Close a drawer by its handle by pushing on it.",
-    "door-unlock-v2": "Unlock the door by rotating the lock counter-clockwise.",
-    "sweep-into-v2": " Sweep a puck from the initial position into a hole.",
-    "button-press-v2": "Press a button in y coordination.",
-    "handle-press-v2": "Press a handle down.",
-    "handle-press-side-v2": "Press a handle down sideways.",
-    "reach-v2": "Reach towards a goal position.",
-    "button-press-topdown-v2": "Press a button that is on top of a box.",
-    "peg-insert-side-v2": "Move towards a stick on the ground, grasp it in the middle, and insert it into the goal",
-    "push-v2": "Move towards the object, and push the object towards a goal",
-    "pick-place-v2": "Move towards an object, grasp the object, and move it to the goal",
-    "bottom burner": "Turn the oven knob that activates the bottom burner",
-    "top burner": "Turn the oven knob that activates the top burner",
-    "light switch": "Slide the light switch",
-    "slide cabinet": "Push and open a sliding cabinet by its handle.",
-    "hinge cabinet": "Grasp the handle of the left hinge cabinet and open",
-    "microwave": "Grasp the handle of the microwave and open",
-    "kettle": "pick up the kettle by the handle and move it to the top left burner"
-}
-
 
 # Training loop
 if __name__ == "__main__":
@@ -740,18 +715,42 @@ if __name__ == "__main__":
     returns = jnp.zeros(envs.num_envs)
     return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
-    mt10_descs = [instruction_mapping[name] for name in benchmark.train_classes]
+    with open('/home/reggiemclean/rf_smoothness/raw-captions.pkl', 'rb') as f:
+        instruction_mapping = pickle.load(f)
+
+    mt10_descs = []
+    print('getting descriptions')
+    for name in benchmark.train_classes:
+        cap = None
+        for x in range(50):
+            cap = instruction_mapping.get('success_videos__' + name + f'_{x}', None)
+            if cap:
+                cap = ' '.join(cap[0])
+                break
+        mt10_descs.append(cap)
+    print(mt10_descs)
+    print(f'loading model {args.model_type}')
 
     if args.model_type == 'S3D':
         from s3dg import S3D
         S3D_PATH = '/home/reggiemclean/rf_smoothness/s3d/'
-        model = S3D(f'{S3D_PATH}s3d_dict.npy', 512).double()
-        model.load_state_dict(torch.load(f'{S3D_PATH}s3d_howto100m.pth'))
+        model = S3D(f'{S3D_PATH}s3d_dict.npy', 512).float()
+        finetuned = torch.load(f'/home/reggiemclean/rf_smoothness/epoch0146.pth.tar')['state_dict'] # epoch0146.pth.tar loss of ~5.5
+        from collections import OrderedDict
+
+        new_state_dict = OrderedDict()
+
+        for k, v in finetuned.items():
+            name = k[7:]
+            new_state_dict[name] = v
+
+
+        model.load_state_dict(new_state_dict)
         model.eval()
         text_output = model.text_module(mt10_descs)
         text_output = text_output['text_embedding'].to('cuda:0')
         model = model.to('cuda:0')
-        frame_history = np.zeros((args.max_episode_steps, envs.num_envs, 250, 250, 3))
+        frame_history = torch.zeros((500, envs.num_envs, 250, 250, 3)).to('cuda:0')
     elif args.model_type == 'LIV':
         import clip
         import torch
@@ -814,19 +813,19 @@ if __name__ == "__main__":
             frames = envs.call('render')
 
         if args.model_type == 'S3D':
-            frame_history[global_step % args.max_episode_steps] = preprocess_metaworld(list(frames))
-            linspace = np.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int)
-            video = torch.from_numpy(frame_history[linspace, :, :, :, :].transpose(1, 4, 0, 2, 3))
+            frame_history[global_step % args.max_episode_steps] = torch.from_numpy(preprocess_metaworld(list(frames))).to('cuda:0')
+            linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int)
+            video = frame_history[linspace, :, :, :, :].permute(1, 4, 0, 2, 3).float()
             og_rewards = rewards.copy()
             with torch.no_grad():
-                video_output = model(video.to('cuda:0'))
+                video_output = model(video)
                 rewards = (video_output['video_embedding'] * text_output).sum(dim=1).cpu().numpy()
+
         elif args.model_type == 'LIV':
             frames = torch.stack([transform(img) for img in frames])
             with torch.no_grad():
                 img_embed = model(input=frames, modality='vision')
             rewards = model.module.sim(img_embed, text_embedding).cpu().numpy()
-
 
         if args.normalize_rewards_env:
             terminated = 1 - terminations
@@ -834,8 +833,6 @@ if __name__ == "__main__":
             return_rms.update(returns)
             rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
             rewards = np.asarray(rewards)
-
-
 
         if global_step % args.max_episode_steps == 0:
             last_rewards = rewards.copy()
