@@ -10,8 +10,10 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 import sys
-sys.path.append('/mnt/nvme/cleanrl')
+sys.path.append('/home/reggie/cleanrl')
 
+os.environ['MUJOCO_GL'] = 'egl'
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
 ] = "0.05"
