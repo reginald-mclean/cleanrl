@@ -1,22 +1,17 @@
 # ruff: noqa: E402
 import multiprocessing as mp
-import argparse
+import sys
+sys.path.append('../cleanrl')
 import os
 
+import paths
+import argparse
 import random
 import time
 from collections import deque
 from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union
-import sys
-sys.path.append('/home/reggie/cleanrl')
-
-os.environ['MUJOCO_GL'] = 'egl'
-os.environ['PYOPENGL_PLATFORM'] = 'egl'
-os.environ[
-    "XLA_PYTHON_CLIENT_MEM_FRACTION"
-] = "0.05"
 
 import distrax
 import flax
@@ -41,6 +36,11 @@ from metaworld.envs.mujoco.env_dict import ALL_V2_ENVIRONMENTS, MT10_V2
 from metaworld import Benchmark, Task
 import pickle 
 import torch
+
+from PIL import Image
+from video_language_critic.reward import RewardCalculator
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+
 
 def parse_args():
     # fmt: off
@@ -103,7 +103,8 @@ def parse_args():
 
 
     parser.add_argument('--model-type', type=str, default=None, help='what vlm reward model to use')
-
+    parser.add_argument('--reward-offset', type=lambda x: bool(strtobool(x)), default=False, help='use first rewards in trajectory added as offset')
+    parser.add_argument('--sparse-reward', type=int, default=0, help='the sparse reward to add when success is detected')
 
     args = parser.parse_args()
 
@@ -729,10 +730,16 @@ if __name__ == "__main__":
             if cap:
                 cap = ' '.join(cap[0])
                 break
+        if not cap:
+            assert 1==2, 'cap is None'
         mt10_descs.append(cap)
     print(mt10_descs)
     print(f'loading model {args.model_type}')
 
+    if args.model_type:
+        global_episodic_return_vlm: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
+        reward_track = np.array([0. for _ in range(NUM_TASKS)])
+        offset = None
     if args.model_type == 'S3D':
         from s3dg import S3D
         S3D_PATH = '/home/reggiemclean/rf_smoothness/s3d/'
@@ -774,10 +781,64 @@ if __name__ == "__main__":
         text_tokens = torch.stack(text_tokens).to(device).squeeze(1)
         with torch.no_grad():
             text_embedding = model(input=text_tokens, modality="text")
-        # compute LIV value
+    elif args.model_type == 'VLC':
+        MW_DATA_DIR = "/home/reggiemclean/data/metaworld/mw50_videos"
+        CAPTION_PATH = MW_DATA_DIR
+        REWARD_CKPT_DIR = "/home/reggiemclean/VLC_RL/vlc_ckpts/"
+        DATA_PATH = MW_DATA_DIR
+        EXP_DIR = "/home/reggiemclean"
+
+        def _transform(n_px):
+            return Compose(
+            [
+                Resize(n_px, interpolation=Image.Resampling.BICUBIC),
+                CenterCrop(n_px),
+                lambda image: image.convert("RGB"),
+                ToTensor(),
+                    Normalize(
+                    (0.48145466, 0.4578275, 0.40821073),
+                    (0.26862954, 0.26130258, 0.27577711),
+                    ),
+                ]
+            )
+
+
+        def load_vlc_args(vlc_ckpt):
+            init_model_path = os.path.join(REWARD_CKPT_DIR, vlc_ckpt)
+            vlc_args_path = os.path.join(init_model_path + '_config.pkl')
+            with open(vlc_args_path, 'rb') as f:
+                vlc_args = pickle.load(f)['args']
+            vlc_args.init_model = init_model_path
+            vlc_args.resume_from_latest = False
+            return vlc_args
+
+        vlc_args = load_vlc_args('ckpt_mw50_retrank33_tigt_negonly_a_rf_1__pytorch_model.bin.20')
+        model = RewardCalculator(args=vlc_args)
+        model.model.eval()
+
+        frame_history = torch.zeros((10, 500, 3, 224, 224)).to('cuda:0')
+        pairs = []
+        masks = []
+        segments = []
+        video_ids = []
+        for desc in mt10_descs:
+            pairs_text, pairs_mask, pairs_segment, choice_video_ids = model.dataloader._get_text(video_id=0, caption=desc)
+            pairs.append(pairs_text[0])
+            masks.append(pairs_mask[0])
+            segments.append(pairs_segment[0])
+            video_ids.append(choice_video_ids[0])
+
+        pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs)).to('cuda:0'), torch.from_numpy(np.asarray(masks)).to('cuda:0'), torch.from_numpy(np.asarray(segments)).to('cuda:0'), torch.from_numpy(np.asarray(video_ids)).to('cuda:0')
+        new_images = torch.zeros((10, 500, 3, 224, 224))
+        transform = _transform(224)
+
+
+    
 
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
+        step_metrics = {}
+
         act_params = {}
         cri_params= {}
         for k in agent.actor.params['params']:
@@ -786,16 +847,8 @@ if __name__ == "__main__":
         for k in agent.critic.params['params']['VmapCritic_0']:
             if 'Dense' in k:
                 cri_params[f'critic_{k}'] = np.float64(jnp.linalg.norm(agent.critic.params['params']['VmapCritic_0'][k]['kernel']))
-
-        if args.track:
-            wandb.log(act_params, commit=False)
-            wandb.log(cri_params, commit=False)
-        if global_step % args.max_episode_steps == 0:
-             if global_step > args.learning_starts:
-                 reward_dict = {}
-                 for i in range(NUM_TASKS):
-                     reward_dict[f"charts/{env_names[i]}_real_reward_change_per_unit_displace"] = derivatives[i]/args.max_episode_steps
-             derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
+        step_metrics['actor_params'] = act_params
+        step_metrics['critic_params'] = cri_params
 
         total_steps = global_step * NUM_TASKS
 
@@ -815,7 +868,7 @@ if __name__ == "__main__":
             frames = envs.call('render')
 
         if args.model_type == 'S3D':
-            frame_history[global_step % args.max_episode_steps] = torch.from_numpy(preprocess_metaworld(list(frames))).to('cuda:0')
+            frame_history[global_step % args.max_episode_steps] = torch.from_numpy(preprocess_metaworld(list(frames))).to('cuda:0')/255.0
             linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int)
             video = frame_history[linspace, :, :, :, :].permute(1, 4, 0, 2, 3).float()
             og_rewards = rewards.copy()
@@ -828,6 +881,36 @@ if __name__ == "__main__":
             with torch.no_grad():
                 img_embed = model(input=frames, modality='vision')
             rewards = model.module.sim(img_embed, text_embedding).cpu().numpy()
+        elif args.model_type == 'VLC':
+            for idx, f in enumerate(frames):
+                frame_history[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(f.astype(np.uint8))).to('cuda:0')
+            batches = torch.zeros((envs.num_envs, 1, model.dataloader.max_frames, 1, 3, 224, 224))
+
+            images = np.linspace(0, global_step % args.max_episode_steps, vlc_args.max_frames, dtype=int)
+
+
+            # torch.Size([10, 1, 12, 1, 3, 224, 224])
+            curr_video = frame_history[:, images].unsqueeze(1).unsqueeze(3)
+            # torch.Size([10, 12, 3, 224, 224])
+            with torch.no_grad():
+                num_frames = len(images)
+                num_padded = model.dataloader.max_frames - num_frames
+                video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(envs.num_envs, 1, 1).to('cuda:0')
+                a, b = model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, curr_video, video_mask)
+                scores = model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=model.model.loose_type)[0]
+            video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
+            final_scores = torch.zeros(envs.num_envs)
+            for idx in range(envs.num_envs):
+                final_scores[idx] = scores[0, idx, video_lengths[idx]]
+
+            rewards = final_scores.numpy()
+            if global_step % args.max_episode_steps == 0:
+                offset = rewards.copy()
+            if args.reward_offset:
+                rewards -= offset
+            if 'success' in infos:
+                success = infos['success'] * args.sparse_reward
+                rewards += success
 
         if args.normalize_rewards_env:
             terminated = 1 - terminations
@@ -864,6 +947,12 @@ if __name__ == "__main__":
 
         if not args.reward_filter:
              rb.add(obs, real_next_obs, actions, rewards, terminations)
+             if args.model_type:
+                 reward_track += rewards
+                 if global_step > 0 and global_step % args.max_episode_steps == 0:
+                     for i in range(NUM_TASKS):
+                         global_episodic_return_vlm.append(reward_track[i])
+                     reward_track = np.array([0. for _ in range(NUM_TASKS)])
         else:
             next_done = np.logical_or(truncations, terminations)
 
@@ -882,7 +971,7 @@ if __name__ == "__main__":
                before_rewards = np.mean(rewards_buffer, axis=0)
                if args.track:
                    for i in range(envs.num_envs):
-                       wandb.log({f'Mean before smoothing env {i}':before_rewards[i]}, commit=False)
+                       step_metrics[f'Mean before smoothing env {i}'] = before_rewards[i]
                if args.reward_filter == 'gaussian':
                    rewards = gaussian_filter1d(rewards_buffer, args.sigma, mode=args.filter_mode,
                                            axis=0)
@@ -916,7 +1005,7 @@ if __name__ == "__main__":
 
                if args.track:
                    for i in range(envs.num_envs):
-                       wandb.log({f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace":smoothing_change[i] / args.max_episode_steps}, commit=False)
+                       step_metrics[f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace"] = smoothing_change[i] / args.max_episode_steps
 
                if args.normalize_rewards:
                    terminated = 1 - terminations
@@ -929,7 +1018,7 @@ if __name__ == "__main__":
                after_rewards = np.mean(rewards_buffer, axis=0)
                if args.track:
                    for i in range(envs.num_envs):
-                       wandb.log({f'Mean after smoothing env {i}': after_rewards[i]}, commit=False)
+                       step_metrics[f'Mean after smoothing env {i}'] = after_rewards[i]
 
                for i in range(args.max_episode_steps):
                    rb.add(
@@ -947,12 +1036,12 @@ if __name__ == "__main__":
 
 
            print(
-               f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
+               f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}, mean_vlm_reward={np.mean(list(global_episodic_return_vlm))}"
            )
            if args.track:
-               wandb.log({"charts/mean_episodic_return": np.mean(list(global_episodic_return))}, commit=False)
-               wandb.log({"charts/mean_episodic_length": np.mean(list(global_episodic_length))}, commit=global_step < args.learning_starts)
-
+               step_metrics["charts/mean_episodic_return"] = np.mean(list(global_episodic_return))
+               step_metrics["charts/mean_episodic_length"] = np.mean(list(global_episodic_length))
+               step_metrics['charts/mean_vlm_reward'] = np.mean(list(global_episodic_return_vlm))
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts and global_episodic_return:
@@ -1009,13 +1098,9 @@ if __name__ == "__main__":
                     for i, (env_name, _) in enumerate(benchmark.train_classes.items())
                 }
                 if args.track:
-                    print(np.array(returns))
-                    wandb.log({f'returns env {idx}': np.array(returns)[idx] for idx in range(len(np.array(returns)))}, commit=False)
-                    wandb.log({f'rms mean env {idx}': return_rms.mean[idx] for idx in range(len(return_rms.mean))}, commit=False)
-                    wandb.log({f'rms mean env {idx}': return_rms.var[idx] for idx in range(len(return_rms.var))}, commit=False)
-                    wandb.log({'rms count': return_rms.count}, commit=False)
-                    wandb.log(logs, commit=False)
-                    wandb.log(eval_metrics)
+                    step_metrics.update(logs)
+                    step_metrics.update(eval_metrics)
+
                 print(
                     f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                     + f" return: {eval_returns:.4f}"
@@ -1035,7 +1120,7 @@ if __name__ == "__main__":
                     )
                     print(f"model saved to {ckpt_manager.directory}")
 
-    print(return_rms.var, return_rms.mean, return_rms.count)
-
+        if args.track:
+            wandb.log(step_metrics, step=global_step)
     envs.close()
     writer.close()
