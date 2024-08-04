@@ -10,9 +10,9 @@ from distutils.util import strtobool
 from functools import partial
 from typing import Deque, NamedTuple, Optional, Tuple, Union, Type
 
-# os.environ[
-#     "XLA_PYTHON_CLIENT_MEM_FRACTION"
-# ] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+os.environ[
+     "XLA_PYTHON_CLIENT_MEM_FRACTION"
+] = "0.05"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
 
 from argparse import Namespace
 import distrax
@@ -36,11 +36,11 @@ from torch.utils.tensorboard import SummaryWriter
 from clip4clip.reward import RewardCalculator
 import torch
 import pickle
-
+import multiprocessing as mp
 
 def load_c4c_args(c4c_ckpt):
     init_model_path = os.path.join(REWARD_CKPT_DIR, c4c_ckpt)
-    c4c_args_path = os.path.join(init_model_path + '_eval.pkl')
+    c4c_args_path = os.path.join(init_model_path + '_config.pkl')
     with open(c4c_args_path, 'rb') as f:
         c4c_args = pickle.load(f)['args']
     c4c_args.init_model = init_model_path
@@ -146,8 +146,6 @@ def _make_envs_common(
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
-            trigger = lambda t: t % 10 == 0
-            env = gym.wrappers.RecordVideo(env, os.path.join(EXP_DIR, f'runs/{run_name}/eval_videos'), episode_trigger=trigger)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
@@ -554,6 +552,7 @@ def update_mean_var_count_from_moments(
 
 # Training loop
 if __name__ == "__main__":
+    mp.set_start_method('spawn')
     args, c4c_args = parse_args()
     run_name = f"{args.env_id}_{args.exp_name}_rbfix"
     if args.reward_normalization_offset:
@@ -669,11 +668,15 @@ if __name__ == "__main__":
         reward_model = RewardCalculator(args=c4c_args)
         reward_model.model.eval()
 
-        frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224))
+        frames = torch.zeros((args.num_envs, args.max_episode_steps, 3, 224, 224)).to('cuda:0')
+
+        print(CAPTION_PATH)
 
         with open(f'{CAPTION_PATH}/raw-captions.pkl', 'rb') as f:
             descriptions = pickle.load(f)
+
         task_desc = [v for k, v in descriptions.items() if 'success_videos__' + args.env_id in k][0][0]
+        print(task_desc)
         task_desc = " ".join(task_desc)
         print('Caption:', task_desc)
         del descriptions
@@ -725,8 +728,12 @@ if __name__ == "__main__":
             current_frames = envs.call('render')
 
             for idx, f in enumerate(current_frames):
-                frames[idx, current_t] = transform(Image.fromarray(np.rot90(np.rot90(f).astype(np.uint8))))
-            batches = torch.zeros((args.num_envs, 1, reward_model.dataloader.max_frames, 1, 3, 224, 224))
+                float_f = f/255.0
+                noise = np.random.rand(224, 224, 3) * 0.2
+                int_f = ((float_f + noise) * 255).astype(np.uint8)
+                numpy_frame = np.rot90(np.rot90(int_f).astype(np.uint8))
+                frames[idx, current_t] = transform(Image.fromarray(numpy_frame)).to('cuda:0')
+            batches = torch.zeros((args.num_envs, 1, reward_model.dataloader.max_frames, 1, 3, 224, 224)).to('cuda:0')
 
             offset_timestep = 0 if args.predict_for_partial_videos else reward_model.dataloader.max_frames - 1
             if current_t >= offset_timestep:
@@ -750,7 +757,7 @@ if __name__ == "__main__":
                         num_frames = len(images)
                         num_padded = reward_model.dataloader.max_frames - num_frames
                         video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(args.num_envs, 1, 1).to('cuda:0')
-                        a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches.to('cuda:0'), video_mask)
+                        a, b = reward_model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, batches, video_mask)
                         scores = reward_model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=reward_model.model.loose_type)[0]
                     if len(scores.shape) > 2:
                         video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
@@ -924,12 +931,12 @@ if __name__ == "__main__":
             if global_step % 1000 == 0:
                 for _key, value in logs.items():
                     writer.add_scalar(_key, value, total_steps)
-                # print("SPS:", int(total_steps / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(total_steps / (time.time() - start_time)),
-                    total_steps,
-                )
+                print("SPS:", int(total_steps / (time.time() - start_time)))
+                #writer.add_scalar(
+                #    "charts/SPS",
+                #    int(total_steps / (time.time() - start_time)),
+                #    total_steps,
+                #)
 
             # Evaluation
             if total_steps % args.evaluation_frequency == 0 and global_step > 0:
