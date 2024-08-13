@@ -77,6 +77,31 @@ class MultiTaskReplayBuffer:
         self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
         self.pos = 0
 
+    def checkpoint(self) -> dict:
+        return {
+            "obs": self.obs,
+            "actions": self.actions,
+            "rewards": self.rewards,
+            "next_obs": self.next_obs,
+            "dones": self.dones,
+            "pos": self.pos,
+            "full": self.full,
+            "rng_state": self._rng.__getstate__()
+        }
+
+    def load_checkpoint(self, ckpt: dict) -> None:
+        for key in ["obs", "actions", "rewards", "next_obs", "dones", "pos", "full", "rng_state"]:
+            assert key in ckpt
+
+        self.obs = ckpt["obs"]
+        self.actions = ckpt["actions"]
+        self.rewards = ckpt["rewards"]
+        self.next_obs = ckpt["next_obs"]
+        self.dones = ckpt["dones"]
+        self.pos = ckpt["pos"]
+        self.full = ckpt["full"]
+        self._rng.__setstate__(ckpt["rng_state"])
+
 
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):
         """Add a batch of samples to the buffer.

@@ -713,6 +713,8 @@ if __name__ == "__main__":
                 if args.save_model:
                     ckpt = agent.get_ckpt()
                     ckpt["rng_key"] = key
+                    ckpt["python_rng_state"] = random.getstate()
+                    ckpt["global_numpy_rng_state"] = np.random.get_state()
                     ckpt["global_step"] = global_step
                     save_args = orbax_utils.save_args_from_target(ckpt)
                     ckpt_manager.save(

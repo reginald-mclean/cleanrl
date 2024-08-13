@@ -14,7 +14,7 @@ def _make_envs_common(
     max_episode_steps: Optional[int] = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
-    reward_func_version: str = 'v2'
+    reward_func_version: str = "v2",
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
         env = env_cls(reward_func_version=reward_func_version)
@@ -37,6 +37,18 @@ def _make_envs_common(
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
         ]
     )
+
+
+# TODO a nice system for checkpointing envs
+# The problem / where I got stuck is that you can't really pass individual args to individual envs in asyncvectorenv.call()
+# Maybe a good solution would be to give each env an ID through some wrapper (?) that is like
+# env_cls + env_id + whatever and each env is responsible for retrieving its checkpoint from either the disc directly or from some broadcast input
+
+# def checkpoint_envs(envs: gym.vector.VectorEnv) -> list[dict]:
+#     return envs.call("get_checkpoint")
+
+# def load_env_checkpoints(envs: gym.vector.VectorEnv, env_ckpts: list[dict]):
+#     envs.call
 
 
 make_envs = partial(_make_envs_common, terminate_on_success=False)
