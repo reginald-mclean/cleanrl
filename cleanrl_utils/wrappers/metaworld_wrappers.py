@@ -7,12 +7,11 @@ from gymnasium import Env
 from gymnasium.spaces import Box, Space
 from gymnasium.vector.utils import concatenate, create_empty_array, iterate
 from gymnasium.vector.vector_env import VectorEnv
-from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
-from gymnasium.wrappers.time_limit import TimeLimit
+from gymnasium.wrappers import RecordEpisodeStatistics, TimeLimit
+from metaworld.envs.mujoco.sawyer_xyz import SawyerXYZEnv
+from metaworld.types import Task
 from numpy.typing import NDArray
 
-from metaworld.types import Task
-from metaworld.envs.mujoco.sawyer_xyz import SawyerXYZEnv
 
 class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: Env, task_idx: int, num_tasks: int):
@@ -49,7 +48,9 @@ class RandomTaskSelectWrapper(gym.Wrapper):
         task_idx = self.np_random.choice(len(self.tasks))
         self.unwrapped.set_task(self.tasks[task_idx])
 
-    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = True):
+    def __init__(
+        self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = True
+    ):
         super().__init__(env)
         self.tasks = tasks
         self.sample_tasks_on_reset = sample_tasks_on_reset
@@ -57,14 +58,37 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         if self.sample_tasks_on_reset:
             self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
-    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def sample_tasks(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
+    
+    def get_checkpoint(self) -> dict:
+        return {
+            "tasks": self.tasks,
+            "rng_state": self.np_random.__getstate__(),
+            "sample_tasks_on_reset": self.sample_tasks_on_reset,
+            "env_rng_state": get_env_rng_checkpoint(self.unwrapped),
+        }
+
+    def load_checkpoint(self, ckpt: dict):
+        assert "tasks" in ckpt
+        assert "rng_state" in ckpt
+        assert "sample_tasks_on_reset" in ckpt
+        assert "env_rng_state" in ckpt
+
+        self.tasks = ckpt["tasks"]
+        self.np_random.__setstate__(ckpt["rng_state"])
+        self.sample_tasks_on_reset = ckpt["sample_tasks_on_reset"]
+        set_env_rng(self.unwrapped, ckpt["env_rng_state"])
 
 
 class PseudoRandomTaskSelectWrapper(gym.Wrapper):
@@ -89,18 +113,24 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
     def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
-    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = False):
+    def __init__(
+        self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = False
+    ):
         super().__init__(env)
         self.sample_tasks_on_reset = sample_tasks_on_reset
         self.tasks = tasks
         self.current_task_idx = -1
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         if self.sample_tasks_on_reset:
             self._set_pseudo_random_task()
         return self.env.reset(seed=seed, options=options)
 
-    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+    def sample_tasks(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ):
         self._set_pseudo_random_task()
         return self.env.reset(seed=seed, options=options)
 
@@ -109,7 +139,7 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
             "tasks": self.tasks,
             "current_task_idx": self.current_task_idx,
             "sample_tasks_on_reset": self.sample_tasks_on_reset,
-            "env_rng_state": get_env_rng_checkpoint(self.unwrapped)
+            "env_rng_state": get_env_rng_checkpoint(self.unwrapped),
         }
 
     def load_checkpoint(self, ckpt: dict):
@@ -122,6 +152,7 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
         self.current_task_idx = ckpt["current_task_idx"]
         self.sample_tasks_on_reset = ckpt["sample_tasks_on_reset"]
         set_env_rng(self.unwrapped, ckpt["env_rng_state"])
+
 
 class AutoTerminateOnSuccessWrapper(gym.Wrapper):
     """A Gymnasium Wrapper to automatically output a termination signal when the environment's task is solved.
@@ -148,24 +179,34 @@ class AutoTerminateOnSuccessWrapper(gym.Wrapper):
             terminated = info["success"] == 1.0
         return obs, reward, terminated, truncated, info
 
-    def get_checkpoint(self) -> dict:
-        return {
-            "tasks": self.tasks,
-            "rng_state": self.np_random.__getstate__(),
-            "sample_tasks_on_reset": self.sample_tasks_on_reset,
-            "env_rng_state": get_env_rng_checkpoint(self.unwrapped)
-        }
 
-    def load_checkpoint(self, ckpt: dict):
-        assert "tasks" in ckpt
-        assert "rng_state" in ckpt
-        assert "sample_tasks_on_reset" in ckpt
-        assert "env_rng_state" in ckpt
+class CheckpointWrapper(gym.Wrapper):
+    env_id: str
 
-        self.tasks = ckpt["tasks"]
-        self.np_random.__setstate__(ckpt["rng_state"])
-        self.sample_tasks_on_reset = ckpt["sample_tasks_on_reset"]
-        set_env_rng(self.unwrapped, ckpt["env_rng_state"])
+    def __init__(self, env: Env, env_id: str):
+        super().__init__(env)
+        assert hasattr(self.env, "get_checkpoint") and callable(self.env.get_checkpoint)
+        assert hasattr(self.env, "load_checkpoint") and callable(
+            self.env.load_checkpoint
+        )
+        self.env_id = env_id
+
+    def get_checkpoint(self) -> tuple[str, dict]:
+        ckpt: dict = self.env.get_checkpoint()
+        return (self.env_id, ckpt)
+
+    def load_checkpoint(self, ckpts: list[tuple[str, dict]]) -> None:
+        my_ckpt = None
+        for env_id, ckpt in ckpts:
+            if env_id == self.env_id:
+                my_ckpt = ckpt
+                break
+        if my_ckpt is None:
+            raise ValueError(
+                f"Could not load checkpoint, no checkpoint found with id {self.env_id}. Checkpoint IDs: ",
+                [env_id for env_id, _ in ckpts],
+            )
+        self.env.load_checkpoint(my_ckpt)
 
 
 def get_env_rng_checkpoint(env: SawyerXYZEnv) -> dict[str, dict]:
@@ -188,13 +229,16 @@ def set_env_rng(env: SawyerXYZEnv, state: dict[str, dict]) -> None:
     env.observation_space.np_random.__setstate__(state["obs_space_rng_state"])
     env.goal_space.np_random.__setstate__(state["goal_space_rng_state"])
 
+
 # ---- Kept for compatibility ----
 class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
     def __init__(self, env: gym.Env, task_idx: int, num_envs: int):
         gym.utils.RecordConstructorArgs.__init__(self)
         gym.Wrapper.__init__(self, env)
         # self.env = env
-        assert task_idx < num_envs, "The task idx of an env cannot be greater than or equal to the number of envs"
+        assert (
+            task_idx < num_envs
+        ), "The task idx of an env cannot be greater than or equal to the number of envs"
         self.one_hot = np.zeros(num_envs)
         self.one_hot[task_idx] = 1
 
@@ -258,7 +302,9 @@ class SyncVectorEnv(VectorEnv):
             self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             if use_one_hot_wrapper:
-                env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
+                env = OneHotV0(
+                    env, self.env_names.index(env_name), len(self.env_fns.keys())
+                )
             env = TimeLimit(env, 500)
             env = RecordEpisodeStatistics(env)
             self.envs.append(env)
@@ -283,7 +329,9 @@ class SyncVectorEnv(VectorEnv):
         )
 
         self._check_spaces()
-        self.observations = create_empty_array(self.single_observation_space, n=self.num_envs, fn=np.zeros)
+        self.observations = create_empty_array(
+            self.single_observation_space, n=self.num_envs, fn=np.zeros
+        )
         self._rewards = np.zeros((self.num_envs,), dtype=np.float64)
         self._terminateds = np.zeros((self.num_envs,), dtype=np.bool_)
         self._truncateds = np.zeros((self.num_envs,), dtype=np.bool_)
@@ -338,13 +386,17 @@ class SyncVectorEnv(VectorEnv):
             # need to set task first
             env_name = self.env_names[i]
             _, _ = env.reset()
-            self.current_tasks[env_name] = (self.current_tasks[env_name] + 1) % len(self.tasks[env_name])
+            self.current_tasks[env_name] = (self.current_tasks[env_name] + 1) % len(
+                self.tasks[env_name]
+            )
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             observation, info = env.reset(**kwargs)
             observations.append(observation)
             infos = self._add_info(infos, info, i)
 
-        self.observations = concatenate(self.single_observation_space, observations, self.observations)
+        self.observations = concatenate(
+            self.single_observation_space, observations, self.observations
+        )
         return (deepcopy(self.observations) if self.copy else self.observations), infos
 
     def step_async(self, actions):
@@ -372,14 +424,18 @@ class SyncVectorEnv(VectorEnv):
                 # select new task
                 env_name = self.env_names[i]
                 _, _ = env.reset()
-                self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
+                self.current_tasks[env_name] = np.random.choice(
+                    len(self.tasks[env_name])
+                )
                 env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
                 observation, info = env.reset()
                 info["final_observation"] = old_observation
                 info["final_info"] = old_info
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(self.single_observation_space, observations, self.observations)
+        self.observations = concatenate(
+            self.single_observation_space, observations, self.observations
+        )
 
         return (
             deepcopy(self.observations) if self.copy else self.observations,
@@ -449,6 +505,7 @@ class SyncVectorEnv(VectorEnv):
 
         return True
 
+
 # https://github.com/rlworkgroup/garage/blob/master/src/garage/tf/algos/rl2.py#L22
 class RL2Env(gym.Wrapper):
     """Environment wrapper for RL2.
@@ -471,7 +528,9 @@ class RL2Env(gym.Wrapper):
     def step(self, action):
         next_state, reward, terminate, truncate, info = self.env.step(action)
         # NOTE: only include terminate flag
-        rl2_next_state = np.concatenate([next_state, action, [reward], [float(terminate)]])
+        rl2_next_state = np.concatenate(
+            [next_state, action, [reward], [float(terminate)]]
+        )
         return rl2_next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):

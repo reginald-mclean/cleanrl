@@ -4,8 +4,9 @@ from typing import Optional, Type
 
 import gymnasium as gym  # type: ignore
 import metaworld  # type: ignore
-from cleanrl_utils.wrappers import metaworld_wrappers
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 def _make_envs_common(
@@ -14,10 +15,13 @@ def _make_envs_common(
     max_episode_steps: Optional[int] = None,
     use_one_hot: bool = True,
     terminate_on_success: bool = False,
-    reward_func_version: str = "v2",
+    reward_func_version: str | None = None,
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        env = env_cls(reward_func_version=reward_func_version)
+        if reward_func_version is not None:
+            env = env_cls(reward_func_version=reward_func_version)
+        else:
+            env = env_cls()
         env = gym.wrappers.TimeLimit(env, max_episode_steps or env.max_path_length)
         if terminate_on_success:
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
@@ -28,6 +32,7 @@ def _make_envs_common(
             )
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
+        env = metaworld_wrappers.CheckpointWrapper(env, f"{name}_{env_id}")
         env.action_space.seed(seed)
         return env
 
@@ -39,16 +44,12 @@ def _make_envs_common(
     )
 
 
-# TODO a nice system for checkpointing envs
-# The problem / where I got stuck is that you can't really pass individual args to individual envs in asyncvectorenv.call()
-# Maybe a good solution would be to give each env an ID through some wrapper (?) that is like
-# env_cls + env_id + whatever and each env is responsible for retrieving its checkpoint from either the disc directly or from some broadcast input
+def checkpoint_envs(envs: gym.vector.VectorEnv) -> list[tuple[str, dict]]:
+    return envs.call("get_checkpoint")
 
-# def checkpoint_envs(envs: gym.vector.VectorEnv) -> list[dict]:
-#     return envs.call("get_checkpoint")
 
-# def load_env_checkpoints(envs: gym.vector.VectorEnv, env_ckpts: list[dict]):
-#     envs.call
+def load_env_checkpoints(envs: gym.vector.VectorEnv, env_ckpts: list[tuple[str, dict]]):
+    envs.call("load_checkpoint", env_ckpts)
 
 
 make_envs = partial(_make_envs_common, terminate_on_success=False)
