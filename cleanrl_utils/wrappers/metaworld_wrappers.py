@@ -1,3 +1,4 @@
+import base64
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -37,6 +38,21 @@ class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         return np.concatenate([obs, self.one_hot])
 
 
+def _serialize_task(task: Task) -> dict:
+    return {
+        "env_name": task.env_name,
+        "data": base64.b64encode(task.data).decode("ascii"),
+    }
+
+
+def _deserialize_task(task_dict: dict[str, str]) -> Task:
+    assert "env_name" in task_dict and "data" in task_dict
+
+    return Task(
+        env_name=task_dict["env_name"], data=base64.b64decode(task_dict["data"])
+    )
+
+
 class RandomTaskSelectWrapper(gym.Wrapper):
     """A Gymnasium Wrapper to automatically set / reset the environment to a random
     task."""
@@ -70,10 +86,10 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     ):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
-    
+
     def get_checkpoint(self) -> dict:
         return {
-            "tasks": self.tasks,
+            "tasks": [_serialize_task(task) for task in self.tasks],
             "rng_state": self.np_random.__getstate__(),
             "sample_tasks_on_reset": self.sample_tasks_on_reset,
             "env_rng_state": get_env_rng_checkpoint(self.unwrapped),
@@ -85,7 +101,7 @@ class RandomTaskSelectWrapper(gym.Wrapper):
         assert "sample_tasks_on_reset" in ckpt
         assert "env_rng_state" in ckpt
 
-        self.tasks = ckpt["tasks"]
+        self.tasks = [_deserialize_task(task) for task in ckpt["tasks"]]
         self.np_random.__setstate__(ckpt["rng_state"])
         self.sample_tasks_on_reset = ckpt["sample_tasks_on_reset"]
         set_env_rng(self.unwrapped, ckpt["env_rng_state"])
