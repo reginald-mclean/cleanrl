@@ -355,7 +355,7 @@ class Agent:
     def load_checkpoint(self, ckpt: dict) -> None:
         self.actor = ckpt["actor"]
         self.critic = ckpt["critic"]
-        self.alpha = ckpt["alpha"]
+        self.alpha_train_state = ckpt["alpha"]
         self.target_entropy = ckpt["target_entropy"]
 
 
@@ -499,8 +499,6 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
         import wandb
-
-        wandb.require("core")
 
         wandb.init(
             project=args.wandb_project_name,
