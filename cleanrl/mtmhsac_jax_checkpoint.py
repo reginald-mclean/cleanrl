@@ -495,6 +495,9 @@ def get_ckpt_restore_args(agent, buffer):
 
 # Training loop
 if __name__ == "__main__":
+    if jax.device_count("gpu") < 1:
+        raise RuntimeError("No GPUs found, aborting. Deviecs: %s" % jax.devices())
+
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
