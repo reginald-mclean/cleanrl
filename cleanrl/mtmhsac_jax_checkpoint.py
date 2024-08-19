@@ -49,8 +49,9 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default="reggies-phd-research",
         help="the entity (team) of wandb's project")
     parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to save model into the `runs/{run_name}` folder")
+        help="whether to save model into the checkpoint directory")
     parser.add_argument("--resume", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="whether to resume the experiment")
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("runs"), help="the checkpoint directory")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10", help="the id of the environment")
@@ -514,7 +515,7 @@ if __name__ == "__main__":
             save_code=True,
             resume="allow",
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(args.checkpoint_dir / f"{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -581,7 +582,7 @@ if __name__ == "__main__":
 
     if args.save_model:  # Orbax checkpoints
         ckpt_manager = ocp.CheckpointManager(
-            Path(f"runs/{run_name}/checkpoints").absolute(),
+            Path(args.checkpoint_dir / f"{run_name}/checkpoints").absolute(),
             item_names=(
                 "agent",
                 "buffer",
