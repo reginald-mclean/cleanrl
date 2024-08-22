@@ -720,7 +720,7 @@ if __name__ == "__main__":
                 and has_autoreset.any()
                 and global_step > 0
             ):
-                envs.set_attr("terminate_on_success", True)
+                envs.call("toggle_terminate_on_success", True)
                 (
                     eval_success_rate,
                     eval_returns,
@@ -730,7 +730,7 @@ if __name__ == "__main__":
                     eval_envs=envs,
                     num_episodes=args.evaluation_num_episodes,
                 )
-                envs.set_attr("terminate_on_success", False)
+                envs.call("toggle_terminate_on_success", False)
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
                     "charts/mean_evaluation_return": float(eval_returns),
@@ -745,6 +745,9 @@ if __name__ == "__main__":
                     f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                     + f" return: {eval_returns:.4f}"
                 )
+
+                # Reset envs again to exit eval mode
+                obs, _ = envs.reset()
 
                 # Checkpointing
                 if args.save_model:
