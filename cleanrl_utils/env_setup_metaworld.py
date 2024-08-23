@@ -40,7 +40,10 @@ def _make_envs_common(
         [
             partial(init_each_env, env_cls=env_cls, name=name, env_id=env_id)
             for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
-        ]
+        ],
+        shared_memory=True,
+        copy=False,
+        daemon=True,
     )
 
 

@@ -9,8 +9,6 @@ from functools import partial
 from pathlib import Path
 from typing import Deque, NamedTuple, Optional, Tuple, Union
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.1"
-
 import distrax  # type: ignore
 import flax
 import flax.linen as nn
