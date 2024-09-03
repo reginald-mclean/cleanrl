@@ -15,7 +15,7 @@ def evaluation(
     eval_envs: gym.vector.VectorEnv,
     num_episodes: int,
     task_names: Optional[List[str]] = None,
-) -> Tuple[float, float, npt.NDArray, jax.random.PRNGKey]:
+) -> Tuple[float, float, npt.NDArray]:
     print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
     if task_names is not None:

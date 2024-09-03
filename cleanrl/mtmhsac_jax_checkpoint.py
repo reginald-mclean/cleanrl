@@ -99,16 +99,6 @@ class Batch(NamedTuple):
     task_ids: ArrayLike
 
 
-class TanhNormal(distrax.Transformed):
-    def __init__(self, loc, scale):
-        normal_dist = distrax.Normal(loc, scale)
-        tanh_bijector = distrax.Tanh()
-        super().__init__(distribution=normal_dist, bijector=tanh_bijector)
-
-    def mean(self):
-        return self.bijector.forward(self.distribution.mean())
-
-
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
         return jax.random.uniform(
@@ -155,7 +145,10 @@ class Actor(nn.Module):
             bias_init=uniform_init(1e-3),
         )(x)
         log_sigma = jnp.clip(log_sigma, self.LOG_STD_MIN, self.LOG_STD_MAX)
-        return TanhNormal(mu, jnp.exp(log_sigma))
+        return distrax.Transformed(
+            distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma)),
+            distrax.Block(distrax.Tanh(), ndims=1),
+        )
 
 
 @jax.jit
@@ -192,7 +185,7 @@ def get_deterministic_action(
     task_ids: ArrayLike,
 ) -> jax.Array:
     dist = actor.apply_fn(actor.params, obs, task_ids)
-    return dist.mean()
+    return jnp.tanh(dist.distribution.loc)
 
 
 class Critic(nn.Module):
@@ -376,9 +369,9 @@ def update(
     )
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(q_values, axis=0).reshape(
-            -1, 1
-        ) - alpha_val * next_action_log_probs.sum(-1).reshape(-1, 1)
+        min_qf_next_target = jnp.min(
+            q_values, axis=0
+        ) - alpha_val * next_action_log_probs.reshape(-1, 1)
         next_q_value = jax.lax.stop_gradient(
             batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
         )
@@ -402,11 +395,11 @@ def update(
 
     def alpha_loss(params: jax.Array, log_probs: jax.Array):
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
-        return (-log_alpha * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
+        return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
     def update_alpha(
         _alpha: TrainState, log_probs: jax.Array
-    ) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
+    ) -> Tuple[TrainState, jax.Array, dict]:
         alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(
             _alpha.params, log_probs
         )
@@ -415,7 +408,10 @@ def update(
         return (
             _alpha,
             alpha_vals,
-            {"losses/alpha_loss": alpha_loss_value, "alpha": jnp.exp(_alpha.params).sum()},  # type: ignore
+            {
+                "losses/alpha_loss": alpha_loss_value,
+                "alpha": jnp.exp(_alpha.params).sum(),
+            },  # type: ignore
         )
 
     key, actor_loss_key = jax.random.split(key)
@@ -433,7 +429,7 @@ def update(
             _critic.params, batch.observations, action_samples, batch.task_ids
         )
         min_qf_values = jnp.min(q_values, axis=0)
-        return (_alpha_val * log_probs.sum(-1).reshape(-1, 1) - min_qf_values).mean(), (
+        return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (
             _alpha,
             _critic,
             logs,
