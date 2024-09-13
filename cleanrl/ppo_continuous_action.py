@@ -6,10 +6,12 @@ import time
 from distutils.util import strtobool
 import sys
 sys.path.append('/home/reggiemclean/cleanrl')
-
+import copy
 from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
+from typing import Deque, NamedTuple, Optional, Tuple, Union
+from collections import deque
 import gymnasium as gym
 import numpy as np
 import torch
@@ -19,6 +21,8 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.wrappers.vector_list_info import VectorListInfo
 import metaworld
+
+from scipy.ndimage import gaussian_filter1d, convolve1d
 
 def parse_args():
     # fmt: off
@@ -31,9 +35,9 @@ def parse_args():
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
     parser.add_argument("--cuda", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, cuda will be enabled by default")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="Meta-World Benchmarking (Updated)",
+    parser.add_argument("--wandb-project-name", type=str, default="Reward Smoothing",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default='reggies-phd-research',
         help="the entity (team) of wandb's project")
@@ -43,7 +47,6 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="MT10",
         help="the id of the environment")
-    parser.add_argument("--reward-version", type=str, default="v2", help="the reward function of the environment")
     parser.add_argument("--total-timesteps", type=int, default=2e7,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
@@ -80,6 +83,20 @@ def parse_args():
         help="how many updates to do before evaluating the agent")
     parser.add_argument("--evaluation-num-episodes", type=int, default=50,
         help="how many episodes per environment to run an evaluation for")
+    # reward smoothing
+    parser.add_argument("--reward-filter", type=str, default=None)
+    parser.add_argument('--filter-mode', type=str, default=None)
+    parser.add_argument('--sigma', type=float, default=None)
+    parser.add_argument('--alpha', type=float, default=0.0)
+    parser.add_argument('--delta', type=float, default=0.0)
+    parser.add_argument('--kernel-type', type=str, default=None)
+
+    # reward normalization
+    parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize after smoothing')
+
+    # reward version
+    parser.add_argument("--reward-version", default="v2", help="the reward function of the environment")
+
     args = parser.parse_args()
     
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -91,6 +108,45 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+class RunningMeanStd:
+    """Tracks the mean, variance and count of values."""
+
+    # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+    def __init__(self, epsilon=1e-4, shape=()):
+        """Tracks the mean, variance and count of values."""
+        self.mean = torch.zeros(shape).to('cuda:0')
+        self.var = torch.ones(shape).to('cuda:0')
+        self.count = epsilon
+
+    def update(self, x):
+        """Updates the mean, var and count from a batch of samples."""
+        batch_mean = torch.mean(x, axis=0)
+        batch_var = torch.var(x, axis=0)
+        batch_count = x.shape[0]
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Updates from batch mean, variance and count moments."""
+        self.mean, self.var, self.count = update_mean_var_count_from_moments(
+            self.mean, self.var, self.count, batch_mean, batch_var, batch_count
+        )
+
+def update_mean_var_count_from_moments(
+    mean, var, count, batch_mean, batch_var, batch_count
+):
+    """Updates the mean, var and count using the previous mean, var, count and batch values."""
+    delta = batch_mean - mean
+    tot_count = count + batch_count
+
+    new_mean = mean + delta * batch_count / tot_count
+    m_a = var * count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + torch.square(delta) * count * batch_count / tot_count
+    new_var = M2 / tot_count
+    new_count = tot_count
+
+    return new_mean, new_var, new_count
 
 
 class Agent(nn.Module):
@@ -142,6 +198,11 @@ if __name__ == "__main__":
 
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    SAVE_PATH = f"/reggieUSB/RewardSmoothing/runs/{run_name}"
+
+    if not os.path.exists(SAVE_PATH):
+        os.makedirs(SAVE_PATH)
+
     if args.track:
         import wandb
 
@@ -184,6 +245,8 @@ if __name__ == "__main__":
 
     args.num_envs = len(keys)
 
+    global_episodic_return: Deque[float] = deque([], maxlen=20 * args.num_envs)
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(torch.float32).to(device)
@@ -196,6 +259,9 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    terminations = torch.zeros((args.num_steps, args.num_envs), dtype=torch.int).to(device)
+
+
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -204,7 +270,16 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = int(args.total_timesteps // args.batch_size)
+    gamma = args.gamma
+    epsilon = 1e-8
+    e_returns = torch.zeros((envs.num_envs)).to(device)
+    return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
+    best_success = None
+    best_success_epoch = None
+
+    if args.delta:
+        args.delta = int(args.delta)
 
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
@@ -232,6 +307,11 @@ if __name__ == "__main__":
                 f"total_steps={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
+
+            if best_success is None or eval_success_rate > best_success:
+                best_success = eval_success_rate
+                torch.save(agent, f'{SAVE_PATH}/best.pth')
+
             envs.set_attr('terminate_on_success', False)
             next_obs, info = envs.reset()
             next_obs = torch.Tensor(next_obs).to(device)
@@ -259,6 +339,43 @@ if __name__ == "__main__":
             done = np.logical_or(terminated, truncated)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+            terminations[step] = torch.tensor(terminated).to(device)
+
+            # need to apply normalization & smoothing per every 500 steps/1 episode
+
+
+
+            if step > 0 and step % 500 == 499:
+               if args.reward_filter:
+                   if args.reward_filter == 'gaussian':
+                       rewards[(step-499):step+1, :] = gaussian_filter1d(rewards[(step-499):step, :], args.sigma, mode=args.filter_mode,
+                                           axis=0)
+                   elif args.reward_filter == 'exponential':
+                       rsmooth = np.zeros_like(rewards[(step-499):step, :])
+                       rsmooth[-1, :] = rewards[0, :]
+                       beta = 1 - args.alpha
+                       for i, rew_raw in enumerate(rewards[(step-499):step, :]):
+                           rsmooth[i, :] = args.alpha * rsmooth[i - 1, :] + beta * rew_raw
+                       rewards[(step-499):step, :] = copy.deepcopy(rsmooth)
+                   elif args.reward_filter == 'uniform':
+                       if args.kernel_type == 'uniform':
+                           filter = (1.0 / args.delta) * np.array([1] * args.delta)
+                       elif args.kernel_type == 'uniform_before':
+                           filter = (1.0/args.delta) * np.array([1] * args.delta + [0] * (args.delta-1))
+                       elif args.kernel_type == 'uniform_after':
+                           filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
+                       else:
+                           raise NotImplementedError('Invalid kernel type for uniform smoothing')
+                       rewards[(step-499):step, :] = torch.from_numpy(convolve1d(rewards[(step-499):step, :].cpu().numpy(), filter, mode=args.filter_mode, axis=0))
+
+               if args.normalize_rewards:
+                   terminated = 1 - terminations[(step-499):step, :]
+                   e_returns = e_returns * gamma * (1 - terminated) + rewards[(step-499):step, :]
+                   return_rms.update(e_returns)
+                   rewards[(step-499):step, :] = rewards[(step-499):step, :] / torch.sqrt(return_rms.var + epsilon)
+                   # rewards[(step-499):step, :] = np.asarray(rewards[(step-499):step, :])
+
+
 
             #print(infos)
 
@@ -270,12 +387,10 @@ if __name__ == "__main__":
                 # Skip the envs that are not done
                 if info is None:
                     continue
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                 #print(i, info)
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-
-        
+                global_episodic_return.append(info["episode"]["r"])
 
 
         # bootstrap value if not done
@@ -305,19 +420,15 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
+
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-                #print(mb_inds)
-                #print(min(b_inds), max(b_inds))
-                #print(type(b_obs))
-                #print(b_obs)
-                #print(obs.size())
-                #print(b_obs.size())
-                #print(b_obs[mb_inds], b_actions[mb_inds])
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -350,7 +461,7 @@ if __name__ == "__main__":
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-
+                
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
@@ -378,6 +489,13 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar('charts/VF_Values', np.mean(np.mean(values.cpu().numpy(), axis=1)), global_step)
+        print(
+            f"global_step={global_step}, mean_episodic_return={np.mean(list(global_episodic_return))}"
+        )
+
+        torch.save(agent, f'{SAVE_PATH}/{global_step}_model.pth')
+
 
     envs.close()
     writer.close()
