@@ -18,9 +18,8 @@ def _make_envs_common(
     normalize_rewards: bool = False
 ) -> gym.vector.VectorEnv:
     def init_each_env(env_cls: Type[SawyerXYZEnv], name: str, env_id: int) -> gym.Env:
-        rf_version = reward_func_version if isinstance(reward_func_version, str) else reward_func_version[env_id]
         if not isinstance(env_cls, TimeLimit):
-            env = env_cls(reward_func_version=reward_func_version, render_mode='rgb_array')
+            env = env_cls(reward_func_version=reward_func_version) #, render_mode='rgb_array')
             env = gym.wrappers.TimeLimit(env, 500)
         else:
             env = env_cls

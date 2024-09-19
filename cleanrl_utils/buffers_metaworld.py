@@ -53,9 +53,11 @@ class MultiTaskReplayBuffer:
         total_capacity: int,
         num_tasks: int,
         envs: gym.vector.VectorEnv,
-        use_torch: bool = True,
+        use_torch: bool = False,
         device: str = "cpu",
         seed: Optional[int] = None,
+        reward_normalization: bool = False,
+        reward_clip_coeff: float = -1.
     ):
         assert total_capacity % num_tasks == 0, "Total capacity must be divisible by the number of tasks."
         self.capacity = total_capacity // num_tasks
@@ -66,6 +68,9 @@ class MultiTaskReplayBuffer:
         self._obs_shape = np.array(envs.single_observation_space.shape).prod()
         self._action_shape = np.array(envs.single_action_space.shape).prod()
         self.full = False
+
+        self.reward_normalization = reward_normalization
+        self.reward_clip_coeff = reward_clip_coeff
         self.reset()  # Init buffer
 
     def reset(self):
@@ -78,11 +83,25 @@ class MultiTaskReplayBuffer:
         self.pos = 0
         self.full = False
 
+        if self.reward_normalization:
+            self.counters = np.zeros(self.num_tasks) # counts number of frames for each of the environment
+            self.first_moments = np.zeros(self.num_tasks, dtype=np.float32)
+            self.second_moments = np.ones(self.num_tasks, dtype=np.float32)
+            self.max_reward = np.ones(self.num_tasks, dtype=np.float32)*(-10000)
+
+
     def add(self, obs: npt.NDArray, next_obs: npt.NDArray, action: npt.NDArray, reward: npt.NDArray, done: npt.NDArray):
         """Add a batch of samples to the buffer.
 
         It is assumed that the observation has a one-hot task embedding as its suffix."""
         task_idx = obs[:, -self.num_tasks :].argmax(1)
+
+        if self.reward_normalization:
+            ctr = self.counters[task_idx]
+            self.first_moments[task_idx] = ctr / (ctr + 1) * self.first_moments[task_idx] + reward / (ctr + 1)
+            self.second_moments[task_idx] = ctr / (ctr + 1) * self.second_moments[task_idx] + (reward**2) / (ctr + 1)
+            self.counters[task_idx] += 1
+            self.max_reward = np.maximum(self.max_reward, reward)
 
         self.obs[self.pos, task_idx] = obs.copy()
         self.actions[self.pos, task_idx] = action.copy()
@@ -95,6 +114,10 @@ class MultiTaskReplayBuffer:
             self.full = True
 
         self.pos = self.pos % self.capacity
+
+    def get_reward_normalizer(self, env_indices):
+        var = self.second_moments[env_indices] - self.first_moments[env_indices]**2
+        return np.sqrt(var + 1e-8)
 
     def single_task_sample(self, task_idx: int, batch_size: int) -> ReplayBufferSamples:
         assert task_idx < self.num_tasks, "Task index out of bounds."
@@ -136,12 +159,28 @@ class MultiTaskReplayBuffer:
             size=(single_task_batch_size,),
         )
 
+        if self.reward_normalization:
+            task_idx = self.obs[sample_idx, :, -self.num_tasks :].argmax(1)
+            sigma = self.get_reward_normalizer(task_idx)
+
+            rewards = np.squeeze(self.rewards[sample_idx]) / sigma
+            rewards = rewards[:, :, np.newaxis]
+
+            np_env_indices = task_idx
+
+            if self.reward_clip_coeff > 0:
+                means = self.first_moments[np_env_indices]
+                if self.reward_normalisation:
+                    means = means/sigma
+                rewards = np.minimum(np.maximum(rewards, means-self.reward_clip_coeff), means+self.reward_clip_coeff)
+
+
         batch = (
             self.obs[sample_idx],
             self.actions[sample_idx],
             self.next_obs[sample_idx],
             self.dones[sample_idx],
-            self.rewards[sample_idx],
+            self.rewards[sample_idx] if not self.reward_normalization else rewards,
         )
 
         mt_batch_size = single_task_batch_size * self.num_tasks

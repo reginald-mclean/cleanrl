@@ -348,15 +348,15 @@ if __name__ == "__main__":
             if step > 0 and step % 500 == 499:
                if args.reward_filter:
                    if args.reward_filter == 'gaussian':
-                       rewards[(step-499):step+1, :] = gaussian_filter1d(rewards[(step-499):step, :], args.sigma, mode=args.filter_mode,
-                                           axis=0)
+                       rewards[(step-499):step, :] = torch.from_numpy(gaussian_filter1d(rewards[(step-499):step, :].cpu().numpy(), args.sigma, mode=args.filter_mode, axis=0))
                    elif args.reward_filter == 'exponential':
-                       rsmooth = np.zeros_like(rewards[(step-499):step, :])
-                       rsmooth[-1, :] = rewards[0, :]
+                       rewards_cpu = rewards[(step-499):step, :].cpu().numpy()
+                       rsmooth = np.zeros_like(rewards_cpu)
+                       rsmooth[-1, :] = rewards_cpu[0, :]
                        beta = 1 - args.alpha
-                       for i, rew_raw in enumerate(rewards[(step-499):step, :]):
+                       for i, rew_raw in enumerate(rewards_cpu):
                            rsmooth[i, :] = args.alpha * rsmooth[i - 1, :] + beta * rew_raw
-                       rewards[(step-499):step, :] = copy.deepcopy(rsmooth)
+                       rewards[(step-499):step, :] = torch.from_numpy(rsmooth).to(device)
                    elif args.reward_filter == 'uniform':
                        if args.kernel_type == 'uniform':
                            filter = (1.0 / args.delta) * np.array([1] * args.delta)

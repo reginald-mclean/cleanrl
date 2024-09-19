@@ -4,6 +4,8 @@ import sys
 sys.path.append('../cleanrl')
 import os
 
+from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper
+
 import paths
 import argparse
 import random
@@ -19,7 +21,6 @@ import flax.linen as nn
 import gymnasium as gym  # type: ignore
 import jax
 import jax.numpy as jnp
-import metaworld  # type: ignore
 import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
@@ -29,15 +30,11 @@ from cleanrl_utils.evals.metaworld_jax_eval import evaluation
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
-from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
+from torch.utils.tensorboard import SummaryWriter
 from scipy.ndimage import gaussian_filter1d, convolve1d
-from metaworld.envs.mujoco.env_dict import ALL_V2_ENVIRONMENTS, MT10_V2
-from metaworld import Benchmark, Task
 import pickle 
 import torch
-
-from matplotlib import pyplot as plt
-
+from dm_control import suite
 
 def parse_args():
     # fmt: off
@@ -62,12 +59,12 @@ def parse_args():
         help="total timesteps of the experiments *across all tasks*, the timesteps per task are this value / num_tasks")
     parser.add_argument("--max-episode-steps", type=int, default=500,
         help="maximum number of timesteps in one episode during training")
-    parser.add_argument("--buffer-size", type=int, default=int(1e6),
+    parser.add_argument("--buffer-size", type=int, default=int(6e5),
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005, help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=1280,
+    parser.add_argument("--batch-size", type=int, default=384,
                         help="the total size of the batch to sample from the replay memory. Must be divisible by number of tasks")
     parser.add_argument("--learning-starts", type=int, default=4e3, help="timestep to start learning")
     parser.add_argument("--evaluation-frequency", type=int, default=200_000,
@@ -97,18 +94,13 @@ def parse_args():
     # reward normalization
     parser.add_argument('--normalize-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize after smoothing')
     parser.add_argument('--normalize-rewards-env', type=lambda x: bool(strtobool(x)), default=False, help='use the normalization wrapper around each env')
-    parser.add_argument('--normalize-buffer-rewards', type=lambda x: bool(strtobool(x)), default=False, help='normalize rewards using whole reward buffer info')
-    parser.add_argument('--reward-clip-coeff', type=float, default=-1., help='clipping value for rewards in replay buffer')
 
 
-    # network normalization
-    parser.add_argument("--l2-reg-coef", type=float, default=0., help="")
-    parser.add_argument("--weight-decay-coef", type=float, default=0., help="")
-
-    # Vision Language Model Settings
     parser.add_argument('--model-type', type=str, default=None, help='what vlm reward model to use')
     parser.add_argument('--reward-offset', type=lambda x: bool(strtobool(x)), default=False, help='use first rewards in trajectory added as offset')
     parser.add_argument('--sparse-reward', type=int, default=0, help='the sparse reward to add when success is detected')
+
+    parser.add_argument('--sparse-smoothed', type=lambda x: bool(strtobool(x)), default=False, help='if this is enabled, the sparse reward will be smoothed, otherwise it will be added after smoothing but before normalization')
 
     args = parser.parse_args()
 
@@ -179,6 +171,7 @@ class Actor(nn.Module):
             + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         )
         x = jnp.take_along_axis(x, indices, axis=1)
+
         log_sigma = nn.Dense(
             self.num_actions,
             kernel_init=uniform_init(1e-3),
@@ -309,6 +302,7 @@ class Agent:
         random_action = jnp.array(
             [self._action_space.sample() for _ in range(init_obs.shape[0])]
         )
+
         def _make_optimizer(lr: float, max_grad_norm: float = 0.0):
             optim = optax.adam(learning_rate=lr)
             if max_grad_norm != 0:
@@ -386,7 +380,7 @@ class Agent:
         }
 
 
-'''@partial(jax.jit, static_argnames=("gamma", "target_entropy"))
+@partial(jax.jit, static_argnames=("gamma", "target_entropy"))
 def update(
     actor: TrainState,
     critic: CriticTrainState,
@@ -475,105 +469,6 @@ def update(
     actor = actor.apply_gradients(grads=actor_grads)
 
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
-'''
-
-@partial(jax.jit, static_argnames=("gamma", "target_entropy", "l2_coef", "weight_decay"))
-def update(
-    actor: TrainState,
-    critic: CriticTrainState,
-    alpha: TrainState,
-    batch: Batch,
-    target_entropy: float,
-    gamma: float,
-    l2_coef: float,
-    weight_decay: float,
-    key: jax.random.PRNGKeyArray,
-) -> Tuple[
-    Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray
-]:
-    next_actions, next_action_log_probs, key = sample_and_log_prob(
-        actor, actor.params, batch.next_observations, batch.task_ids, key
-    )
-    q_values = critic.apply_fn(
-        critic.target_params, batch.next_observations, next_actions, batch.task_ids
-    )
-
-    def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(q_values, axis=0).reshape(
-            -1, 1
-        ) - alpha_val * next_action_log_probs.sum(-1).reshape(-1, 1)
-        next_q_value = jax.lax.stop_gradient(
-            batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
-        )
-        q_pred = critic.apply_fn(
-            params, batch.observations, batch.actions, batch.task_ids
-        )
-        mse_loss = 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum()
-        return mse_loss, q_pred.mean()
-
-    def update_critic(
-        _critic: CriticTrainState, alpha_val: jax.Array
-    ) -> Tuple[CriticTrainState, dict]:
-        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(
-            critic_loss, has_aux=True
-        )(_critic.params, alpha_val)
-        _critic = _critic.apply_gradients(grads=critic_grads)
-
-        return _critic, {
-            "losses/qf_values": qf_values,
-            "losses/qf_loss": critic_loss_value,
-        }
-
-    def alpha_loss(params: jax.Array, log_probs: jax.Array):
-        log_alpha = batch.task_ids @ params.reshape(-1, 1)
-        return (-log_alpha * (log_probs.sum(-1).reshape(-1, 1) + target_entropy)).mean()
-
-    def update_alpha(
-        _alpha: TrainState, log_probs: jax.Array
-    ) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
-        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(
-            _alpha.params, log_probs
-        )
-        _alpha = _alpha.apply_gradients(grads=alpha_grads)
-        alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
-        return (
-            _alpha,
-            alpha_vals,
-            {"losses/alpha_loss": alpha_loss_value, "alpha": jnp.exp(_alpha.params).sum()},
-        )
-
-    key, actor_loss_key = jax.random.split(key)
-
-    def actor_loss(params: flax.core.FrozenDict):
-        action_samples, log_probs, _ = sample_and_log_prob(
-            actor, params, batch.observations, batch.task_ids, actor_loss_key
-        )
-        _alpha, _alpha_val, alpha_logs = update_alpha(alpha, log_probs)
-        _alpha_val = jax.lax.stop_gradient(_alpha_val)
-        _critic, critic_logs = update_critic(critic, _alpha_val)
-        logs = {**alpha_logs, **critic_logs}
-        q_values = _critic.apply_fn(
-            _critic.params, batch.observations, action_samples, batch.task_ids
-        )
-        min_qf_values = jnp.min(q_values, axis=0)
-        policy_loss = (_alpha_val * log_probs.sum(-1).reshape(-1, 1) - min_qf_values).mean()
-        l2_reg = l2_coef * sum(jnp.sum(jnp.square(p)) for p in jax.tree_util.tree_leaves(params))
-        return policy_loss + l2_reg, (
-            _alpha,
-            _critic,
-            logs,
-        )
-
-    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(
-        actor_loss, has_aux=True
-    )(actor.params)
-    actor = actor.apply_gradients(grads=actor_grads)
-    
-    # Apply weight decay
-    actor = actor.replace(params=jax.tree_map(lambda x: x * (1 - weight_decay), actor.params))
-
-    return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
-
 
 @flax.struct.dataclass
 class Storage:
@@ -662,26 +557,6 @@ def _make_tasks(classes, args_kwargs, kwargs_override, seed=None):
 
 
 
-class Modified_MT10(Benchmark):
-    def __init__(self, seed=None):
-        super().__init__()
-
-        env_names = ['button-press-v2', 'door-close-v2', 'door-unlock-v2', 'drawer-close-v2', 'drawer-open-v2', 'handle-press-side-v2', 'handle-press-v2', 'sweep-into-v2', 'window-close-v2', 'window-open-v2']
-        self._train_classes = {name: ALL_V2_ENVIRONMENTS[name] for name in env_names}
-        self._test_classes = {}
-
-        train_kwargs = {
-              key: dict(args=[],
-              kwargs={'task_id': list(ALL_V2_ENVIRONMENTS.keys()).index(key)})
-              for key in env_names
-        }
-
-        self._train_tasks = _make_tasks(self._train_classes, train_kwargs,
-                                        dict(partially_observable=False),
-                                        seed=seed)
-        self._test_tasks = []
-
-
 def preprocess_metaworld(frames, shorten=True):
     #(10, 480, 480, 3)
     center = 240, 320
@@ -699,7 +574,6 @@ def preprocess_metaworld(frames, shorten=True):
 # Training loop
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-
     args = parse_args()
     run_name = f"{args.exp_name}"
 
@@ -723,6 +597,7 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
+            #sync_tensorboard=True,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -736,7 +611,7 @@ if __name__ == "__main__":
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"/reggieUSB/RewardSmoothing/runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
+            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
         )
 
     # TRY NOT TO MODIFY: seeding
@@ -744,26 +619,40 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
 
-    # env setup
-    if args.env_id == "MT10":
-        benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == "Modified_MT10":
-        benchmark = Modified_MT10(seed=args.seed)
-    else:
-        benchmark = metaworld.MT1(args.env_id, seed=args.seed)
+    trigger = lambda x: x % 100 == 0
+    envs = gym.vector.SyncVectorEnv([lambda: gym.wrappers.RecordVideo(
+                                                 gym.wrappers.RecordEpisodeStatistics(
+                                                     gym.wrappers.TimeLimit(
+                                                         OneHotWrapper(
+                                                             suite.load('walker', 'run'), 0, 3
+                                                         ),
+                                                     1000),
+                                                 ),
+                                             video_folder='/home/reggiemclean/cleanrl/dmcontrol_videos/walker/run', episode_trigger=trigger
+                                             ),
+                                     lambda: gym.wrappers.RecordVideo(
+                                                 gym.wrappers.RecordEpisodeStatistics(
+                                                     gym.wrappers.TimeLimit(
+                                                         OneHotWrapper(
+                                                             suite.load('walker', 'walk'), 1, 3
+                                                         ),
+                                                     1000),
+                                                 ),
+                                             video_folder='/home/reggiemclean/cleanrl/dmcontrol_videos/walker/walk', episode_trigger=trigger
+                                             ),
+                                     lambda: gym.wrappers.RecordVideo(
+                                                 gym.wrappers.RecordEpisodeStatistics(
+                                                     gym.wrappers.TimeLimit(
+                                                         OneHotWrapper(
+                                                             suite.load('walker', 'stand'), 2, 3
+                                                         ),
+                                                     1000),
+                                                 ),
+                                             video_folder='/home/reggiemclean/cleanrl/dmcontrol_videos/walker/stand', episode_trigger=trigger
+                                             ),
+                                   ])
 
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    )
-
-    envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False #args.normalize_rewards_env # normalize-rewards-env
-    )
-    eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version, normalize_rewards=False
-    )
-
-    NUM_TASKS = len(benchmark.train_classes)
+    NUM_TASKS = 3 # len(3)
 
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
@@ -776,8 +665,6 @@ if __name__ == "__main__":
         envs=envs,
         use_torch=False,
         seed=args.seed,
-        reward_normalization=args.normalize_buffer_rewards,
-        reward_clip_coeff=args.reward_clip_coeff,
     )
 
     global_episodic_return: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
@@ -796,7 +683,7 @@ if __name__ == "__main__":
         clip_grad_norm=args.clip_grad_norm,
         init_key=key,
     )
-    env_names = list(benchmark.train_classes.keys())
+    env_names = ['walker-run', 'walker-stand', 'walker-walk']
 
     start_time = time.time()
     derivatives = np.asarray([0. for _ in range(NUM_TASKS)])
@@ -814,130 +701,11 @@ if __name__ == "__main__":
     returns = jnp.zeros(envs.num_envs)
     return_rms = RunningMeanStd(shape=(envs.num_envs, ))
 
-
-    if args.model_type is not None:
-        from PIL import Image
-        from video_language_critic.reward import RewardCalculator
-        from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-
-        with open('/home/reggiemclean/rf_smoothness/raw-captions.pkl', 'rb') as f:
-            instruction_mapping = pickle.load(f)
-
-        mt10_descs = []
-        print('getting descriptions')
-        for name in benchmark.train_classes:
-            cap = None
-            for x in range(50):
-                cap = instruction_mapping.get('success_videos__' + name + f'_{x}', None)
-                if cap:
-                    cap = ' '.join(cap[0])
-                    break
-            if not cap:
-                assert 1==2, 'cap is None'
-            mt10_descs.append(cap)
-        print(mt10_descs)
-        print(f'loading model {args.model_type}')
-
-        global_episodic_return_vlm: Deque[float] = deque([], maxlen=20 * NUM_TASKS)
-        reward_track = np.array([0. for _ in range(NUM_TASKS)])
-        offset = None
-    if args.model_type == 'S3D':
-        from s3dg import S3D
-        S3D_PATH = '/home/reggiemclean/rf_smoothness/s3d/'
-        model = S3D(f'{S3D_PATH}s3d_dict.npy', 512).float()
-        finetuned = torch.load(f'/home/reggiemclean/rf_smoothness/epoch0146.pth.tar')['state_dict'] # epoch0146.pth.tar loss of ~5.5
-        from collections import OrderedDict
-
-        new_state_dict = OrderedDict()
-
-        for k, v in finetuned.items():
-            name = k[7:]
-            new_state_dict[name] = v
-
-
-        model.load_state_dict(new_state_dict)
-        model.eval()
-        text_output = model.text_module(mt10_descs)
-        text_output = text_output['text_embedding'].to('cuda:0')
-        model = model.to('cuda:0')
-        frame_history = torch.zeros((500, envs.num_envs, 250, 250, 3)).to('cuda:0')
-    elif args.model_type == 'LIV':
-        import clip
-        import torch
-        import torchvision.transforms as T
-        from PIL import Image 
-
-        from liv import load_liv
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        model = load_liv()
-        model.eval()
-        transform = T.Compose([T.ToTensor()])
-        text_tokens = []
-        # pre-process image and text
-        for desc in mt10_descs:
-            text = clip.tokenize([desc]).to(device)
-            text_tokens.append(text)
-        text_tokens = torch.stack(text_tokens).to(device).squeeze(1)
-        with torch.no_grad():
-            text_embedding = model(input=text_tokens, modality="text")
-    elif args.model_type == 'VLC':
-        MW_DATA_DIR = "/home/reggiemclean/data/metaworld/mw50_videos"
-        CAPTION_PATH = MW_DATA_DIR
-        REWARD_CKPT_DIR = "/home/reggiemclean/VLC_RL/vlc_ckpts/"
-        DATA_PATH = MW_DATA_DIR
-        EXP_DIR = "/home/reggiemclean"
-
-        def _transform(n_px):
-            return Compose(
-            [
-                Resize(n_px, interpolation=Image.Resampling.BICUBIC),
-                CenterCrop(n_px),
-                lambda image: image.convert("RGB"),
-                ToTensor(),
-                    Normalize(
-                    (0.48145466, 0.4578275, 0.40821073),
-                    (0.26862954, 0.26130258, 0.27577711),
-                    ),
-                ]
-            )
-
-
-        def load_vlc_args(vlc_ckpt):
-            init_model_path = os.path.join(REWARD_CKPT_DIR, vlc_ckpt)
-            vlc_args_path = os.path.join(init_model_path + '_config.pkl')
-            with open(vlc_args_path, 'rb') as f:
-                vlc_args = pickle.load(f)['args']
-            vlc_args.init_model = init_model_path
-            vlc_args.resume_from_latest = False
-            return vlc_args
-
-        vlc_args = load_vlc_args('ckpt_mw50_retrank33_tigt_negonly_a_rf_1__pytorch_model.bin.20')
-        model = RewardCalculator(args=vlc_args)
-        model.model.eval()
-
-        frame_history = torch.zeros((10, 500, 3, 224, 224)).to('cuda:0')
-        pairs = []
-        masks = []
-        segments = []
-        video_ids = []
-        for desc in mt10_descs:
-            pairs_text, pairs_mask, pairs_segment, choice_video_ids = model.dataloader._get_text(video_id=0, caption=desc)
-            pairs.append(pairs_text[0])
-            masks.append(pairs_mask[0])
-            segments.append(pairs_segment[0])
-            video_ids.append(choice_video_ids[0])
-
-        pairs_text, pairs_mask, pairs_segment, choice_video_ids = torch.from_numpy(np.asarray(pairs)).to('cuda:0'), torch.from_numpy(np.asarray(masks)).to('cuda:0'), torch.from_numpy(np.asarray(segments)).to('cuda:0'), torch.from_numpy(np.asarray(video_ids)).to('cuda:0')
-        new_images = torch.zeros((10, 500, 3, 224, 224))
-        transform = _transform(224)
-
-
-    
-
     # TRY NOT TO MODIFY: start the game
     for global_step in range(args.total_timesteps // NUM_TASKS):
+        if global_step % args.max_episode_steps == 0:
+            sparse_rewards = np.zeros((args.max_episode_steps, NUM_TASKS))
+
         step_metrics = {}
 
         act_params = {}
@@ -962,56 +730,7 @@ if __name__ == "__main__":
             actions, key = agent.get_action_train(obs, key)
         #if global_step % 1000 == 0:
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-
-
-        if args.model_type:
-            frames = envs.call('render')
-
-        if args.model_type == 'S3D':
-            frame_history[global_step % args.max_episode_steps] = torch.from_numpy(preprocess_metaworld(list(frames))).to('cuda:0')/255.0
-            linspace = torch.linspace(0, global_step % args.max_episode_steps, 32, dtype=torch.int)
-            video = frame_history[linspace, :, :, :, :].permute(1, 4, 0, 2, 3).float()
-            og_rewards = rewards.copy()
-            with torch.no_grad():
-                video_output = model(video)
-                rewards = (video_output['video_embedding'] * text_output).sum(dim=1).cpu().numpy()
-
-        elif args.model_type == 'LIV':
-            frames = torch.stack([transform(img) for img in frames])
-            with torch.no_grad():
-                img_embed = model(input=frames, modality='vision')
-            rewards = model.module.sim(img_embed, text_embedding).cpu().numpy()
-        elif args.model_type == 'VLC':
-            for idx, f in enumerate(frames):
-                frame_history[idx, global_step % args.max_episode_steps] = transform(Image.fromarray(f.astype(np.uint8))).to('cuda:0')
-            batches = torch.zeros((envs.num_envs, 1, model.dataloader.max_frames, 1, 3, 224, 224))
-
-            images = np.linspace(0, global_step % args.max_episode_steps, vlc_args.max_frames, dtype=int)
-
-
-            # torch.Size([10, 1, 12, 1, 3, 224, 224])
-            curr_video = frame_history[:, images].unsqueeze(1).unsqueeze(3)
-            # torch.Size([10, 12, 3, 224, 224])
-            with torch.no_grad():
-                num_frames = len(images)
-                num_padded = model.dataloader.max_frames - num_frames
-                video_mask = torch.from_numpy(np.asarray([1] * num_frames + [0] * num_padded)).unsqueeze(0).unsqueeze(0).repeat(envs.num_envs, 1, 1).to('cuda:0')
-                a, b = model.model.get_sequence_visual_output(pairs_text, pairs_mask, pairs_segment, curr_video, video_mask)
-                scores = model.model.get_similarity_logits(a, b, pairs_text, video_mask, loose_type=model.model.loose_type)[0]
-            video_lengths = torch.argmax(torch.logical_not(video_mask).int(), dim=2).squeeze(1) - 1
-            final_scores = torch.zeros(envs.num_envs)
-            for idx in range(envs.num_envs):
-                final_scores[idx] = scores[0, idx, video_lengths[idx]]
-
-            rewards = final_scores.numpy()
-            if global_step % args.max_episode_steps == 0:
-                offset = rewards.copy()
-            if args.reward_offset:
-                rewards -= offset
-            if 'success' in infos:
-                success = infos['success'] * args.sparse_reward
-                rewards += success
+        next_obs, rewards, terminations, infos = envs.step(actions)
 
         if args.normalize_rewards_env:
             terminated = 1 - terminations
@@ -1040,7 +759,7 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, d in enumerate(truncations):
+        for idx, d in enumerate(terminations):
             if d:
                 real_next_obs[idx] = infos["final_observation"][idx]
 
@@ -1048,12 +767,6 @@ if __name__ == "__main__":
 
         if not args.reward_filter:
              rb.add(obs, real_next_obs, actions, rewards, terminations)
-             if args.model_type:
-                 reward_track += rewards
-                 if global_step > 0 and global_step % args.max_episode_steps == 0:
-                     for i in range(NUM_TASKS):
-                         global_episodic_return_vlm.append(reward_track[i])
-                     reward_track = np.array([0. for _ in range(NUM_TASKS)])
         else:
             next_done = np.logical_or(truncations, terminations)
 
@@ -1069,31 +782,47 @@ if __name__ == "__main__":
         if global_step % 500 == 0 and global_episodic_return:
            if args.reward_filter:
                # Sample a batch from replay buffer
+               before_rewards = np.mean(rewards_buffer, axis=0)
+               if args.track:
+                   for i in range(envs.num_envs):
+                       step_metrics[f'Mean before smoothing env {i}'] = before_rewards[i]
                if args.reward_filter == 'gaussian':
                    rewards = gaussian_filter1d(rewards_buffer, args.sigma, mode=args.filter_mode,
                                            axis=0)
-
                elif args.reward_filter == 'exponential':
                    rewards = np.zeros_like(rewards_buffer)
                    rewards[-1, :] = rewards_buffer[0, :]
                    beta = 1 - args.alpha
                    for i, rew_raw in enumerate(rewards_buffer):
                        rewards[i, :] = args.alpha * rewards[i - 1, :] + beta * rew_raw
-
                elif args.reward_filter == 'uniform':
                    if args.kernel_type == 'uniform':
                        filter = (1.0 / args.delta) * np.array([1] * args.delta)
-
                    elif args.kernel_type == 'uniform_before':
                        filter = (1.0/args.delta) * np.array([1] * args.delta + [0] * (args.delta-1))
-
                    elif args.kernel_type == 'uniform_after':
                        filter = (1.0 / args.delta) * np.array([0] * (args.delta - 1) + [1] * args.delta)
-
                    else:
                        raise NotImplementedError('Invalid kernel type for uniform smoothing')
-
                    rewards = convolve1d(rewards_buffer, filter, mode=args.filter_mode, axis=0)
+
+               smoothing_change = np.array([0.0 for _ in range(envs.num_envs)])
+               for i in range(args.max_episode_steps):
+                   if i == 0:
+                       l_rew = np.asarray(rewards_buffer[i])
+                       l_act = np.asarray(actions_buffer[i, :, :-1])
+                   else:
+                       act_dist = np.linalg.norm(l_act - actions_buffer[i, :, :-1], axis=1)
+                       smoothing_change += (rewards_buffer[i] - l_rew) / act_dist
+                       l_rew = rewards_buffer[i]
+                       l_act = actions_buffer[i, :, :-1]
+
+               if args.track:
+                   for i in range(envs.num_envs):
+                       step_metrics[f"charts/{env_names[i]}_smoothed_reward_change_per_unit_displace"] = smoothing_change[i] / args.max_episode_steps
+
+               if not args.sparse_smoothed:
+                   rewards += sparse_rewards
 
                if args.normalize_rewards:
                    terminated = 1 - terminations
@@ -1102,15 +831,11 @@ if __name__ == "__main__":
                    rewards = rewards / jnp.sqrt(return_rms.var + epsilon)
                    rewards = np.asarray(rewards)
 
-               if args.track and total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                   for i in range(envs.num_envs):
-                       print(f"charts/{env_names[i]}_Rewards_Episode_{global_step}", np.sum([val for idx, val in enumerate(rewards_buffer[:, i])]))
-                       fig, ax = plt.subplots()
-                       ax.plot([val for idx, val in enumerate(rewards_buffer[:, i])])
-                       step_metrics[f"charts/{env_names[i]}_Rewards_Episode_{global_step}"] = wandb.Image(fig)
-                       plt.close(fig)
-                       #print(step_metrics[f"charts/{env_names[i]}_Rewards_Episode_{global_step}"])
                rewards_buffer = rewards
+               after_rewards = np.mean(rewards_buffer, axis=0)
+               if args.track:
+                   for i in range(envs.num_envs):
+                       step_metrics[f'Mean after smoothing env {i}'] = after_rewards[i]
 
                for i in range(args.max_episode_steps):
                    rb.add(
@@ -1128,13 +853,11 @@ if __name__ == "__main__":
 
 
            print(
-               f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))},"+ " " if not args.model_type else f" mean_vlm_reward={np.mean(list(global_episodic_return_vlm))}"
+               f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
            )
            if args.track:
                step_metrics["charts/mean_episodic_return"] = np.mean(list(global_episodic_return))
                step_metrics["charts/mean_episodic_length"] = np.mean(list(global_episodic_length))
-               if args.model_type:
-                   step_metrics['charts/mean_vlm_reward'] = np.mean(list(global_episodic_return_vlm))
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts and global_episodic_return:
@@ -1160,12 +883,10 @@ if __name__ == "__main__":
                     batch,
                     agent.target_entropy,
                     args.gamma,
-                    args.l2_reg_coef,
-                    args.weight_decay_coef,
                     key,
                 )
                 logs = jax.device_get(logs)
-
+                step_metrics.update(logs)
             # update the target networks
             if global_step % args.target_network_frequency == 0:
                 agent.soft_update_target_networks(args.tau)
@@ -1175,7 +896,7 @@ if __name__ == "__main__":
                 print("SPS:", int(total_steps / (time.time() - start_time)))
 
             # Evaluation
-            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
+            '''if total_steps % args.evaluation_frequency == 0 and global_step > 0:
                 (
                     eval_success_rate,
                     eval_returns,
@@ -1214,7 +935,8 @@ if __name__ == "__main__":
                         metrics=eval_metrics,
                     )
                     print(f"model saved to {ckpt_manager.directory}")
-
+            '''
         if args.track:
             wandb.log(step_metrics, step=global_step)
     envs.close()
+    writer.close()
