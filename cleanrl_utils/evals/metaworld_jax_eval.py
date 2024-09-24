@@ -21,9 +21,7 @@ def evaluation(
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
         episodic_returns = {task_name: [] for task_name in set(task_names)}
-        envs_per_task = {
-            task_name: task_names.count(task_name) for task_name in set(task_names)
-        }
+        envs_per_task = {task_name: task_names.count(task_name) for task_name in set(task_names)}
     else:
         successes = np.zeros(eval_envs.num_envs)
         episodic_returns = [[] for _ in range(eval_envs.num_envs)]
@@ -32,10 +30,7 @@ def evaluation(
 
     def eval_done(returns):
         if type(returns) is dict:
-            return all(
-                len(r) >= (num_episodes * envs_per_task[task_name])
-                for task_name, r in returns.items()
-            )
+            return all(len(r) >= (num_episodes * envs_per_task[task_name]) for task_name, r in returns.items())
         else:
             return all(len(r) >= num_episodes for r in returns)
 
@@ -45,13 +40,8 @@ def evaluation(
         for i, env_ended in enumerate(np.logical_or(terminations, truncations)):
             if env_ended:
                 if task_names is not None:
-                    episodic_returns[task_names[i]].append(
-                        float(infos["episode"]["r"][i])
-                    )
-                    if (
-                        len(episodic_returns[task_names[i]])
-                        <= num_episodes * envs_per_task[task_names[i]]
-                    ):
+                    episodic_returns[task_names[i]].append(float(infos["episode"]["r"][i]))
+                    if len(episodic_returns[task_names[i]]) <= num_episodes * envs_per_task[task_names[i]]:
                         successes[task_names[i]] += int(infos["success"][i])
                 else:
                     episodic_returns[i].append(float(infos["episode"]["r"][i]))
@@ -60,8 +50,7 @@ def evaluation(
 
     if type(episodic_returns) is dict:
         episodic_returns = {
-            task_name: returns[: (num_episodes * envs_per_task[task_name])]
-            for task_name, returns in episodic_returns.items()
+            task_name: returns[: (num_episodes * envs_per_task[task_name])] for task_name, returns in episodic_returns.items()
         }
     else:
         episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
@@ -70,10 +59,7 @@ def evaluation(
 
     if type(successes) is dict:
         success_rate_per_task = np.array(
-            [
-                successes[task_name] / (num_episodes * envs_per_task[task_name])
-                for task_name in set(task_names)
-            ]
+            [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
         )
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(list(episodic_returns.values()))
@@ -132,17 +118,13 @@ def metalearning_evaluation(
 
         # Evaluation
         eval_envs.call("toggle_terminate_on_success", True)
-        mean_success_rate, mean_return, _success_rate_per_task = evaluation(
-            agent, eval_envs, eval_episodes, task_names
-        )
+        mean_success_rate, mean_return, _success_rate_per_task = evaluation(agent, eval_envs, eval_episodes, task_names)
         total_mean_success_rate += mean_success_rate
         total_mean_return += mean_return
         success_rate_per_task[i] = _success_rate_per_task
 
     success_rates = (success_rate_per_task).mean(axis=0)
-    task_success_rates = {
-        task_name: success_rates[i] for i, task_name in enumerate(set(task_names))
-    }
+    task_success_rates = {task_name: success_rates[i] for i, task_name in enumerate(set(task_names))}
 
     return (
         total_mean_success_rate / num_evals,

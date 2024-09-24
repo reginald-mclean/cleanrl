@@ -3,20 +3,21 @@ import argparse
 import os
 import random
 import time
+from collections import deque
 from distutils.util import strtobool
-import torch.multiprocessing as mp
 
 import gymnasium as gym
 import metaworld
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
-from collections import deque
+
 from cleanrl_utils.evals.meta_world_eval_protocol import evaluation_procedure
 from cleanrl_utils.wrappers.metaworld_wrappers import OneHotWrapper
 
@@ -67,8 +68,7 @@ class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod()
-            + np.prod(env.single_action_space.shape),
+            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
             400,
         )
         self.fc2 = nn.Linear(400, 400)
@@ -115,9 +115,7 @@ class Actor(nn.Module):
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            log_std + 1
-        )  # From SpinUp / Denis Yarats
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
 
@@ -143,11 +141,7 @@ class Actor(nn.Module):
 def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
     obs = data.observations
     one_hots = obs[:, -num_tasks:]
-    if (
-        log_alpha.shape[0] != one_hots.shape[1]
-        or one_hots.shape[1] != num_tasks
-        or log_alpha.shape[0] != num_tasks
-    ):
+    if log_alpha.shape[0] != one_hots.shape[1] or one_hots.shape[1] != num_tasks or log_alpha.shape[0] != num_tasks:
         raise ValueError(
             "The number of tasks in the environment does "
             "not match self._num_tasks. Are you sure that you passed "
@@ -158,7 +152,7 @@ def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
 
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn')
+    mp.set_start_method("spawn")
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -176,8 +170,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -202,9 +195,7 @@ if __name__ == "__main__":
         def thunk():
             env = env_cls()
             env = gym.wrappers.TimeLimit(env, env.max_path_length)
-            task = random.choice(
-                [task for task in benchmark.train_tasks if task.env_name == name]
-            )
+            task = random.choice([task for task in benchmark.train_tasks if task.env_name == name])
             env.set_task(task)
             env = gym.wrappers.RecordEpisodeStatistics(env)
             env = OneHotWrapper(env, env_id, len(benchmark.train_classes))
@@ -214,24 +205,16 @@ if __name__ == "__main__":
         return thunk
 
     envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(env_id, name, env_cls, args.seed)
-            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
-        ]
+        [make_env(env_id, name, env_cls, args.seed) for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())]
     )
     envs = gym.wrappers.VectorListInfo(envs)
 
     eval_envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(env_id, name, env_cls, args.seed)
-            for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())
-        ]
+        [make_env(env_id, name, env_cls, args.seed) for env_id, (name, env_cls) in enumerate(benchmark.train_classes.items())]
     )
     eavl_envs = gym.wrappers.VectorListInfo(envs)
 
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
 
@@ -242,24 +225,16 @@ if __name__ == "__main__":
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
-    )
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(
-            torch.tensor(envs.single_action_space.shape).to(device)
-        ).item()
-        log_alpha = torch.tensor(
-            [0] * len(envs.envs), device=device, dtype=torch.float32
-        ).requires_grad_()
+        target_entropy = -torch.prod(torch.tensor(envs.single_action_space.shape).to(device)).item()
+        log_alpha = torch.tensor([0] * len(envs.envs), device=device, dtype=torch.float32).requires_grad_()
         a_optimizer = optim.Adam([log_alpha] * len(envs.envs), lr=args.q_lr)
     else:
-        log_alpha = torch.tensor(
-            [0] * len(envs.envs), device=device, dtype=torch.float32
-        ).log()
+        log_alpha = torch.tensor([0] * len(envs.envs), device=device, dtype=torch.float32).log()
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -280,9 +255,7 @@ if __name__ == "__main__":
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(len(envs.envs))]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(len(envs.envs))])
         else:
             actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
             actions = actions.detach().cpu().numpy()
@@ -341,7 +314,7 @@ if __name__ == "__main__":
                 update=global_step,
                 tasks=benchmark.train_tasks,
                 keys=list(benchmark.train_classes.keys()),
-                device=device
+                device=device,
             )
             print(
                 f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)} eval_success_rate={eval_success_rate}"
@@ -351,26 +324,17 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size * num_tasks)
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
-                )
+                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 min_qf_next_target = (
                     torch.min(qf1_next_target, qf2_next_target)
-                    - get_log_alpha(log_alpha, num_tasks, data).exp()
-                    * next_state_log_pi
+                    - get_log_alpha(log_alpha, num_tasks, data).exp() * next_state_log_pi
                 )
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
+                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = qf1(
-                data.observations, data.actions.type(torch.float32)
-            ).view(-1)
-            qf2_a_values = qf2(
-                data.observations, data.actions.type(torch.float32)
-            ).view(-1)
+            qf1_a_values = qf1(data.observations, data.actions.type(torch.float32)).view(-1)
+            qf2_a_values = qf2(data.observations, data.actions.type(torch.float32)).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -387,10 +351,7 @@ if __name__ == "__main__":
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                    actor_loss = (
-                        (get_log_alpha(log_alpha, num_tasks, data).exp() * log_pi)
-                        - min_qf_pi
-                    ).mean()
+                    actor_loss = ((get_log_alpha(log_alpha, num_tasks, data).exp() * log_pi) - min_qf_pi).mean()
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
@@ -399,10 +360,7 @@ if __name__ == "__main__":
                     if args.autotune:
                         with torch.no_grad():
                             _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (
-                            -get_log_alpha(log_alpha, num_tasks, data)
-                            * (log_pi + target_entropy)
-                        ).mean()
+                        alpha_loss = (-get_log_alpha(log_alpha, num_tasks, data) * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
                         alpha_loss.backward()
@@ -411,26 +369,14 @@ if __name__ == "__main__":
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
-                for param, target_param in zip(
-                    qf1.parameters(), qf1_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
-                for param, target_param in zip(
-                    qf2.parameters(), qf2_target.parameters()
-                ):
-                    target_param.data.copy_(
-                        args.tau * param.data + (1 - args.tau) * target_param.data
-                    )
+                for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
-                )
-                writer.add_scalar(
-                    "losses/qf2_values", qf2_a_values.mean().item(), global_step
-                )
+                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
@@ -443,9 +389,7 @@ if __name__ == "__main__":
                     global_step,
                 )
                 if args.autotune:
-                    writer.add_scalar(
-                        "losses/alpha_loss", alpha_loss.item(), global_step
-                    )
+                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
     envs.close()
     writer.close()

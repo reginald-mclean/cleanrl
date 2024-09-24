@@ -27,9 +27,7 @@ def _make_envs_common(
         env.toggle_terminate_on_success(terminate_on_success)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
-            env = metaworld_wrappers.OneHotWrapper(
-                env, env_id, len(benchmark.train_classes)
-            )
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env = metaworld_wrappers.CheckpointWrapper(env, f"{name}_{env_id}")

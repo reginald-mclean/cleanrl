@@ -26,9 +26,7 @@ class OneHotWrapper(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
         self.one_hot = np.zeros(num_tasks)
         self.one_hot[task_idx] = 1.0
 
-        self._observation_space = gym.spaces.Box(
-            np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub])
-        )
+        self._observation_space = gym.spaces.Box(np.concatenate([env_lb, one_hot_lb]), np.concatenate([env_ub, one_hot_ub]))
 
     @property
     def observation_space(self) -> gym.spaces.Space:
@@ -48,9 +46,7 @@ def _serialize_task(task: Task) -> dict:
 def _deserialize_task(task_dict: dict[str, str]) -> Task:
     assert "env_name" in task_dict and "data" in task_dict
 
-    return Task(
-        env_name=task_dict["env_name"], data=base64.b64decode(task_dict["data"])
-    )
+    return Task(env_name=task_dict["env_name"], data=base64.b64decode(task_dict["data"]))
 
 
 class RandomTaskSelectWrapper(gym.Wrapper):
@@ -64,9 +60,7 @@ class RandomTaskSelectWrapper(gym.Wrapper):
         task_idx = self.np_random.choice(len(self.tasks))
         self.unwrapped.set_task(self.tasks[task_idx])
 
-    def __init__(
-        self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = True
-    ):
+    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = True):
         super().__init__(env)
         self.tasks = tasks
         self.sample_tasks_on_reset = sample_tasks_on_reset
@@ -74,16 +68,12 @@ class RandomTaskSelectWrapper(gym.Wrapper):
     def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
-    def reset(
-        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
-    ):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         if self.sample_tasks_on_reset:
             self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
-    def sample_tasks(
-        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
-    ):
+    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_random_task()
         return self.env.reset(seed=seed, options=options)
 
@@ -129,24 +119,18 @@ class PseudoRandomTaskSelectWrapper(gym.Wrapper):
     def toggle_sample_tasks_on_reset(self, on: bool):
         self.sample_tasks_on_reset = on
 
-    def __init__(
-        self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = False
-    ):
+    def __init__(self, env: Env, tasks: List[object], sample_tasks_on_reset: bool = False):
         super().__init__(env)
         self.sample_tasks_on_reset = sample_tasks_on_reset
         self.tasks = tasks
         self.current_task_idx = -1
 
-    def reset(
-        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
-    ):
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         if self.sample_tasks_on_reset:
             self._set_pseudo_random_task()
         return self.env.reset(seed=seed, options=options)
 
-    def sample_tasks(
-        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
-    ):
+    def sample_tasks(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._set_pseudo_random_task()
         return self.env.reset(seed=seed, options=options)
 
@@ -202,9 +186,7 @@ class CheckpointWrapper(gym.Wrapper):
     def __init__(self, env: Env, env_id: str):
         super().__init__(env)
         assert hasattr(self.env, "get_checkpoint") and callable(self.env.get_checkpoint)
-        assert hasattr(self.env, "load_checkpoint") and callable(
-            self.env.load_checkpoint
-        )
+        assert hasattr(self.env, "load_checkpoint") and callable(self.env.load_checkpoint)
         self.env_id = env_id
 
     def get_checkpoint(self) -> tuple[str, dict]:
@@ -252,9 +234,7 @@ class OneHotV0(gym.Wrapper, gym.utils.RecordConstructorArgs):
         gym.utils.RecordConstructorArgs.__init__(self)
         gym.Wrapper.__init__(self, env)
         # self.env = env
-        assert (
-            task_idx < num_envs
-        ), "The task idx of an env cannot be greater than or equal to the number of envs"
+        assert task_idx < num_envs, "The task idx of an env cannot be greater than or equal to the number of envs"
         self.one_hot = np.zeros(num_envs)
         self.one_hot[task_idx] = 1
 
@@ -318,9 +298,7 @@ class SyncVectorEnv(VectorEnv):
             self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             if use_one_hot_wrapper:
-                env = OneHotV0(
-                    env, self.env_names.index(env_name), len(self.env_fns.keys())
-                )
+                env = OneHotV0(env, self.env_names.index(env_name), len(self.env_fns.keys()))
             env = TimeLimit(env, 500)
             env = RecordEpisodeStatistics(env)
             self.envs.append(env)
@@ -345,9 +323,7 @@ class SyncVectorEnv(VectorEnv):
         )
 
         self._check_spaces()
-        self.observations = create_empty_array(
-            self.single_observation_space, n=self.num_envs, fn=np.zeros
-        )
+        self.observations = create_empty_array(self.single_observation_space, n=self.num_envs, fn=np.zeros)
         self._rewards = np.zeros((self.num_envs,), dtype=np.float64)
         self._terminateds = np.zeros((self.num_envs,), dtype=np.bool_)
         self._truncateds = np.zeros((self.num_envs,), dtype=np.bool_)
@@ -402,17 +378,13 @@ class SyncVectorEnv(VectorEnv):
             # need to set task first
             env_name = self.env_names[i]
             _, _ = env.reset()
-            self.current_tasks[env_name] = (self.current_tasks[env_name] + 1) % len(
-                self.tasks[env_name]
-            )
+            self.current_tasks[env_name] = (self.current_tasks[env_name] + 1) % len(self.tasks[env_name])
             env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
             observation, info = env.reset(**kwargs)
             observations.append(observation)
             infos = self._add_info(infos, info, i)
 
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
-        )
+        self.observations = concatenate(self.single_observation_space, observations, self.observations)
         return (deepcopy(self.observations) if self.copy else self.observations), infos
 
     def step_async(self, actions):
@@ -440,18 +412,14 @@ class SyncVectorEnv(VectorEnv):
                 # select new task
                 env_name = self.env_names[i]
                 _, _ = env.reset()
-                self.current_tasks[env_name] = np.random.choice(
-                    len(self.tasks[env_name])
-                )
+                self.current_tasks[env_name] = np.random.choice(len(self.tasks[env_name]))
                 env.set_task(self.tasks[env_name][self.current_tasks[env_name]])
                 observation, info = env.reset()
                 info["final_observation"] = old_observation
                 info["final_info"] = old_info
             observations.append(observation)
             infos = self._add_info(infos, info, i)
-        self.observations = concatenate(
-            self.single_observation_space, observations, self.observations
-        )
+        self.observations = concatenate(self.single_observation_space, observations, self.observations)
 
         return (
             deepcopy(self.observations) if self.copy else self.observations,
@@ -537,16 +505,12 @@ class RL2Env(gym.Wrapper):
         super().__init__(env)
         obs_flat_dim = np.prod(self.env.observation_space.shape)
         action_flat_dim = np.prod(self.env.action_space.shape)
-        self._observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_flat_dim + action_flat_dim + 1 + 1,)
-        )
+        self._observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(obs_flat_dim + action_flat_dim + 1 + 1,))
 
     def step(self, action):
         next_state, reward, terminate, truncate, info = self.env.step(action)
         # NOTE: only include terminate flag
-        rl2_next_state = np.concatenate(
-            [next_state, action, [reward], [float(terminate)]]
-        )
+        rl2_next_state = np.concatenate([next_state, action, [reward], [float(terminate)]])
         return rl2_next_state, reward, terminate, truncate, info
 
     def reset(self, *, seed=None, options=None):

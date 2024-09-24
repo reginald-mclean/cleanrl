@@ -2,23 +2,24 @@
 import argparse
 import os
 import random
+import sys
 import time
 from distutils.util import strtobool
-import sys
-sys.path.append('/home/reggiemclean/cleanrl')
 
-from cleanrl_utils.evals.metaworld_jax_eval import evaluation
-from cleanrl_utils.wrappers.metaworld_wrappers import OneHotV0, SyncVectorEnv
-from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
+sys.path.append("/home/reggiemclean/cleanrl")
+
 import gymnasium as gym
+import metaworld
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-from gymnasium.wrappers.vector_list_info import VectorListInfo
-import metaworld
+
+from cleanrl_utils.env_setup_metaworld import make_envs
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
+
 
 def parse_args():
     # fmt: off
@@ -87,6 +88,7 @@ def parse_args():
     # fmt: on
     return args
 
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -115,7 +117,7 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_eval(self, x, device='cuda:0'):
+    def get_action_eval(self, x, device="cuda:0"):
         x = torch.from_numpy(x).to(device)
         action, _, _, _ = self.get_action_and_value(x)
         return action.cpu().detach().numpy()
@@ -135,10 +137,11 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
 
-    print(os.environ['CUDA_DEVICE_ORDER'])
-    print(os.environ['CUDA_VISIBLE_DEVICES'])
+    mp.set_start_method("spawn", force=True)
+
+    print(os.environ["CUDA_DEVICE_ORDER"])
+    print(os.environ["CUDA_VISIBLE_DEVICES"])
 
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -167,18 +170,16 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    if args.env_id == 'MT10':
+    if args.env_id == "MT10":
         benchmark = metaworld.MT10(seed=args.seed)
-    elif args.env_id == 'MT50':
+    elif args.env_id == "MT50":
         benchmark = metaworld.MT50(seed=args.seed)
 
-    use_one_hot_wrapper = True if 'MT10' in args.env_id or 'MT50' in args.env_id else False
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
     print(use_one_hot_wrapper)
     # env setup
 
-    envs = make_envs(
-        benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version
-    )
+    envs = make_envs(benchmark, args.seed, 500, use_one_hot=use_one_hot_wrapper, reward_func_version=args.reward_version)
 
     keys = list(benchmark.train_classes.keys())
 
@@ -205,16 +206,11 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = int(args.total_timesteps // args.batch_size)
 
-
     for update in range(1, num_updates + 1):
         if (update - 1) % args.eval_freq == 0:
             agent.eval()
-            envs.set_attr('terminate_on_success', True)
-            (
-                eval_success_rate,
-                eval_returns,
-                eval_success_per_task,
-            ) = evaluation(
+            envs.set_attr("terminate_on_success", True)
+            (eval_success_rate, eval_returns, eval_success_per_task,) = evaluation(
                 agent=agent,
                 eval_envs=envs,
                 num_episodes=args.evaluation_num_episodes,
@@ -232,7 +228,7 @@ if __name__ == "__main__":
                 f"total_steps={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"
             )
-            envs.set_attr('terminate_on_success', False)
+            envs.set_attr("terminate_on_success", False)
             next_obs, info = envs.reset()
             next_obs = torch.Tensor(next_obs).to(device)
             agent.train()
@@ -260,7 +256,7 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
-            #print(infos)
+            # print(infos)
 
             # Only print when at least 1 env is done
             if "final_info" not in infos:
@@ -271,12 +267,9 @@ if __name__ == "__main__":
                 if info is None:
                     continue
                 print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                #print(i, info)
+                # print(i, info)
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-
-        
-
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -310,13 +303,13 @@ if __name__ == "__main__":
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
-                #print(mb_inds)
-                #print(min(b_inds), max(b_inds))
-                #print(type(b_obs))
-                #print(b_obs)
-                #print(obs.size())
-                #print(b_obs.size())
-                #print(b_obs[mb_inds], b_actions[mb_inds])
+                # print(mb_inds)
+                # print(min(b_inds), max(b_inds))
+                # print(type(b_obs))
+                # print(b_obs)
+                # print(obs.size())
+                # print(b_obs.size())
+                # print(b_obs[mb_inds], b_actions[mb_inds])
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
