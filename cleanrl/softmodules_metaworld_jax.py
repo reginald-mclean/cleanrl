@@ -21,14 +21,14 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
-from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
-from cleanrl_utils.evals.metaworld_jax_eval import evaluation
-from cleanrl_utils.wrappers import metaworld_wrappers
-from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
+
+from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -463,9 +463,7 @@ class Agent:  # MT SAC Agent
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
-    def get_action_train(
-        self, obs: np.ndarray, key: jax.random.PRNGKeyArray
-    ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
+    def get_action_train(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, s_t, z_Tau, key)
         actions = jax.device_get(actions)
@@ -563,9 +561,7 @@ def update(
     key, actor_loss_key = jax.random.split(key)
 
     def actor_loss(params: flax.core.FrozenDict):
-        action_samples, log_probs, _ = sample_and_log_prob(
-            actor, params, batch.observations, batch.task_ids, actor_loss_key
-        )
+        action_samples, log_probs, _ = sample_and_log_prob(actor, params, batch.observations, batch.task_ids, actor_loss_key)
 
         # HACK Putting the other losses / grad updates inside this function for performance,
         # so we can reuse the action_samples / log_probs while also doing alpha loss first
@@ -609,8 +605,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -626,9 +621,7 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    )
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
 
     envs = make_envs(
         benchmark,
@@ -639,9 +632,7 @@ if __name__ == "__main__":
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # agent setup
     rb = MultiTaskReplayBuffer(
@@ -693,9 +684,7 @@ if __name__ == "__main__":
         )
 
         if args.resume and ckpt_manager.latest_step() is not None:
-            ckpt = ckpt_manager.restore(
-                ckpt_manager.latest_step(), args=get_ckpt_restore_args(agent, rb)
-            )
+            ckpt = ckpt_manager.restore(ckpt_manager.latest_step(), args=get_ckpt_restore_args(agent, rb))
 
             agent.load_checkpoint(ckpt["agent"])
             rb.load_checkpoint(ckpt["buffer"])
@@ -720,9 +709,7 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             actions, key = agent.get_action_train(obs, key)
 
@@ -734,9 +721,7 @@ if __name__ == "__main__":
             rb.add(obs, next_obs, actions, rewards, terminations)
         elif has_autoreset.any() and not has_autoreset.all():
             # TODO handle the case where only some envs have autoreset
-            raise NotImplementedError(
-                "Only some envs resetting isn't implemented at the moment."
-            )
+            raise NotImplementedError("Only some envs resetting isn't implemented at the moment.")
 
         has_autoreset = np.logical_or(terminations, truncations)
 
@@ -751,9 +736,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(
-                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
-            )
+            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),
@@ -816,11 +799,7 @@ if __name__ == "__main__":
                 and global_step > 0
             ):
                 envs.call("toggle_terminate_on_success", True)
-                (
-                    eval_success_rate,
-                    eval_returns,
-                    eval_success_per_task,
-                ) = evaluation(
+                (eval_success_rate, eval_returns, eval_success_per_task,) = evaluation(
                     agent=agent,
                     eval_envs=envs,
                     num_episodes=args.evaluation_num_episodes,
@@ -872,4 +851,3 @@ if __name__ == "__main__":
     if args.save_model:
         ckpt_manager.wait_until_finished()
         ckpt_manager.close()
-

@@ -1,6 +1,6 @@
 import sys
 
-sys.path.append('/home/reggiemclean/gradientSurgery/cleanrl')
+sys.path.append("/home/reggiemclean/gradientSurgery/cleanrl")
 
 import argparse
 import os
@@ -18,11 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
+from torch.utils.tensorboard import SummaryWriter
+
 from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
 from cleanrl_utils.env_setup_metaworld import make_envs, make_eval_envs
 from cleanrl_utils.evals.meta_world_eval_protocol import new_evaluation_procedure
-from stable_baselines3.common.type_aliases import ReplayBufferSamples
-from torch.utils.tensorboard import SummaryWriter
 
 DISABLE_COMPILE = os.environ.get("DISABLE_COMPILE", False)
 
@@ -85,8 +86,7 @@ class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod()
-            + np.prod(env.single_action_space.shape),
+            np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
             400,
         )
         self.fc2 = nn.Linear(400, 400)
@@ -120,18 +120,14 @@ class Actor(nn.Module):
         x = F.relu(self.fc2(x))
 
         # extract the task ids from the one-hot encodings of the observations
-        task_idx = (
-            x[:, -self.num_task_heads :].argmax(1).unsqueeze(1).detach().to(x.device)
-        )
+        task_idx = x[:, -self.num_task_heads :].argmax(1).unsqueeze(1).detach().to(x.device)
         indices = torch.arange(400).unsqueeze(0).to(x.device) + task_idx * 400
         x = x.gather(1, indices)
 
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
-            log_std + 1
-        )  # From SpinUp / Denis Yarats
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
         return mean, log_std
 
@@ -157,11 +153,7 @@ class Actor(nn.Module):
 @torch.compile(mode="reduce-overhead", disable=DISABLE_COMPILE)
 def get_log_alpha(log_alpha, num_tasks, data: ReplayBufferSamples):
     one_hots = data.observations[:, -num_tasks:]
-    if (
-        log_alpha.shape[0] != one_hots.shape[1]
-        or one_hots.shape[1] != num_tasks
-        or log_alpha.shape[0] != num_tasks
-    ):
+    if log_alpha.shape[0] != one_hots.shape[1] or one_hots.shape[1] != num_tasks or log_alpha.shape[0] != num_tasks:
         raise ValueError(
             "The number of tasks in the environment does "
             "not match self._num_tasks. Are you sure that you passed "
@@ -202,57 +194,62 @@ def sac_loss(
     actor_optimizer.zero_grad(set_to_none=False)
     for i in range(NUM_TASKS):
         data = rb.single_task_sample(task_idx=i, batch_size=128)
-        alpha = get_log_alpha(log_alpha, NUM_TASKS, data).exp().detach()
+        get_log_alpha(log_alpha, NUM_TASKS, data).exp().detach()
         with torch.no_grad():
-            next_state_actions, next_state_log_pi, _ = actor.get_action(
-                data.next_observations
-            )
+            next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
             qf1_next_target = qf1_target(data.next_observations, next_state_actions)
             qf2_next_target = qf2_target(data.next_observations, next_state_actions)
             min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - get_log_alpha(log_alpha, NUM_TASKS, data).exp()
-                    * next_state_log_pi
+                torch.min(qf1_next_target, qf2_next_target)
+                - get_log_alpha(log_alpha, NUM_TASKS, data).exp() * next_state_log_pi
             )
-            next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-            ) * args.gamma * (min_qf_next_target).view(-1)
+            next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-        qf1_a_values = qf1(
-            data.observations, data.actions.type(torch.float32)
-        ).view(-1)
-        qf2_a_values = qf2(
-            data.observations, data.actions.type(torch.float32)
-        ).view(-1)
+        qf1_a_values = qf1(data.observations, data.actions.type(torch.float32)).view(-1)
+        qf2_a_values = qf2(data.observations, data.actions.type(torch.float32)).view(-1)
         qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
         qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
         qf_loss = qf1_loss + qf2_loss
 
         # q_optimizer should be zeroed for each task's data
         qf_loss.backward()
-        devices = [
-            p.device for group in q_optimizer.param_groups for p in group['params']]
-        qf_grad = [p.grad.detach().clone().flatten() if (p.requires_grad is True and p.grad is not None)
-                   else None for group in q_optimizer.param_groups for p in group['params']]
-        qf_grad_tasks.append(torch.cat([g if g is not None else torch.zeros(
-            qf_grad_num_elements[i], device=devices[i]) for i, g in enumerate(qf_grad)]))
+        devices = [p.device for group in q_optimizer.param_groups for p in group["params"]]
+        qf_grad = [
+            p.grad.detach().clone().flatten() if (p.requires_grad is True and p.grad is not None) else None
+            for group in q_optimizer.param_groups
+            for p in group["params"]
+        ]
+        qf_grad_tasks.append(
+            torch.cat(
+                [
+                    g if g is not None else torch.zeros(qf_grad_num_elements[i], device=devices[i])
+                    for i, g in enumerate(qf_grad)
+                ]
+            )
+        )
 
         pi, log_pi, _ = actor.get_action(data.observations)
         qf1_pi = qf1(data.observations, pi)
         qf2_pi = qf2(data.observations, pi)
         min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-        actor_loss = (
-                (get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi)
-                - min_qf_pi
-        ).mean()
+        actor_loss = ((get_log_alpha(log_alpha, NUM_TASKS, data).exp() * log_pi) - min_qf_pi).mean()
 
         actor_loss.backward()
 
-        devices = [p.device for group in actor_optimizer.param_groups for p in group['params']]
-        actor_grad = [p.grad.detach().clone().flatten() if (p.requires_grad is True and p.grad is not None)
-                      else None for group in actor_optimizer.param_groups for p in group['params']]
-        actor_grad_tasks.append(torch.cat([g if g is not None else torch.zeros(
-            actor_grad_num_elements[i], device=devices[i]) for i, g in enumerate(actor_grad)]))
+        devices = [p.device for group in actor_optimizer.param_groups for p in group["params"]]
+        actor_grad = [
+            p.grad.detach().clone().flatten() if (p.requires_grad is True and p.grad is not None) else None
+            for group in actor_optimizer.param_groups
+            for p in group["params"]
+        ]
+        actor_grad_tasks.append(
+            torch.cat(
+                [
+                    g if g is not None else torch.zeros(actor_grad_num_elements[i], device=devices[i])
+                    for i, g in enumerate(actor_grad)
+                ]
+            )
+        )
 
         # get the gradients from each network, project them, then update networks
 
@@ -260,10 +257,7 @@ def sac_loss(
         q_optimizer.zero_grad(set_to_none=False)
 
         if autotune:  # Alpha loss
-            alpha_loss = (
-                -get_log_alpha(log_alpha, NUM_TASKS, data)
-                * (log_pi.detach() + target_entropy)
-            ).mean()
+            alpha_loss = (-get_log_alpha(log_alpha, NUM_TASKS, data) * (log_pi.detach() + target_entropy)).mean()
 
             a_optimizer.zero_grad()
             alpha_loss.backward()
@@ -292,11 +286,10 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -318,18 +311,14 @@ if __name__ == "__main__":
     NUM_TASKS = len(benchmark.train_classes)
 
     use_one_hot_wrapper = "MT10" in args.env_id or "MT50" in args.env_id
-    envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-    )
+    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
     eval_envs = make_eval_envs(
         benchmark,
         args.seed,
         args.max_episode_steps,
         use_one_hot=use_one_hot_wrapper,
     )
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     actor = Actor(envs, NUM_TASKS).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -338,24 +327,16 @@ if __name__ == "__main__":
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(
-        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr
-    )
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(
-            torch.tensor(envs.single_action_space.shape).to(device)
-        ).item()
-        log_alpha = torch.tensor(
-            [args.alpha] * NUM_TASKS, device=device, dtype=torch.float32
-        ).requires_grad_()
+        target_entropy = -torch.prod(torch.tensor(envs.single_action_space.shape).to(device)).item()
+        log_alpha = torch.tensor([args.alpha] * NUM_TASKS, device=device, dtype=torch.float32).requires_grad_()
         a_optimizer = optim.Adam([log_alpha] * NUM_TASKS, lr=args.q_lr)
     else:
-        log_alpha = torch.tensor(
-            [args.alpha] * NUM_TASKS, device=device, dtype=torch.float32
-        )
+        log_alpha = torch.tensor([args.alpha] * NUM_TASKS, device=device, dtype=torch.float32)
 
     envs.single_observation_space.dtype = np.float32
     rb = MultiTaskReplayBuffer(
@@ -377,9 +358,7 @@ if __name__ == "__main__":
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
         else:
             actions = get_actions(actor, torch.tensor(obs, device=device)).cpu().numpy()
 
@@ -415,23 +394,22 @@ if __name__ == "__main__":
                 np.mean(global_episodic_length),
                 global_step,
             )
-            print(
-                f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}"
-            )
+            print(f"global_step={global_step}, mean_episodic_return={np.mean(global_episodic_return)}")
 
         # ALGO LOGIC: training.
-        if (
-            global_step > args.learning_starts
-            and global_step % args.gradient_steps == 0
-        ):  # torchrl-style training loop
-            qf_grad_num_elements = [p.numel() if p.requires_grad is True else 0 for group in q_optimizer.param_groups
-                                    for p in group['params']]
-            qf_grad_shapes = [p.shape if p.requires_grad is True else None for group in q_optimizer.param_groups
-                              for p in group['params']]
-            actor_grad_num_element = [p.numel() if p.requires_grad is True else 0 for group in
-                                      actor_optimizer.param_groups for p in group['params']]
-            actor_grad_shapes = [p.shape if p.requires_grad is True else None for group in actor_optimizer.param_groups
-                                 for p in group['params']]
+        if global_step > args.learning_starts and global_step % args.gradient_steps == 0:  # torchrl-style training loop
+            qf_grad_num_elements = [
+                p.numel() if p.requires_grad is True else 0 for group in q_optimizer.param_groups for p in group["params"]
+            ]
+            qf_grad_shapes = [
+                p.shape if p.requires_grad is True else None for group in q_optimizer.param_groups for p in group["params"]
+            ]
+            actor_grad_num_element = [
+                p.numel() if p.requires_grad is True else 0 for group in actor_optimizer.param_groups for p in group["params"]
+            ]
+            actor_grad_shapes = [
+                p.shape if p.requires_grad is True else None for group in actor_optimizer.param_groups for p in group["params"]
+            ]
             for epoch_step in range(args.gradient_steps):
                 current_step = global_step + epoch_step
 
@@ -460,41 +438,45 @@ if __name__ == "__main__":
                 def _project_gradients_actor(grads):
                     for i in range(NUM_TASKS):
                         inner_product = torch.sum(grads * actor_grads_task[i])
-                        projection_direction = inner_product / \
-                                               (torch.sum(actor_grads_task[i] * actor_grads_task[i]) + 1e-12)
-                        grads = grads - torch.min(projection_direction,
-                                                  torch.zeros_like(projection_direction)) ** actor_grads_task[i]
+                        projection_direction = inner_product / (torch.sum(actor_grads_task[i] * actor_grads_task[i]) + 1e-12)
+                        grads = (
+                            grads
+                            - torch.min(projection_direction, torch.zeros_like(projection_direction)) ** actor_grads_task[i]
+                        )
                     return grads
 
                 def _project_gradients_qf(grads):
                     for i in range(NUM_TASKS):
                         inner_product = torch.sum(grads * qf_grads_task[i])
-                        projection_direction = inner_product / \
-                                               (torch.sum(qf_grads_task[i] * qf_grads_task[i]) + 1e-12)
-                        grads = grads - torch.min(projection_direction,
-                                                  torch.zeros_like(projection_direction)) ** qf_grads_task[i]
+                        projection_direction = inner_product / (torch.sum(qf_grads_task[i] * qf_grads_task[i]) + 1e-12)
+                        grads = (
+                            grads - torch.min(projection_direction, torch.zeros_like(projection_direction)) ** qf_grads_task[i]
+                        )
                     return grads
 
                 proj_qf_grads = torch.sum(torch.stack(list(map(_project_gradients_qf, list(qf_proj_grad)))), dim=0)
-                proj_actor_grads = torch.sum(torch.stack(list(map(_project_gradients_actor,
-                                                                  list(actor_proj_grad)))), dim=0)
-                indices_qf = [0, ] + [v for v in accumulate(qf_grad_num_elements)]
-                params_qf = [p for group in q_optimizer.param_groups for p in group['params']]
+                proj_actor_grads = torch.sum(torch.stack(list(map(_project_gradients_actor, list(actor_proj_grad)))), dim=0)
+                indices_qf = [
+                    0,
+                ] + [v for v in accumulate(qf_grad_num_elements)]
+                params_qf = [p for group in q_optimizer.param_groups for p in group["params"]]
                 assert len(params_qf) == len(qf_grad_shapes) == len(indices_qf[:-1])
 
-                for param, grad_shape, start_idx, end_idx in zip(params_qf, qf_grad_shapes, indices_qf[:-1],
-                                                                 indices_qf[1:]):
+                for param, grad_shape, start_idx, end_idx in zip(params_qf, qf_grad_shapes, indices_qf[:-1], indices_qf[1:]):
                     if grad_shape is not None:
                         if param.grad is None:
                             param.grad = proj_qf_grads[start_idx:end_idx].view(grad_shape)  # copy proj grad
-                        else: 
+                        else:
                             param.grad[...] = proj_qf_grads[start_idx:end_idx].view(grad_shape)  # copy proj grad
 
-                indices_actor = [0, ] + [v for v in accumulate(actor_grad_num_element)]
-                params_actor = [p for group in actor_optimizer.param_groups for p in group['params']]
+                indices_actor = [
+                    0,
+                ] + [v for v in accumulate(actor_grad_num_element)]
+                params_actor = [p for group in actor_optimizer.param_groups for p in group["params"]]
                 assert len(params_actor) == len(actor_grad_shapes) == len(indices_actor[:-1])
-                for param, grad_shape, start_idx, end_idx in zip(params_actor, actor_grad_shapes, indices_actor[:-1],
-                                                                 indices_actor[1:]):
+                for param, grad_shape, start_idx, end_idx in zip(
+                    params_actor, actor_grad_shapes, indices_actor[:-1], indices_actor[1:]
+                ):
                     if grad_shape is not None:
                         if param.grad is None:
                             param.grad = proj_actor_grads[start_idx:end_idx].view(grad_shape)
@@ -505,18 +487,10 @@ if __name__ == "__main__":
 
                 # update the target networks
                 if current_step % args.target_network_frequency == 0:
-                    for param, target_param in zip(
-                        qf1.parameters(), qf1_target.parameters()
-                    ):
-                        target_param.data.copy_(
-                            args.tau * param.data + (1 - args.tau) * target_param.data
-                        )
-                    for param, target_param in zip(
-                        qf2.parameters(), qf2_target.parameters()
-                    ):
-                        target_param.data.copy_(
-                            args.tau * param.data + (1 - args.tau) * target_param.data
-                        )
+                    for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+                    for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
                 if current_step % 100 == 0:
                     for k, v in logs.items():
@@ -536,15 +510,9 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print(f"Evaluating... at global_step={global_step}")
-            eval_success_rate, eval_returns = new_evaluation_procedure(
-                actor, eval_envs, args.evaluation_num_episodes, device
-            )
-            writer.add_scalar(
-                "charts/mean_success_rate", eval_success_rate, global_step
-            )
-            writer.add_scalar(
-                "charts/mean_evaluation_return", eval_returns, global_step
-            )
+            eval_success_rate, eval_returns = new_evaluation_procedure(actor, eval_envs, args.evaluation_num_episodes, device)
+            writer.add_scalar("charts/mean_success_rate", eval_success_rate, global_step)
+            writer.add_scalar("charts/mean_evaluation_return", eval_returns, global_step)
             print(
                 f"global_step={global_step}, mean evaluation success rate: {eval_success_rate:.4f}"
                 + f" return: {eval_returns:.4f}"

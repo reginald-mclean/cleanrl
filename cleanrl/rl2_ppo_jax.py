@@ -108,21 +108,15 @@ def _make_envs_common(
     total_tasks_per_class: Optional[int] = None,
     reward_version="v1",
 ) -> Tuple[gym.vector.VectorEnv, List[str]]:
-    all_classes = (
-        benchmark.train_classes if split == "train" else benchmark.test_classes
-    )
+    all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
     envs_per_task = len(all_classes)
-    assert (
-        num_parallel_envs % envs_per_task == 0
-    ), f"{num_parallel_envs=} must be divisible by {envs_per_task=}"
+    assert num_parallel_envs % envs_per_task == 0, f"{num_parallel_envs=} must be divisible by {envs_per_task=}"
     tasks_per_env = num_parallel_envs // len(all_classes)
 
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
         env = env_cls(reward_func_version=reward_version)
-        env = gym.wrappers.TimeLimit(
-            env, max_episode_steps or env.unwrapped.max_path_length
-        )
+        env = gym.wrappers.TimeLimit(env, max_episode_steps or env.unwrapped.max_path_length)
         env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env.toggle_terminate_on_success(terminate_on_success)
         env = metaworld_wrappers.RL2Env(env)
@@ -149,12 +143,7 @@ def _make_envs_common(
             task_names.append(env_name)
 
     return (
-        gym.vector.AsyncVectorEnv(
-            [
-                partial(make_env, env_cls=env_cls, tasks=tasks)
-                for env_cls, tasks in env_tuples
-            ]
-        ),
+        gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples]),
         task_names,
     )
 
@@ -186,9 +175,7 @@ def rl2_evaluation(
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
         episodic_returns = {task_name: [] for task_name in set(task_names)}
-        envs_per_task = {
-            task_name: task_names.count(task_name) for task_name in set(task_names)
-        }
+        envs_per_task = {task_name: task_names.count(task_name) for task_name in set(task_names)}
     else:
         successes = np.zeros(eval_envs.num_envs)
         episodic_returns = [[] for _ in range(eval_envs.num_envs)]
@@ -203,10 +190,7 @@ def rl2_evaluation(
 
     def eval_done(returns):
         if isinstance(returns, dict):
-            return all(
-                len(r) >= (num_episodes * envs_per_task[task_name])
-                for task_name, r in returns.items()
-            )
+            return all(len(r) >= (num_episodes * envs_per_task[task_name]) for task_name, r in returns.items())
         else:
             return all(len(r) >= num_episodes for r in returns)
 
@@ -220,13 +204,8 @@ def rl2_evaluation(
                 if info is None:
                     continue
                 if task_names is not None:
-                    episodic_returns[task_names[i]].append(
-                        float(info["episode"]["r"][0])
-                    )
-                    if (
-                        len(episodic_returns[task_names[i]])
-                        <= num_episodes * envs_per_task[task_names[i]]
-                    ):
+                    episodic_returns[task_names[i]].append(float(info["episode"]["r"][0]))
+                    if len(episodic_returns[task_names[i]]) <= num_episodes * envs_per_task[task_names[i]]:
                         successes[task_names[i]] += int(info["success"])
                 else:
                     episodic_returns[i].append(float(info["episode"]["r"][0]))
@@ -235,18 +214,14 @@ def rl2_evaluation(
 
     if isinstance(episodic_returns, dict):
         episodic_returns = {
-            task_name: returns[: (num_episodes * envs_per_task[task_name])]
-            for task_name, returns in episodic_returns.items()
+            task_name: returns[: (num_episodes * envs_per_task[task_name])] for task_name, returns in episodic_returns.items()
         }
     else:
         episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
 
     if isinstance(successes, dict):
         success_rate_per_task = np.array(
-            [
-                successes[task_name] / (num_episodes * envs_per_task[task_name])
-                for task_name in set(task_names)
-            ]
+            [successes[task_name] / (num_episodes * envs_per_task[task_name]) for task_name in set(task_names)]
         )
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(list(episodic_returns.values()))
@@ -255,10 +230,7 @@ def rl2_evaluation(
         mean_success_rate = np.mean(success_rate_per_task)
         mean_returns = np.mean(episodic_returns)
 
-    task_success_rates = {
-        task_name: success_rate_per_task[i]
-        for i, task_name in enumerate(set(task_names))
-    }
+    task_success_rates = {task_name: success_rate_per_task[i] for i, task_name in enumerate(set(task_names))}
 
     print(f"Evaluation time: {time.time() - start_time:.2f}s")
     return mean_success_rate, mean_returns, task_success_rates
@@ -266,9 +238,7 @@ def rl2_evaluation(
 
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
+        return jax.random.uniform(key, shape=shape, minval=-bound, maxval=bound, dtype=dtype)
 
     return _init
 
@@ -283,21 +253,18 @@ class RL2Policy(nn.Module):
     def initialize_carry(self, batch_seq_len: Tuple):
         carry_shape = batch_seq_len + (self.args.recurrent_state_size,)
         if self.args.recurrent_type == "gru":
-            return nn.GRUCell(
-                self.args.recurrent_state_size, parent=None
-            ).initialize_carry(jax.random.PRNGKey(0), carry_shape)
+            return nn.GRUCell(self.args.recurrent_state_size, parent=None).initialize_carry(jax.random.PRNGKey(0), carry_shape)
         elif self.args.recurrent_type == "lstm":
-            return nn.OptimizedLSTMCell(
-                self.args.recurrent_state_size, parent=None
-            ).initialize_carry(jax.random.PRNGKey(0), carry_shape)
-
+            return nn.OptimizedLSTMCell(self.args.recurrent_state_size, parent=None).initialize_carry(
+                jax.random.PRNGKey(0), carry_shape
+            )
 
     @nn.compact
     def __call__(self, x, carry) -> Tuple[distrax.Distribution, jax.Array, jax.Array]:
         if self.args.recurrent_type == "gru":
-            carry, x = nn.RNN(
-                nn.GRUCell(features=self.args.recurrent_state_size), return_carry=True
-            )(x, initial_carry=carry, time_major=False)
+            carry, x = nn.RNN(nn.GRUCell(features=self.args.recurrent_state_size), return_carry=True)(
+                x, initial_carry=carry, time_major=False
+            )
         elif self.args.recurrent_type == "lstm":
             carry, x = nn.RNN(
                 nn.OptimizedLSTMCell(features=self.args.recurrent_state_size),
@@ -370,9 +337,7 @@ def update_rl2_ppo(
         carry: Tuple[jax.Array, jax.Array],
     ) -> Tuple[jax.Array, dict]:
         mu, log_sigma, carry = agent_state.apply_fn(params, observations, carry)
-        action_dist = distrax.MultivariateNormalDiag(
-            loc=mu, scale_diag=jnp.exp(log_sigma)
-        )
+        action_dist = distrax.MultivariateNormalDiag(loc=mu, scale_diag=jnp.exp(log_sigma))
         newlog_prob = action_dist.log_prob(actions)
         logratio = newlog_prob[..., None] - log_probs
         ratio = jnp.exp(logratio)
@@ -382,9 +347,7 @@ def update_rl2_ppo(
         clip_fraction = (jnp.absolute(ratio - 1.0) > args.clip_coef).mean()
 
         pg_loss1 = advantages * ratio
-        pg_loss2 = advantages * jax.lax.clamp(
-            1.0 - args.clip_coef, ratio, 1.0 + args.clip_coef
-        )
+        pg_loss2 = advantages * jax.lax.clamp(1.0 - args.clip_coef, ratio, 1.0 + args.clip_coef)
         pg_loss = -jnp.minimum(pg_loss1, pg_loss2).mean()
 
         entropy_loss = action_dist.entropy().mean()
@@ -402,12 +365,10 @@ def update_rl2_ppo(
     for _ in range(args.update_epochs):
         key, subkey = jax.random.split(key)
         # shuffle batch of the meta trials
-        rollout_inds = jax.random.permutation(
-            subkey, len(meta_rollouts), independent=True
-        )
+        rollout_inds = jax.random.permutation(subkey, len(meta_rollouts), independent=True)
         for i in rollout_inds:
             rollouts = meta_rollouts[i]
-            carry = agent.initialize_carry((rollouts.observations.shape[0], ))
+            carry = agent.initialize_carry((rollouts.observations.shape[0],))
             grads, aux_metrics = jax.grad(ppo_loss, has_aux=True)(
                 agent_state.params,
                 rollouts.observations,
@@ -430,15 +391,11 @@ class LinearFeatureBaseline:
         obs = np.clip(obs, -10, 10)
         ones = jnp.ones((*obs.shape[:-1], 1))
         time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
-        features = np.concatenate(
-            [obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1
-        )
+        features = np.concatenate([obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1)
         return features
 
     @classmethod
-    def _fit_baseline(
-        cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5
-    ) -> np.ndarray:
+    def _fit_baseline(cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5) -> np.ndarray:
         features = cls._extract_features(obs)
         target = returns.reshape(returns.shape[0], -1, 1)
 
@@ -489,8 +446,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -527,9 +483,7 @@ if __name__ == "__main__":
     obs, _ = zip(*envs.call("sample_tasks"))
     obs = np.stack(obs)
 
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = RL2Policy(envs, args)
     fit_baseline = LinearFeatureBaseline.fit_baseline
@@ -556,9 +510,7 @@ if __name__ == "__main__":
             max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
-        )
+        ckpt_manager = orbax.checkpoint.CheckpointManager(f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options)
 
     # TRY NOT TO MODIFY: start the game
     start_time = time.time()
@@ -578,12 +530,7 @@ if __name__ == "__main__":
         "trial_mode": True,
     }
     total_steps = 0
-    steps_per_iter = (
-        args.num_parallel_envs
-        * args.num_episodes_per_trial
-        * args.max_episode_steps
-        * args.trial_batch_size
-    )
+    steps_per_iter = args.num_parallel_envs * args.num_episodes_per_trial * args.max_episode_steps * args.trial_batch_size
     n_iters = int(args.total_timesteps // steps_per_iter)
     for _iter in range(n_iters):
         print(f"Iteration {_iter} {total_steps=}")
@@ -591,17 +538,13 @@ if __name__ == "__main__":
         for _ in range(args.trial_batch_size):
             carry = agent.initialize_carry((args.num_parallel_envs,))
             while not buffer.ready:
-                action, logprob, carry, key = sample_action_logprob(
-                    agent_state, obs, carry, key
-                )
+                action, logprob, carry, key = sample_action_logprob(agent_state, obs, carry, key)
                 action = jax.device_get(action)
                 # TRY NOT TO MODIFY: execute the game and log data.
                 next_obs, reward, terminated, truncated, infos = envs.step(action)
                 total_steps += args.num_parallel_envs
 
-                buffer.push(
-                    obs, action, reward, truncated, log_prob=jax.device_get(logprob)
-                )
+                buffer.push(obs, action, reward, truncated, log_prob=jax.device_get(logprob))
                 obs = next_obs
 
             # Collect episode batch https://github.com/rlworkgroup/garage/blob/master/src/garage/_dtypes.py#L455
@@ -610,20 +553,14 @@ if __name__ == "__main__":
             buffer.reset()
 
         mean_episodic_return = meta_trial_batch[-1].episode_returns.mean()
-        writer.add_scalar(
-            "charts/mean_episodic_return", mean_episodic_return, total_steps
-        )
+        writer.add_scalar("charts/mean_episodic_return", mean_episodic_return, total_steps)
         print(f"{total_steps=}, {mean_episodic_return=}")
 
-        agent_state, logs = update_rl2_ppo(
-            args, agent, agent_state, meta_trial_batch, key
-        )
+        agent_state, logs = update_rl2_ppo(args, agent, agent_state, meta_trial_batch, key)
         logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
 
         if total_steps % args.eval_freq == 0 and total_steps > 0:
-            num_evals = (
-                len(benchmark.test_classes) * args.num_evaluation_goals
-            ) // args.num_parallel_envs
+            num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // args.num_parallel_envs
             print(f"Evaluating on test tasks at {total_steps=}")
             test_success_rate, eval_returns, eval_success_per_task = rl2_evaluation(
                 agent,
@@ -638,9 +575,7 @@ if __name__ == "__main__":
                 logs[f"charts/{task_name}_success_rate"] = float(success_rate)
 
             print(f"Evaluating on train set at {total_steps=}")
-            num_evals = (
-                len(benchmark.train_classes) * args.num_evaluation_goals
-            ) // args.num_parallel_envs
+            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // args.num_parallel_envs
             _, _, train_success_per_task = rl2_evaluation(
                 agent,
                 agent_state,

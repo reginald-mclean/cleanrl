@@ -84,9 +84,7 @@ def parse_args():
     return args
 
 
-def split_obs_task_id(
-    obs: Union[jax.Array, npt.NDArray], num_tasks: int
-) -> Tuple[ArrayLike, ArrayLike]:
+def split_obs_task_id(obs: Union[jax.Array, npt.NDArray], num_tasks: int) -> Tuple[ArrayLike, ArrayLike]:
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
 
 
@@ -101,9 +99,7 @@ class Batch(NamedTuple):
 
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
+        return jax.random.uniform(key, shape=shape, minval=-bound, maxval=bound, dtype=dtype)
 
     return _init
 
@@ -128,10 +124,7 @@ class Actor(nn.Module):
             x = nn.relu(x)
 
         # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
+        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         x = jnp.take_along_axis(x, indices, axis=1)
 
         log_sigma = nn.Dense(
@@ -204,15 +197,10 @@ class Critic(nn.Module):
             )(x)
             x = nn.relu(x)
         # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
+        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        return nn.Dense(
-            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
-        )(x)
+        return nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(x)
 
 
 class VectorCritic(nn.Module):
@@ -264,9 +252,7 @@ class Agent:
         self._gamma = gamma
 
         just_obs, task_id = jax.device_put(split_obs_task_id(init_obs, num_tasks))
-        random_action = jnp.array(
-            [self._action_space.sample() for _ in range(init_obs.shape[0])]
-        )
+        random_action = jnp.array([self._action_space.sample() for _ in range(init_obs.shape[0])])
 
         def _make_optimizer(lr: float, max_grad_norm: float = 0.0):
             optim = optax.adam(learning_rate=lr)
@@ -290,17 +276,11 @@ class Agent:
         )
 
         _, qf_init_key = jax.random.split(key, 2)
-        vector_critic_net = VectorCritic(
-            num_tasks=num_tasks, hidden_dims=args.critic_network
-        )
+        vector_critic_net = VectorCritic(num_tasks=num_tasks, hidden_dims=args.critic_network)
         self.critic = CriticTrainState.create(
             apply_fn=vector_critic_net.apply,
-            params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
-            ),
-            target_params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
-            ),
+            params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
+            target_params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
             tx=_make_optimizer(q_lr, clip_grad_norm),
         )
 
@@ -311,9 +291,7 @@ class Agent:
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
-    def get_action_train(
-        self, obs: npt.NDArray[np.float64], key: jax.Array
-    ) -> Tuple[npt.NDArray[np.float64], jax.Array]:
+    def get_action_train(self, obs: npt.NDArray[np.float64], key: jax.Array) -> Tuple[npt.NDArray[np.float64], jax.Array]:
         state, task_id = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, state, task_id, key)
         return jax.device_get(actions), key
@@ -327,9 +305,7 @@ class Agent:
     @jax.jit
     def soft_update(tau: float, critic_state: CriticTrainState) -> CriticTrainState:
         qf_state = critic_state.replace(
-            target_params=optax.incremental_update(
-                critic_state.params, critic_state.target_params, tau
-            )
+            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, tau)
         )
         return qf_state
 
@@ -364,29 +340,17 @@ def update(
     next_actions, next_action_log_probs, key = sample_and_log_prob(
         actor, actor.params, batch.next_observations, batch.task_ids, key
     )
-    q_values = critic.apply_fn(
-        critic.target_params, batch.next_observations, next_actions, batch.task_ids
-    )
+    q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
-        min_qf_next_target = jnp.min(
-            q_values, axis=0
-        ) - alpha_val * next_action_log_probs.reshape(-1, 1)
-        next_q_value = jax.lax.stop_gradient(
-            batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
-        )
+        min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
+        next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
 
-        q_pred = critic.apply_fn(
-            params, batch.observations, batch.actions, batch.task_ids
-        )
+        q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
         return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
-    def update_critic(
-        _critic: CriticTrainState, alpha_val: jax.Array
-    ) -> Tuple[CriticTrainState, dict]:
-        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(
-            critic_loss, has_aux=True
-        )(_critic.params, alpha_val)
+    def update_critic(_critic: CriticTrainState, alpha_val: jax.Array) -> Tuple[CriticTrainState, dict]:
+        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(critic_loss, has_aux=True)(_critic.params, alpha_val)
         _critic = _critic.apply_gradients(grads=critic_grads)
         return _critic, {
             "losses/qf_values": qf_values,
@@ -397,12 +361,8 @@ def update(
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
         return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
-    def update_alpha(
-        _alpha: TrainState, log_probs: jax.Array
-    ) -> Tuple[TrainState, jax.Array, dict]:
-        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(
-            _alpha.params, log_probs
-        )
+    def update_alpha(_alpha: TrainState, log_probs: jax.Array) -> Tuple[TrainState, jax.Array, dict]:
+        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(_alpha.params, log_probs)
         _alpha = _alpha.apply_gradients(grads=alpha_grads)
         alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
         return (
@@ -417,17 +377,13 @@ def update(
     key, actor_loss_key = jax.random.split(key)
 
     def actor_loss(params: flax.core.FrozenDict):
-        action_samples, log_probs, _ = sample_and_log_prob(
-            actor, params, batch.observations, batch.task_ids, actor_loss_key
-        )
+        action_samples, log_probs, _ = sample_and_log_prob(actor, params, batch.observations, batch.task_ids, actor_loss_key)
         _alpha, _alpha_val, alpha_logs = update_alpha(alpha, log_probs)
         _alpha_val = jax.lax.stop_gradient(_alpha_val)
         _critic, critic_logs = update_critic(critic, _alpha_val)
         logs = {**alpha_logs, **critic_logs}
 
-        q_values = _critic.apply_fn(
-            _critic.params, batch.observations, action_samples, batch.task_ids
-        )
+        q_values = _critic.apply_fn(_critic.params, batch.observations, action_samples, batch.task_ids)
         min_qf_values = jnp.min(q_values, axis=0)
         return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (
             _alpha,
@@ -435,18 +391,14 @@ def update(
             logs,
         )
 
-    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(
-        actor_loss, has_aux=True
-    )(actor.params)
+    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
     actor = actor.apply_gradients(grads=actor_grads)
 
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
 
 
 # Checkpointing utils
-def get_ckpt_save_args(
-    agent, buffer, envs, key, total_steps, global_step, episodes_ended
-):
+def get_ckpt_save_args(agent, buffer, envs, key, total_steps, global_step, episodes_ended):
     rb_ckpt = buffer.checkpoint()
     return ocp.args.Composite(
         agent=ocp.args.PyTreeSave(agent.checkpoint()),
@@ -512,8 +464,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(args.checkpoint_dir / f"{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -529,9 +480,7 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    )
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
 
     envs = make_envs(
         benchmark,
@@ -542,9 +491,7 @@ if __name__ == "__main__":
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # agent setup
     rb = MultiTaskReplayBuffer(
@@ -592,9 +539,7 @@ if __name__ == "__main__":
         )
 
         if args.resume and ckpt_manager.latest_step() is not None:
-            ckpt = ckpt_manager.restore(
-                ckpt_manager.latest_step(), args=get_ckpt_restore_args(agent, rb)
-            )
+            ckpt = ckpt_manager.restore(ckpt_manager.latest_step(), args=get_ckpt_restore_args(agent, rb))
 
             agent.load_checkpoint(ckpt["agent"])
             rb.load_checkpoint(ckpt["buffer"])
@@ -619,9 +564,7 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             actions, key = agent.get_action_train(obs, key)
 
@@ -633,9 +576,7 @@ if __name__ == "__main__":
             rb.add(obs, next_obs, actions, rewards, terminations)
         elif has_autoreset.any() and not has_autoreset.all():
             # TODO handle the case where only some envs have autoreset
-            raise NotImplementedError(
-                "Only some envs resetting isn't implemented at the moment."
-            )
+            raise NotImplementedError("Only some envs resetting isn't implemented at the moment.")
 
         has_autoreset = np.logical_or(terminations, truncations)
 
@@ -650,9 +591,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(
-                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
-            )
+            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),
@@ -715,11 +654,7 @@ if __name__ == "__main__":
                 and global_step > 0
             ):
                 envs.call("toggle_terminate_on_success", True)
-                (
-                    eval_success_rate,
-                    eval_returns,
-                    eval_success_per_task,
-                ) = evaluation(
+                (eval_success_rate, eval_returns, eval_success_per_task,) = evaluation(
                     agent=agent,
                     eval_envs=envs,
                     num_episodes=args.evaluation_num_episodes,

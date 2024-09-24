@@ -21,14 +21,15 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
-from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
-from cleanrl_utils.evals.metaworld_jax_eval import evaluation
-from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
+
+from cleanrl_utils.buffers_metaworld import MultiTaskReplayBuffer
+from cleanrl_utils.evals.metaworld_jax_eval import evaluation
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -105,9 +106,7 @@ def _make_envs_common(
             env = metaworld_wrappers.AutoTerminateOnSuccessWrapper(env)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if use_one_hot:
-            env = metaworld_wrappers.OneHotWrapper(
-                env, env_id, len(benchmark.train_classes)
-            )
+            env = metaworld_wrappers.OneHotWrapper(env, env_id, len(benchmark.train_classes))
         tasks = [task for task in benchmark.train_tasks if task.env_name == name]
         env = metaworld_wrappers.RandomTaskSelectWrapper(env, tasks)
         env.action_space.seed(seed)
@@ -127,9 +126,7 @@ make_eval_envs = partial(_make_envs_common, terminate_on_success=True)
 
 def uniform_init(bound: float):
     def _init(key, shape, dtype):
-        return jax.random.uniform(
-            key, shape=shape, minval=-bound, maxval=bound, dtype=dtype
-        )
+        return jax.random.uniform(key, shape=shape, minval=-bound, maxval=bound, dtype=dtype)
 
     return _init
 
@@ -154,10 +151,7 @@ class Actor(nn.Module):
             x = nn.relu(x)
 
         # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
+        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         x = jnp.take_along_axis(x, indices, axis=1)
 
         log_sigma = nn.Dense(
@@ -178,9 +172,7 @@ class Actor(nn.Module):
 
 
 # Utils
-def split_obs_task_id(
-    obs: Union[jax.Array, npt.NDArray], num_tasks: int
-) -> Tuple[ArrayLike, ArrayLike]:
+def split_obs_task_id(obs: Union[jax.Array, npt.NDArray], num_tasks: int) -> Tuple[ArrayLike, ArrayLike]:
     return obs[..., :-num_tasks], obs[..., -num_tasks:]
 
 
@@ -237,15 +229,10 @@ class Critic(nn.Module):
             )(x)
             x = nn.relu(x)
         # extract the task ids from the one-hot encodings of the observations
-        indices = (
-            jnp.arange(hidden_lst[-1])[None, :]
-            + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
-        )
+        indices = jnp.arange(hidden_lst[-1])[None, :] + (task_idx.argmax(1) * hidden_lst[-1])[..., None]
         x = jnp.take_along_axis(x, indices, axis=1)
 
-        return nn.Dense(
-            1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3)
-        )(x)
+        return nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))(x)
 
 
 class VectorCritic(nn.Module):
@@ -263,9 +250,7 @@ class VectorCritic(nn.Module):
             out_axes=0,
             axis_size=self.n_critics,
         )
-        q_values = vmap_critic(self.hidden_dims, self.num_tasks)(
-            state, action, task_idx
-        )
+        q_values = vmap_critic(self.hidden_dims, self.num_tasks)(state, action, task_idx)
         return q_values
 
 
@@ -300,9 +285,7 @@ class Agent:  # MT SAC Agent
         self._gamma = gamma
 
         just_obs, task_id = jax.device_put(split_obs_task_id(init_obs, num_tasks))
-        random_action = jnp.array(
-            [self._action_space.sample() for _ in range(init_obs.shape[0])]
-        )
+        random_action = jnp.array([self._action_space.sample() for _ in range(init_obs.shape[0])])
 
         def _make_optimizer(lr: float, max_grad_norm: float = 0.0):
             optim = optax.adam(learning_rate=lr)
@@ -326,17 +309,11 @@ class Agent:  # MT SAC Agent
         )
 
         _, qf_init_key = jax.random.split(key, 2)
-        vector_critic_net = VectorCritic(
-            num_tasks=num_tasks, hidden_dims=args.critic_network
-        )
+        vector_critic_net = VectorCritic(num_tasks=num_tasks, hidden_dims=args.critic_network)
         self.critic = CriticTrainState.create(
             apply_fn=vector_critic_net.apply,
-            params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
-            ),
-            target_params=vector_critic_net.init(
-                qf_init_key, just_obs, random_action, task_id
-            ),
+            params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
+            target_params=vector_critic_net.init(qf_init_key, just_obs, random_action, task_id),
             tx=_make_optimizer(q_lr, clip_grad_norm),
         )
 
@@ -347,9 +324,7 @@ class Agent:  # MT SAC Agent
         )
         self.target_entropy = -np.prod(self._action_space.shape).item()
 
-    def get_action_train(
-        self, obs: np.ndarray, key: jax.random.PRNGKeyArray
-    ) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
+    def get_action_train(self, obs: np.ndarray, key: jax.random.PRNGKeyArray) -> Tuple[np.ndarray, jax.random.PRNGKeyArray]:
         s_t, z_Tau = split_obs_task_id(obs, self._num_tasks)
         actions, key = sample_action(self.actor, s_t, z_Tau, key)
         actions = jax.device_get(actions)
@@ -365,9 +340,7 @@ class Agent:  # MT SAC Agent
     @jax.jit
     def soft_update(tau: float, critic_state: CriticTrainState) -> CriticTrainState:
         qf_state = critic_state.replace(
-            target_params=optax.incremental_update(
-                critic_state.params, critic_state.target_params, tau
-            )
+            target_params=optax.incremental_update(critic_state.params, critic_state.target_params, tau)
         )
         return qf_state
 
@@ -392,40 +365,26 @@ def update(
     target_entropy: float,
     gamma: float,
     key: jax.random.PRNGKeyArray,
-) -> Tuple[
-    Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray
-]:
+) -> Tuple[Tuple[TrainState, CriticTrainState, TrainState], dict, jax.random.PRNGKeyArray]:
     # --- Critic loss ---
     # Sample a'
     next_actions, next_action_log_probs, key = sample_and_log_prob(
         actor, actor.params, batch.next_observations, batch.task_ids, key
     )
     # Compute target Q values
-    q_values = critic.apply_fn(
-        critic.target_params, batch.next_observations, next_actions, batch.task_ids
-    )
+    q_values = critic.apply_fn(critic.target_params, batch.next_observations, next_actions, batch.task_ids)
 
     def critic_loss(params: flax.core.FrozenDict, alpha_val: jax.Array):
         # next_action_log_probs is (B,) shaped because of the sum(axis=1), while Q values are (B, 1)
-        min_qf_next_target = jnp.min(
-            q_values, axis=0
-        ) - alpha_val * next_action_log_probs.reshape(-1, 1)
-        next_q_value = jax.lax.stop_gradient(
-            batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target
-        )
+        min_qf_next_target = jnp.min(q_values, axis=0) - alpha_val * next_action_log_probs.reshape(-1, 1)
+        next_q_value = jax.lax.stop_gradient(batch.rewards + (1 - batch.dones) * gamma * min_qf_next_target)
 
-        q_pred = critic.apply_fn(
-            params, batch.observations, batch.actions, batch.task_ids
-        )
+        q_pred = critic.apply_fn(params, batch.observations, batch.actions, batch.task_ids)
         # NOTE specific to Soft Modules: task weights
         return 0.5 * ((q_pred - next_q_value) ** 2).mean(axis=1).sum(), q_pred.mean()
 
-    def update_critic(
-        _critic: CriticTrainState, alpha_val: jax.Array
-    ) -> Tuple[CriticTrainState, dict]:
-        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(
-            critic_loss, has_aux=True
-        )(_critic.params, alpha_val)
+    def update_critic(_critic: CriticTrainState, alpha_val: jax.Array) -> Tuple[CriticTrainState, dict]:
+        (critic_loss_value, qf_values), critic_grads = jax.value_and_grad(critic_loss, has_aux=True)(_critic.params, alpha_val)
         _critic = _critic.apply_gradients(grads=critic_grads)
         return _critic, {
             "losses/qf_values": qf_values,
@@ -437,12 +396,8 @@ def update(
         log_alpha = batch.task_ids @ params.reshape(-1, 1)
         return (-log_alpha * (log_probs.reshape(-1, 1) + target_entropy)).mean()
 
-    def update_alpha(
-        _alpha: TrainState, log_probs: jax.Array
-    ) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
-        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(
-            _alpha.params, log_probs
-        )
+    def update_alpha(_alpha: TrainState, log_probs: jax.Array) -> Tuple[TrainState, jax.Array, jax.Array, dict]:
+        alpha_loss_value, alpha_grads = jax.value_and_grad(alpha_loss)(_alpha.params, log_probs)
         _alpha = _alpha.apply_gradients(grads=alpha_grads)
         alpha_vals = _alpha.apply_fn(_alpha.params, batch.task_ids)
 
@@ -456,9 +411,7 @@ def update(
     key, actor_loss_key = jax.random.split(key)
 
     def actor_loss(params: flax.core.FrozenDict):
-        action_samples, log_probs, _ = sample_and_log_prob(
-            actor, params, batch.observations, batch.task_ids, actor_loss_key
-        )
+        action_samples, log_probs, _ = sample_and_log_prob(actor, params, batch.observations, batch.task_ids, actor_loss_key)
 
         # HACK Putting the other losses / grad updates inside this function for performance,
         # so we can reuse the action_samples / log_probs while also doing alpha loss first
@@ -467,9 +420,7 @@ def update(
         _critic, critic_logs = update_critic(critic, _alpha_val)
         logs = {**alpha_logs, **critic_logs}
 
-        q_values = _critic.apply_fn(
-            _critic.params, batch.observations, action_samples, batch.task_ids
-        )
+        q_values = _critic.apply_fn(_critic.params, batch.observations, action_samples, batch.task_ids)
         min_qf_values = jnp.min(q_values, axis=0)
         return (_alpha_val * log_probs.reshape(-1, 1) - min_qf_values).mean(), (
             _alpha,
@@ -477,9 +428,7 @@ def update(
             logs,
         )
 
-    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(
-        actor_loss, has_aux=True
-    )(actor.params)
+    (actor_loss_value, (alpha, critic, logs)), actor_grads = jax.value_and_grad(actor_loss, has_aux=True)(actor.params)
     actor = actor.apply_gradients(grads=actor_grads)
 
     return (actor, critic, alpha), {**logs, "losses/actor_loss": actor_loss_value}, key
@@ -504,8 +453,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     if args.save_model:  # Orbax checkpoints
@@ -513,9 +461,7 @@ if __name__ == "__main__":
             max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
-        )
+        ckpt_manager = orbax.checkpoint.CheckpointManager(f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -530,21 +476,13 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
-    use_one_hot_wrapper = (
-        True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    )
-    envs = make_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-    )
-    eval_envs = make_eval_envs(
-        benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper
-    )
+    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
+    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
+    eval_envs = make_eval_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # agent setup
     rb = MultiTaskReplayBuffer(
@@ -580,9 +518,7 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array(
-                [envs.single_action_space.sample() for _ in range(NUM_TASKS)]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
         else:
             actions, key = agent.get_action_train(obs, key)
 
@@ -611,9 +547,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(
-                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
-            )
+            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),

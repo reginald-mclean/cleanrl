@@ -58,9 +58,7 @@ class MultiTaskReplayBuffer:
         device: str = "cpu",
         seed: Optional[int] = None,
     ):
-        assert (
-            total_capacity % num_tasks == 0
-        ), "Total capacity must be divisible by the number of tasks."
+        assert total_capacity % num_tasks == 0, "Total capacity must be divisible by the number of tasks."
         self.capacity = total_capacity // num_tasks
         self.num_tasks = num_tasks
         self.use_torch = use_torch
@@ -73,16 +71,10 @@ class MultiTaskReplayBuffer:
 
     def reset(self):
         """Reinitialize the buffer."""
-        self.obs = np.zeros(
-            (self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32
-        )
-        self.actions = np.zeros(
-            (self.capacity, self.num_tasks, self._action_shape), dtype=np.float32
-        )
+        self.obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
+        self.actions = np.zeros((self.capacity, self.num_tasks, self._action_shape), dtype=np.float32)
         self.rewards = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
-        self.next_obs = np.zeros(
-            (self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32
-        )
+        self.next_obs = np.zeros((self.capacity, self.num_tasks, self._obs_shape), dtype=np.float32)
         self.dones = np.zeros((self.capacity, self.num_tasks, 1), dtype=np.float32)
         self.pos = 0
 
@@ -167,16 +159,12 @@ class MultiTaskReplayBuffer:
         Returns:
             ReplayBufferSamples: A batch of samples of batch shape (batch_size,).
         """
-        assert (
-            batch_size % self.num_tasks == 0
-        ), "Batch size must be divisible by the number of tasks."
+        assert batch_size % self.num_tasks == 0, "Batch size must be divisible by the number of tasks."
         single_task_batch_size = batch_size // self.num_tasks
 
         sample_idx = self._rng.integers(
             low=0,
-            high=max(
-                self.pos if not self.full else self.capacity, single_task_batch_size
-            ),
+            high=max(self.pos if not self.full else self.capacity, single_task_batch_size),
             size=(single_task_batch_size,),
         )
 
@@ -242,9 +230,7 @@ class MultiTaskRolloutBuffer:
         reshape = rewards.shape[-1] == 1
         if reshape:
             rewards = rewards.reshape(rewards.shape[:-1])
-        returns = scipy.signal.lfilter(
-            [1], [1, float(-discount)], rewards[..., ::-1], axis=-1
-        )[..., ::-1]
+        returns = scipy.signal.lfilter([1], [1, float(-discount)], rewards[..., ::-1], axis=-1)[..., ::-1]
         return returns if not reshape else returns.reshape(*returns.shape, 1)
 
     def _compute_advantage(
@@ -254,9 +240,7 @@ class MultiTaskRolloutBuffer:
         gamma: float,
         gae_lambda: float,
     ):
-        assert (
-            rewards.shape == baselines.shape
-        ), "Rewards and baselines must have the same shape."
+        assert rewards.shape == baselines.shape, "Rewards and baselines must have the same shape."
         reshape = rewards.shape[-1] == 1
         if reshape:
             rewards = rewards.reshape(rewards.shape[:-1])
@@ -269,11 +253,7 @@ class MultiTaskRolloutBuffer:
         return advantages if not reshape else advantages.reshape(*advantages.shape, 1)
 
     def _normalize_advantages(self, advantages: npt.NDArray) -> npt.NDArray:
-        axis = (
-            tuple(np.arange(advantages.ndim)[1:])
-            if (advantages.ndim > 2 and advantages.shape[-1] == 1)
-            else None
-        )
+        axis = tuple(np.arange(advantages.ndim)[1:]) if (advantages.ndim > 2 and advantages.shape[-1] == 1) else None
         mean = np.mean(advantages, axis=axis, keepdims=axis is not None)
         var = np.var(advantages, axis=axis, keepdims=axis is not None)
 
@@ -298,9 +278,7 @@ class MultiTaskRolloutBuffer:
         The timesteps are multiple rollouts flattened into one time dimension."""
         assert task_idx < self.num_tasks, "Task index out of bounds."
 
-        task_rollouts = Rollout(
-            *map(lambda *xs: np.stack(xs), *self.rollouts[task_idx])
-        )
+        task_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *self.rollouts[task_idx]))
 
         assert task_rollouts.observations.shape[:2] == (
             self._rollouts_per_task,
@@ -326,9 +304,7 @@ class MultiTaskRolloutBuffer:
 
         # 2.2) Apply baseline
         # NOTE baseline is responsible for any data conversions / moving to the GPU
-        assert (
-            baseline is not None
-        ), "You must provide a baseline function, or a fit_baseline that returns one."
+        assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
         baselines = baseline(task_rollouts)
 
         # 3) Compute advantages
@@ -337,14 +313,10 @@ class MultiTaskRolloutBuffer:
 
         # 3.1) (Optional) Normalize advantages
         if normalize_advantages:
-            task_rollouts = task_rollouts._replace(
-                advantages=self._normalize_advantages(task_rollouts.advantages)
-            )
+            task_rollouts = task_rollouts._replace(advantages=self._normalize_advantages(task_rollouts.advantages))
 
         # 4) Flatten rollout and time dimensions
-        task_rollouts = Rollout(
-            *map(lambda x: x.reshape(-1, *x.shape[2:]), task_rollouts)
-        )
+        task_rollouts = Rollout(*map(lambda x: x.reshape(-1, *x.shape[2:]), task_rollouts))
 
         return self._to_torch(task_rollouts) if self._use_torch else task_rollouts
 
@@ -362,9 +334,7 @@ class MultiTaskRolloutBuffer:
 
         Returns a Rollout tuple where each array has the batch dimensions (Task,Timestep,).
         The timesteps are multiple rollouts flattened into one time dimension."""
-        rollouts_per_task = [
-            Rollout(*map(lambda *xs: np.stack(xs), *t)) for t in self.rollouts
-        ]
+        rollouts_per_task = [Rollout(*map(lambda *xs: np.stack(xs), *t)) for t in self.rollouts]
         all_rollouts = Rollout(*map(lambda *xs: np.stack(xs), *rollouts_per_task))
         assert all_rollouts.observations.shape[:3] == (
             self.num_tasks,
@@ -384,11 +354,7 @@ class MultiTaskRolloutBuffer:
 
         if trial_mode:
             # 1) Flatten rollouts to be one big trial (RL2)
-            all_rollouts = Rollout(
-                *map(
-                    lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts
-                )
-            )
+            all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
             all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
 
             # 2.1) (Optional) Fit baseline
@@ -397,9 +363,7 @@ class MultiTaskRolloutBuffer:
 
             # 2.2) Apply baseline
             # NOTE baseline is responsible for any data conversions / moving to the GPU
-            assert (
-                baseline is not None
-            ), "You must provide a baseline function, or a fit_baseline that returns one."
+            assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
             baselines = baseline(all_rollouts)
 
             # 3) Compute advantages
@@ -408,9 +372,7 @@ class MultiTaskRolloutBuffer:
 
             # 3.1) (Optional) Normalize advantages
             if normalize_advantages:
-                all_rollouts = all_rollouts._replace(
-                    advantages=self._normalize_advantages(all_rollouts.advantages)
-                )
+                all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
         else:
             # 1) Get returns
             all_rollouts = all_rollouts._replace(returns=self._get_returns(all_rollouts.rewards, gamma))  # type: ignore
@@ -421,9 +383,7 @@ class MultiTaskRolloutBuffer:
 
             # 2.2) Apply baseline
             # NOTE baseline is responsible for any data conversions / moving to the GPU
-            assert (
-                baseline is not None
-            ), "You must provide a baseline function, or a fit_baseline that returns one."
+            assert baseline is not None, "You must provide a baseline function, or a fit_baseline that returns one."
             baselines = baseline(all_rollouts)
 
             # 3) Compute advantages
@@ -432,16 +392,10 @@ class MultiTaskRolloutBuffer:
 
             # 3.1) (Optional) Normalize advantages
             if normalize_advantages:
-                all_rollouts = all_rollouts._replace(
-                    advantages=self._normalize_advantages(all_rollouts.advantages)
-                )
+                all_rollouts = all_rollouts._replace(advantages=self._normalize_advantages(all_rollouts.advantages))
 
             # 4) Flatten rollout and time dimensions
-            all_rollouts = Rollout(
-                *map(
-                    lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts
-                )
-            )
+            all_rollouts = Rollout(*map(lambda x: x.reshape(self.num_tasks, -1, *x.shape[3:]), all_rollouts))
 
         return self._to_torch(all_rollouts) if self._use_torch else all_rollouts
 
@@ -465,9 +419,7 @@ class MultiTaskRolloutBuffer:
         obs = obs.copy()
         action = action.copy()
         assert obs.ndim == action.ndim
-        if (
-            obs.ndim > 2 and action.ndim > 2
-        ):  # Flatten outer batch dims only if they exist
+        if obs.ndim > 2 and action.ndim > 2:  # Flatten outer batch dims only if they exist
             obs = obs.reshape(-1, *obs.shape[2:])
             action = action.reshape(-1, *action.shape[2:])
 
@@ -495,8 +447,6 @@ class MultiTaskRolloutBuffer:
             self._running_rollouts[i].append(timestep)
 
             if done[i]:  # pop full rollouts into the rollouts buffer
-                rollout = Rollout(
-                    *map(lambda *xs: np.stack(xs), *self._running_rollouts[i])
-                )
+                rollout = Rollout(*map(lambda *xs: np.stack(xs), *self._running_rollouts[i]))
                 self.rollouts[i].append(rollout)
                 self._running_rollouts[i] = []

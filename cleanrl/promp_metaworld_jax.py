@@ -21,14 +21,15 @@ import numpy as np
 import numpy.typing as npt
 import optax  # type: ignore
 import orbax.checkpoint  # type: ignore
-from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
-from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
-from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
 from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
+
+from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout
+from cleanrl_utils.evals.metaworld_jax_eval import metalearning_evaluation
+from cleanrl_utils.wrappers import metaworld_wrappers
 
 
 # Experiment management utils
@@ -199,9 +200,9 @@ class MetaVectorPolicy(nn.Module):
             out_axes=0,
             axis_size=self.n_tasks,
         )
-        mean, log_std = vmap_policy(
-            num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
-        )(state)
+        mean, log_std = vmap_policy(num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim)(
+            state
+        )
         return distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
 
     @staticmethod
@@ -212,9 +213,7 @@ class MetaVectorPolicy(nn.Module):
         rng: jax.random.PRNGKeyArray,
         init_args: list,
     ) -> FrozenDict:
-        return GaussianPolicy(num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(
-            rng, *init_args
-        )
+        return GaussianPolicy(num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(rng, *init_args)
 
     @staticmethod
     def expand_params(params: FrozenDict, axis_size: int) -> FrozenDict:
@@ -520,9 +519,7 @@ if __name__ == "__main__":
             max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
         )
         checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
-        )
+        ckpt_manager = orbax.checkpoint.CheckpointManager(f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
