@@ -587,8 +587,11 @@ def update(
 
 # Training loop
 if __name__ == "__main__":
+    # if jax.device_count("gpu") < 1:
+    #     raise RuntimeError("No GPUs found, aborting. Deviecs: %s" % jax.devices())
+
     args = parse_args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}"
     if args.track:
         import wandb
 
@@ -598,23 +601,17 @@ if __name__ == "__main__":
             sync_tensorboard=True,
             config=vars(args),
             name=run_name,
+            id=run_name,
             monitor_gym=True,
             save_code=True,
+            resume="allow",
         )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
-
-    if args.save_model:  # Orbax checkpoints
-        ckpt_options = orbax.checkpoint.CheckpointManagerOptions(
-            max_to_keep=5, create=True, best_fn=lambda x: x["charts/mean_success_rate"]
-        )
-        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        ckpt_manager = orbax.checkpoint.CheckpointManager(
-            f"runs/{run_name}/checkpoints", checkpointer, options=ckpt_options
-        )
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -629,13 +626,22 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.MT1(args.env_id, seed=args.seed)
 
-    use_one_hot_wrapper = True if "MT10" in args.env_id or "MT50" in args.env_id else False
-    envs = make_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
-    eval_envs = make_eval_envs(benchmark, args.seed, args.max_episode_steps, use_one_hot=use_one_hot_wrapper)
+    use_one_hot_wrapper = (
+        True if "MT10" in args.env_id or "MT50" in args.env_id else False
+    )
+
+    envs = make_envs(
+        benchmark,
+        args.seed,
+        args.max_episode_steps,
+        use_one_hot=use_one_hot_wrapper,
+    )
 
     NUM_TASKS = len(benchmark.train_classes)
 
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    assert isinstance(
+        envs.single_action_space, gym.spaces.Box
+    ), "only continuous action space is supported"
 
     # agent setup
     rb = MultiTaskReplayBuffer(
@@ -650,6 +656,8 @@ if __name__ == "__main__":
     global_episodic_length: Deque[int] = deque([], maxlen=20 * NUM_TASKS)
 
     obs, _ = envs.reset()
+    has_autoreset = np.full((envs.num_envs,), False)
+    start_step, episodes_ended = 0, 0
 
     key, agent_init_key = jax.random.split(key)
     agent = Agent(
@@ -667,44 +675,85 @@ if __name__ == "__main__":
         init_key=key,
     )
 
+    if args.save_model:  # Orbax checkpoints
+        ckpt_manager = ocp.CheckpointManager(
+            Path(args.checkpoint_dir / f"{run_name}/checkpoints").absolute(),
+            item_names=(
+                "agent",
+                "buffer",
+                "env_states",
+                "rngs",
+                "metadata",
+            ),
+            options=ocp.CheckpointManagerOptions(
+                max_to_keep=5,
+                create=True,
+                best_fn=lambda x: x["charts/mean_success_rate"],
+            ),
+        )
+
+        if args.resume and ckpt_manager.latest_step() is not None:
+            ckpt = ckpt_manager.restore(
+                ckpt_manager.latest_step(), args=get_ckpt_restore_args(agent, rb)
+            )
+
+            agent.load_checkpoint(ckpt["agent"])
+            rb.load_checkpoint(ckpt["buffer"])
+            load_env_checkpoints(envs, ckpt["env_states"])
+
+            key = ckpt["rngs"]["rng_key"]
+            random.setstate(ckpt["rngs"]["python_rng_state"])
+            np.random.set_state(ckpt["rngs"]["global_numpy_rng_state"])
+
+            start_step = ckpt["metadata"]["global_step"]
+            episodes_ended = ckpt["metadata"]["episodes_ended"]
+
+            print(f"Loaded checkpoint at step {start_step}")
+
+    env_names = list(benchmark.train_classes.keys())
+
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    for global_step in range(args.total_timesteps // NUM_TASKS):
-        total_steps = global_step * NUM_TASKS
+    for global_step in range(start_step, args.total_timesteps // envs.num_envs):
+        total_steps = global_step * envs.num_envs
 
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(NUM_TASKS)])
+            actions = np.array(
+                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
+            )
         else:
             actions, key = agent.get_action_train(obs, key)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                # Skip the envs that are not done
-                if info is None:
-                    continue
-                global_episodic_return.append(info["episode"]["r"])
-                global_episodic_length.append(info["episode"]["l"])
-
-        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
-        real_next_obs = next_obs.copy()
-        for idx, d in enumerate(truncations):
-            if d:
-                real_next_obs[idx] = infos["final_observation"][idx]
-
         # Store data in the buffer
-        rb.add(obs, real_next_obs, actions, rewards, terminations)
+        if not has_autoreset.any():
+            rb.add(obs, next_obs, actions, rewards, terminations)
+        elif has_autoreset.any() and not has_autoreset.all():
+            # TODO handle the case where only some envs have autoreset
+            raise NotImplementedError(
+                "Only some envs resetting isn't implemented at the moment."
+            )
+
+        has_autoreset = np.logical_or(terminations, truncations)
+
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        for i, env_ended in enumerate(has_autoreset):
+            if env_ended:
+                global_episodic_return.append(infos["episode"]["r"][i])
+                global_episodic_length.append(infos["episode"]["l"][i])
+                episodes_ended += 1
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         if global_step % 500 == 0 and global_episodic_return:
-            print(f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}")
+            print(
+                f"global_step={total_steps}, mean_episodic_return={np.mean(list(global_episodic_return))}"
+            )
             writer.add_scalar(
                 "charts/mean_episodic_return",
                 np.mean(list(global_episodic_return)),
@@ -722,7 +771,14 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
             observations, task_ids = split_obs_task_id(data.observations, NUM_TASKS)
             next_observations, _ = split_obs_task_id(data.next_observations, NUM_TASKS)
-            batch = Batch(observations, data.actions, data.rewards, next_observations, data.dones, task_ids)
+            batch = Batch(
+                observations,
+                data.actions,
+                data.rewards,
+                next_observations,
+                data.dones,
+                task_ids,
+            )
 
             # Update agent
             (agent.actor, agent.critic, agent.alpha_train_state), logs, key = update(
@@ -742,18 +798,34 @@ if __name__ == "__main__":
 
             # Logging
             if global_step % 100 == 0:
+                sps_steps = (global_step - start_step) * envs.num_envs
                 for _key, value in logs.items():
-                    writer.add_scalar(_key, value, total_steps)
-                print("SPS:", int(total_steps / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(total_steps / (time.time() - start_time)), total_steps)
+                    writer.add_scalar(_key, value, sps_steps)
+                print("SPS:", int(sps_steps / (time.time() - start_time)))
+                writer.add_scalar(
+                    "charts/SPS",
+                    int(sps_steps / (time.time() - start_time)),
+                    total_steps,
+                )
 
             # Evaluation
-            if total_steps % args.evaluation_frequency == 0 and global_step > 0:
-                eval_success_rate, eval_returns, eval_success_per_task = evaluation(
+            if (
+                args.evaluation_frequency > 0
+                and episodes_ended % args.evaluation_frequency == 0
+                and has_autoreset.any()
+                and global_step > 0
+            ):
+                envs.call("toggle_terminate_on_success", True)
+                (
+                    eval_success_rate,
+                    eval_returns,
+                    eval_success_per_task,
+                ) = evaluation(
                     agent=agent,
-                    eval_envs=eval_envs,
+                    eval_envs=envs,
                     num_episodes=args.evaluation_num_episodes,
                 )
+                envs.call("toggle_terminate_on_success", False)
                 eval_metrics = {
                     "charts/mean_success_rate": float(eval_success_rate),
                     "charts/mean_evaluation_return": float(eval_returns),
@@ -765,20 +837,39 @@ if __name__ == "__main__":
                 for k, v in eval_metrics.items():
                     writer.add_scalar(k, v, total_steps)
                 print(
-                    f"global_step={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
+                    f"total_steps={total_steps}, mean evaluation success rate: {eval_success_rate:.4f}"
                     + f" return: {eval_returns:.4f}"
                 )
 
+                # Reset envs again to exit eval mode
+                obs, _ = envs.reset()
+
                 # Checkpointing
                 if args.save_model:
-                    ckpt = agent.get_ckpt()
-                    ckpt["rng_key"] = key
-                    ckpt["global_step"] = global_step
-                    save_args = orbax_utils.save_args_from_target(ckpt)
+                    if not has_autoreset.all():
+                        raise NotImplementedError(
+                            "Checkpointing currently doesn't work for the case where evaluation is run before all envs have finished their episodes / are about to be reset."
+                        )
+
                     ckpt_manager.save(
-                        step=global_step, items=ckpt, save_kwargs={"save_args": save_args}, metrics=eval_metrics
+                        total_steps,
+                        args=get_ckpt_save_args(
+                            agent,
+                            rb,
+                            envs,
+                            key,
+                            total_steps,
+                            global_step,
+                            episodes_ended,
+                        ),
+                        metrics=eval_metrics,
                     )
-                    print(f"model saved to {ckpt_manager.directory}")
 
     envs.close()
     writer.close()
+    if args.track:
+        wandb.finish()
+    if args.save_model:
+        ckpt_manager.wait_until_finished()
+        ckpt_manager.close()
+
