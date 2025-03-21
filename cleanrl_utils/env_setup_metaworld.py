@@ -4,7 +4,7 @@ from typing import Optional, Type
 
 import gymnasium as gym  # type: ignore
 import metaworld  # type: ignore
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from metaworld.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 
 from cleanrl_utils.wrappers import metaworld_wrappers
 

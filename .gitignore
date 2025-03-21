@@ -130,3 +130,9 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# nix
+flake.nix
+flake.lock
+.envrc
+.direnv

@@ -27,7 +27,7 @@ from cleanrl_utils.wrappers import metaworld_wrappers
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax.typing import ArrayLike
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from metaworld.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
 
 

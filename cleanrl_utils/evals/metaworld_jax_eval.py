@@ -42,6 +42,7 @@ def evaluation(
     while not eval_done(episodic_returns):
         actions = agent.get_action_eval(obs)
         obs, _, terminations, truncations, infos = eval_envs.step(actions)
+
         for i, env_ended in enumerate(np.logical_or(terminations, truncations)):
             if env_ended:
                 if task_names is not None:
@@ -118,12 +119,30 @@ def metalearning_evaluation(
             rollouts_per_task=adaptation_episodes,
             max_episode_steps=max_episode_steps,
         )
+        has_autoreset = np.full((eval_envs.num_envs,), False)
 
         for _ in range(adaptation_steps):
             while not eval_buffer.ready:
                 action, log_probs, means, stds, key = agent.get_action_train(obs, key)
-                next_obs, reward, _, truncated, _ = eval_envs.step(action)
-                eval_buffer.push(obs, action, reward, truncated, log_probs, means, stds)
+                next_obs, reward, terminations, truncations, _ = eval_envs.step(action)
+                if not has_autoreset.any():
+                    eval_buffer.push(
+                        obs,
+                        action,
+                        reward,
+                        has_autoreset.astype(np.float32),
+                        log_probs,
+                        means,
+                        stds,
+                    )
+                elif has_autoreset.any() and not has_autoreset.all():
+                    # TODO: handle the case where only some envs have autoreset
+                    raise NotImplementedError(
+                        "Only some envs resetting isn't implemented at the moment."
+                    )
+
+                has_autoreset = np.logical_or(terminations, truncations)
+
                 obs = next_obs
 
             rollouts = eval_buffer.get(**buffer_kwargs)

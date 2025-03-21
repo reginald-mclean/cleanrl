@@ -9,7 +9,7 @@ from gymnasium.spaces import Box, Space
 from gymnasium.vector.utils import concatenate, create_empty_array, iterate
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.wrappers import RecordEpisodeStatistics, TimeLimit
-from metaworld.envs.mujoco.sawyer_xyz import SawyerXYZEnv
+from metaworld.sawyer_xyz_env import SawyerXYZEnv
 from metaworld.types import Task
 from numpy.typing import NDArray
 

@@ -22,7 +22,7 @@ import optax
 import orbax
 import orbax.checkpoint
 from flax.core.frozen_dict import FrozenDict
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from metaworld.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers_metaworld import MultiTaskRolloutBuffer, Rollout

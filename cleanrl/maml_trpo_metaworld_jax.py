@@ -3,13 +3,12 @@ import argparse
 import os
 import random
 import time
-from distutils.util import strtobool
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Type
 
-os.environ[
-    "XLA_PYTHON_CLIENT_PREALLOCATE"
-] = "false"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = (
+    "false"  # see https://github.com/google/jax/discussions/6332#discussioncomment-1279991
+)
 
 import distrax  # type: ignore
 import flax.linen as nn
@@ -28,7 +27,7 @@ from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax.flatten_util import ravel_pytree
 from jax.typing import ArrayLike
-from metaworld.envs.mujoco.sawyer_xyz.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
+from metaworld.sawyer_xyz_env import SawyerXYZEnv  # type: ignore
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -40,13 +39,13 @@ def parse_args():
         help="the name of this experiment")
     parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
-    parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--track", type=bool, default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
     parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--save-model", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--save-model", type=bool, default=False, nargs="?", const=True,
         help="whether to save model into the `runs/{run_name}` folder")
     parser.add_argument("--evaluation-frequency", type=int, default=1_000_000,
         help="the frequency of evaluating the model (in total timesteps collected from the env)")
@@ -97,9 +96,13 @@ def _make_envs_common(
     task_select: str = "random",
     total_tasks_per_class: Optional[int] = None,
 ) -> Tuple[gym.vector.VectorEnv, List[str]]:
-    all_classes = benchmark.train_classes if split == "train" else benchmark.test_classes
+    all_classes = (
+        benchmark.train_classes if split == "train" else benchmark.test_classes
+    )
     all_tasks = benchmark.train_tasks if split == "train" else benchmark.test_tasks
-    assert meta_batch_size % len(all_classes) == 0, "meta_batch_size must be divisible by envs_per_task"
+    assert meta_batch_size % len(all_classes) == 0, (
+        "meta_batch_size must be divisible by envs_per_task"
+    )
     tasks_per_env = meta_batch_size // len(all_classes)
 
     def make_env(env_cls: Type[SawyerXYZEnv], tasks: list) -> gym.Env:
@@ -123,18 +126,33 @@ def _make_envs_common(
             tasks = tasks[:total_tasks_per_class]
         subenv_tasks = [tasks[i::tasks_per_env] for i in range(0, tasks_per_env)]
         for tasks_for_subenv in subenv_tasks:
-            assert len(tasks_for_subenv) == len(tasks) // tasks_per_env
+            assert len(tasks_for_subenv) == len(tasks) // tasks_per_env, f"{len(tasks_for_subenv)} {len(tasks)} {tasks_per_env}"
             env_tuples.append((env_cls, tasks_for_subenv))
             task_names.append(env_name)
 
     return (
-        gym.vector.AsyncVectorEnv([partial(make_env, env_cls=env_cls, tasks=tasks) for env_cls, tasks in env_tuples]),
+        gym.vector.AsyncVectorEnv(
+            [
+                partial(make_env, env_cls=env_cls, tasks=tasks)
+                for env_cls, tasks in env_tuples
+            ]
+        ),
         task_names,
     )
 
 
-make_envs = partial(_make_envs_common, terminate_on_success=False, task_select="pseudorandom", split="train")
-make_eval_envs = partial(_make_envs_common, terminate_on_success=True, task_select="pseudorandom", split="test")
+make_envs = partial(
+    _make_envs_common,
+    terminate_on_success=False,
+    task_select="pseudorandom",
+    split="train",
+)
+make_eval_envs = partial(
+    _make_envs_common,
+    terminate_on_success=True,
+    task_select="pseudorandom",
+    split="test",
+)
 
 
 # Networks
@@ -201,7 +219,9 @@ class MetaVectorPolicy(nn.Module):
             axis_size=self.n_tasks,
         )
         mean, log_std = vmap_policy(
-            num_actions=self.num_actions, num_layers=self.num_layers, hidden_dim=self.hidden_dim
+            num_actions=self.num_actions,
+            num_layers=self.num_layers,
+            hidden_dim=self.hidden_dim,
         )(state)
         return distrax.MultivariateNormalDiag(loc=mean, scale_diag=jnp.exp(log_std))
 
@@ -210,23 +230,25 @@ class MetaVectorPolicy(nn.Module):
         num_actions: int,
         num_layers: int,
         hidden_dim: int,
-        rng: jax.random.PRNGKeyArray,
+        rng: jax.Array,
         init_args: list,
     ) -> FrozenDict:
-        return GaussianPolicy(num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim).init(
-            rng, *init_args
-        )
+        return GaussianPolicy(
+            num_actions=num_actions, num_layers=num_layers, hidden_dim=hidden_dim
+        ).init(rng, *init_args)
 
     @staticmethod
     def expand_params(params: FrozenDict, axis_size: int) -> FrozenDict:
-        inner_params = jax.tree_map(lambda x: jnp.stack([x for _ in range(axis_size)]), params)["params"]
+        inner_params = jax.tree_map(
+            lambda x: jnp.stack([x for _ in range(axis_size)]), params
+        )["params"]
         return FrozenDict({"params": {"VmapGaussianPolicy_0": inner_params}})
 
 
 @jax.jit
 def sample_actions(
-    actor: TrainState, obs: ArrayLike, key: jax.random.PRNGKey
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.random.PRNGKeyArray]:
+    actor: TrainState, obs: ArrayLike, key: jax.Array
+) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     key, action_key = jax.random.split(key)
     dist = actor.apply_fn(actor.params, obs)
     action_samples, action_log_probs = dist.sample_and_log_prob(seed=action_key)
@@ -239,10 +261,16 @@ def get_deterministic_actions(actor: TrainState, obs: ArrayLike) -> jax.Array:
 
 
 def get_actions_log_probs_and_dists(
-    actor: TrainState, obs: ArrayLike, key: jax.random.PRNGKey
-) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, jax.random.PRNGKeyArray]:
+    actor: TrainState, obs: ArrayLike, key: jax.Array
+) -> Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray, jax.Array]:
     actions, log_probs, means, stds, key = sample_actions(actor, obs, key)
-    return jax.device_get(actions), jax.device_get(log_probs), jax.device_get(means), jax.device_get(stds), key
+    return (
+        jax.device_get(actions),
+        jax.device_get(log_probs),
+        jax.device_get(means),
+        jax.device_get(stds),
+        key,
+    )
 
 
 class MetaTrainState(TrainState):
@@ -253,7 +281,10 @@ class MetaTrainState(TrainState):
 @jax.jit
 def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
     def inner_opt_objective(_theta: FrozenDict):
-        log_probs = jnp.expand_dims(policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions), -1)
+        log_probs = jnp.expand_dims(
+            policy.apply_fn(_theta, rollouts.observations).log_prob(rollouts.actions),
+            -1,
+        )
         return -(log_probs * rollouts.advantages).mean()
 
     grads = jax.grad(inner_opt_objective)(policy.params)
@@ -262,7 +293,16 @@ def inner_step(policy: TrainState, rollouts: Rollout) -> TrainState:
     return updated_policy
 
 
-@partial(jax.jit, static_argnames=("num_tasks", "delta", "cg_iters", "backtrack_ratio", "max_backtrack_iters"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "num_tasks",
+        "delta",
+        "cg_iters",
+        "backtrack_ratio",
+        "max_backtrack_iters",
+    ),
+)
 def outer_step(
     train_state: MetaTrainState,
     all_rollouts: List[Rollout],
@@ -284,15 +324,21 @@ def outer_step(
         # Inner Train State now has theta^\prime
         # Compute MAML objective
         rollouts = all_rollouts[-1]
-        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, rollouts.observations)
-        new_param_log_probs = jnp.expand_dims(new_param_dist.log_prob(rollouts.actions), -1)
+        new_param_dist = inner_train_state.apply_fn(
+            inner_train_state.params, rollouts.observations
+        )
+        new_param_log_probs = jnp.expand_dims(
+            new_param_dist.log_prob(rollouts.actions), -1
+        )
 
         likelihood_ratio = jnp.exp(new_param_log_probs - rollouts.log_probs)
         outer_objective = likelihood_ratio * rollouts.advantages
         return -outer_objective.mean()
 
     # TRPO, outer gradient step
-    def kl_constraint(params: FrozenDict, inputs: Rollout, targets: distrax.Distribution):
+    def kl_constraint(
+        params: FrozenDict, inputs: List[Rollout], targets: distrax.Distribution
+    ):
         vec_theta = MetaVectorPolicy.expand_params(params, num_tasks)
         inner_train_state = train_state.inner_train_state.replace(params=vec_theta)
 
@@ -301,16 +347,26 @@ def outer_step(
             rollouts = inputs[i]
             inner_train_state = inner_step(inner_train_state, rollouts)
 
-        new_param_dist = inner_train_state.apply_fn(inner_train_state.params, inputs[-1].observations)
+        new_param_dist = inner_train_state.apply_fn(
+            inner_train_state.params, inputs[-1].observations
+        )
         return targets.kl_divergence(new_param_dist).mean()
 
-    target_dist = distrax.MultivariateNormalDiag(all_rollouts[-1].means, all_rollouts[-1].stds)
+    target_dist = distrax.MultivariateNormalDiag(
+        all_rollouts[-1].means, all_rollouts[-1].stds
+    )
     kl_before = kl_constraint(train_state.params, all_rollouts, target_dist)
 
     ## Compute search direction by solving for Ax = g
 
     def hvp(x):
-        hvp_deep = optax.hvp(kl_constraint, v=x, params=train_state.params, inputs=all_rollouts, targets=target_dist)
+        hvp_deep = optax.second_order.hvp(
+            kl_constraint,
+            v=x,
+            params=train_state.params,
+            inputs=all_rollouts,
+            targets=target_dist,
+        )
         hvp_shallow = ravel_pytree(hvp_deep)[0]
         return hvp_shallow + 1e-5 * x  # Ensure positive definite
 
@@ -331,18 +387,29 @@ def outer_step(
     def _body_fn(val):
         step, loss, kl, _ = val
         new_params = jax.tree_util.tree_map(
-            lambda theta_i, s_i: theta_i - (backtrack_ratio**step) * beta * s_i, train_state.params, s
+            lambda theta_i, s_i: theta_i - (backtrack_ratio**step) * beta * s_i,
+            train_state.params,
+            s,
         )
-        loss, kl = maml_loss(new_params), kl_constraint(new_params, all_rollouts, target_dist)
+        loss, kl = (
+            maml_loss(new_params),
+            kl_constraint(new_params, all_rollouts, target_dist),
+        )
         return step + 1, loss, kl, new_params
 
     step, loss, kl, new_params = jax.lax.while_loop(
-        _cond_fn, _body_fn, init_val=(0, loss_before, jnp.finfo(jnp.float32).max, train_state.params)
+        _cond_fn,
+        _body_fn,
+        init_val=(0, loss_before, jnp.finfo(jnp.float32).max, train_state.params),
     )
 
     # Param updates
     # Reject params if line search failed
-    params = jax.lax.cond((loss < loss_before) & (kl <= delta), lambda: new_params, lambda: train_state.params)
+    params = jax.lax.cond(
+        (loss < loss_before) & (kl <= delta),
+        lambda: new_params,
+        lambda: train_state.params,
+    )
     train_state = train_state.replace(params=params)
 
     return train_state, {
@@ -370,13 +437,17 @@ class LinearFeatureBaseline:
         obs = np.clip(obs, -10, 10)
         ones = jnp.ones((*obs.shape[:-1], 1))
         time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
-        features = np.concatenate([obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1)
+        features = np.concatenate(
+            [obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1
+        )
         if reshape:
             features = features.reshape(features.shape[0], -1, features.shape[-1])
         return features
 
     @classmethod
-    def _fit_baseline(cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5) -> np.ndarray:
+    def _fit_baseline(
+        cls, obs: np.ndarray, returns: np.ndarray, reg_coeff: float = 1e-5
+    ) -> np.ndarray:
         features = cls._extract_features(obs)
         target = returns.reshape(returns.shape[0], -1, 1)
 
@@ -416,7 +487,7 @@ class MAMLTRPO:
         envs: gym.vector.VectorEnv,
         num_layers: int,
         hidden_dim: int,
-        init_key: jax.random.PRNGKey,
+        init_key: jax.Array,
         init_obs: ArrayLike,
         inner_lr: float,
         delta: float,
@@ -436,7 +507,9 @@ class MAMLTRPO:
 
         # Init general parameters theta
         self.policy = None
-        theta = MetaVectorPolicy.init_single(**self.network_args, rng=init_key, init_args=[init_obs])
+        theta = MetaVectorPolicy.init_single(
+            **self.network_args, rng=init_key, init_args=[init_obs]
+        )
         self.init_multitask_policy(self.num_tasks, theta)
 
         self.train_state = MetaTrainState.create(
@@ -469,13 +542,14 @@ class MAMLTRPO:
             )
         else:
             self.policy = self.policy.replace(
-                apply_fn=policy_network.apply, params=policy_network.expand_params(params, num_tasks)
+                apply_fn=policy_network.apply,
+                params=policy_network.expand_params(params, num_tasks),
             )
 
     def adapt(self, rollouts: Rollout) -> None:
         self.policy = inner_step(self.policy, rollouts)
 
-    def step(self, all_rollouts: Rollout) -> dict:
+    def step(self, all_rollouts: list[Rollout]) -> dict:
         self.train_state, logs = outer_step(
             train_state=self.train_state,
             all_rollouts=all_rollouts,
@@ -487,7 +561,7 @@ class MAMLTRPO:
         )
         return logs
 
-    def get_action_train(self, obs: ArrayLike, key: jax.random.PRNGKey):
+    def get_action_train(self, obs: ArrayLike, key: jax.Array):
         return get_actions_log_probs_and_dists(self.policy, obs, key)
 
     def get_action_eval(self, obs: ArrayLike) -> np.ndarray:
@@ -520,7 +594,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     if args.save_model:  # Orbax checkpoints
@@ -545,7 +620,10 @@ if __name__ == "__main__":
     else:
         benchmark = metaworld.ML1(args.env_id, seed=args.seed)
     envs, train_task_names = make_envs(
-        benchmark, meta_batch_size=args.meta_batch_size, seed=args.seed, max_episode_steps=args.max_episode_steps
+        benchmark,
+        meta_batch_size=args.meta_batch_size,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
     )
     eval_envs, eval_task_names = make_eval_envs(
         benchmark=benchmark,
@@ -595,8 +673,12 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
+    has_autoreset = np.full((envs.num_envs,), False)
+
     # TRY NOT TO MODIFY: start the game
-    steps_per_iter = args.meta_batch_size * args.rollouts_per_task * args.max_episode_steps
+    steps_per_iter = (
+        args.meta_batch_size * args.rollouts_per_task * args.max_episode_steps
+    )
     n_iters = args.total_timesteps // steps_per_iter
     for _iter in range(n_iters):  # Outer step
         global_step = _iter * steps_per_iter
@@ -610,8 +692,25 @@ if __name__ == "__main__":
             print(f"- Collecting inner step {_step}")
             while not buffer.ready:
                 action, log_probs, means, stds, key = agent.get_action_train(obs, key)
-                next_obs, reward, _, truncated, _ = envs.step(action)
-                buffer.push(obs, action, reward, truncated, log_probs, means, stds)
+                next_obs, reward, terminations, truncations, _ = envs.step(action)
+
+                if not has_autoreset.any():
+                    buffer.push(
+                        obs,
+                        action,
+                        reward,
+                        np.logical_or(truncations, terminations).astype(np.float32),
+                        log_probs,
+                        means,
+                        stds,
+                    )
+                elif has_autoreset.any() and not has_autoreset.all():
+                    # TODO: handle the case where only some envs have autoreset
+                    raise NotImplementedError(
+                        "Only some envs resetting isn't implemented at the moment."
+                    )
+
+                has_autoreset = np.logical_or(terminations, truncations)
                 obs = next_obs
 
             rollouts = buffer.get(**buffer_processing_kwargs)
@@ -625,7 +724,9 @@ if __name__ == "__main__":
                 agent.adapt(rollouts)
 
         mean_episodic_return = all_rollouts[-1].episode_returns.mean()
-        writer.add_scalar("charts/mean_episodic_return", mean_episodic_return, global_step)
+        writer.add_scalar(
+            "charts/mean_episodic_return", mean_episodic_return, global_step
+        )
         print("- Mean episodic return: ", mean_episodic_return)
 
         # Outer policy update
@@ -636,7 +737,9 @@ if __name__ == "__main__":
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
             print("- Evaluating on test set...")
-            num_evals = (len(benchmark.test_classes) * args.num_evaluation_goals) // args.meta_batch_size
+            num_evals = (
+                len(benchmark.test_classes) * args.num_evaluation_goals
+            ) // args.meta_batch_size
 
             evaluation_kwargs = {
                 "agent": agent,
@@ -647,12 +750,14 @@ if __name__ == "__main__":
                 "buffer_kwargs": buffer_processing_kwargs,
             }
 
-            eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = metalearning_evaluation(
-                eval_envs=eval_envs,
-                num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
-                key=key,
-                task_names=eval_task_names,
-                **evaluation_kwargs,
+            eval_success_rate, eval_mean_return, eval_success_rate_per_task, key = (
+                metalearning_evaluation(
+                    eval_envs=eval_envs,
+                    num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
+                    key=key,
+                    task_names=eval_task_names,
+                    **evaluation_kwargs,
+                )
             )
 
             logs["charts/mean_success_rate"] = float(eval_success_rate)
@@ -661,7 +766,9 @@ if __name__ == "__main__":
                 logs[f"charts/{task_name}_success_rate"] = float(success_rate)
 
             print("- Evaluating on train set...")
-            num_evals = (len(benchmark.train_classes) * args.num_evaluation_goals) // args.meta_batch_size
+            num_evals = (
+                len(benchmark.train_classes) * args.num_evaluation_goals
+            ) // args.meta_batch_size
             _, _, eval_success_rate_per_train_task, key = metalearning_evaluation(
                 eval_envs=envs,
                 num_evals=num_evals,  # How many times to sample new tasks to do meta evaluation on
@@ -677,7 +784,8 @@ if __name__ == "__main__":
             if args.save_model:  # Checkpoint
                 ckpt_manager.save(
                     step=global_step,
-                    items=agent.make_checkpoint() | {"key": key, "global_step": global_step},
+                    items=agent.make_checkpoint()
+                    | {"key": key, "global_step": global_step},
                     metrics=logs,
                 )
                 print("- Saved Model")
@@ -688,7 +796,9 @@ if __name__ == "__main__":
             writer.add_scalar(k, v, global_step)
         print(logs)
 
-        writer.add_scalar("charts/sps", global_step / (time.time() - start_time), global_step)
+        writer.add_scalar(
+            "charts/sps", global_step / (time.time() - start_time), global_step
+        )
         print("- SPS: ", global_step / (time.time() - start_time))
 
         # Set tasks for next iteration
