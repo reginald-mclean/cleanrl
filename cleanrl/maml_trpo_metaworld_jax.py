@@ -435,7 +435,7 @@ class LinearFeatureBaseline:
     @staticmethod
     def _extract_features(obs: np.ndarray, reshape=True):
         obs = np.clip(obs, -10, 10)
-        ones = jnp.ones((*obs.shape[:-1], 1))
+        ones = np.ones((*obs.shape[:-1], 1))
         time_step = ones * (np.arange(obs.shape[-2]).reshape(-1, 1) / 100.0)
         features = np.concatenate(
             [obs, obs**2, time_step, time_step**2, time_step**3, ones], axis=-1
