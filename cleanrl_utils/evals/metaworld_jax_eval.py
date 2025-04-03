@@ -16,7 +16,6 @@ def evaluation(
     num_episodes: int,
     task_names: Optional[List[str]] = None,
 ) -> Tuple[float, float, npt.NDArray]:
-    print(f"Evaluating for {num_episodes} episodes.")
     obs, _ = eval_envs.reset()
     if task_names is not None:
         successes = {task_name: 0 for task_name in set(task_names)}
@@ -27,8 +26,6 @@ def evaluation(
     else:
         successes = np.zeros(eval_envs.num_envs)
         episodic_returns = [[] for _ in range(eval_envs.num_envs)]
-
-    start_time = time.time()
 
     def eval_done(returns):
         if type(returns) is dict:
@@ -67,8 +64,6 @@ def evaluation(
     else:
         episodic_returns = [returns[:num_episodes] for returns in episodic_returns]
 
-    print(f"Evaluation time: {time.time() - start_time:.2f}s")
-
     if type(successes) is dict:
         success_rate_per_task = np.array(
             [
@@ -98,8 +93,6 @@ def metalearning_evaluation(
     key: jax.random.PRNGKey,
     task_names: Optional[List[str]] = None,
 ):
-    agent.init_multitask_policy(eval_envs.num_envs, agent.train_state.params)
-
     # Adaptation
     total_mean_success_rate = 0.0
     total_mean_return = 0.0
@@ -109,19 +102,24 @@ def metalearning_evaluation(
     else:
         success_rate_per_task = np.zeros((num_evals, eval_envs.num_envs))
 
+    eval_buffer = MultiTaskRolloutBuffer(
+        num_tasks=eval_envs.num_envs,
+        rollouts_per_task=adaptation_episodes,
+        max_episode_steps=max_episode_steps,
+    )
+
     for i in range(num_evals):
         eval_envs.call("toggle_sample_tasks_on_reset", False)
         eval_envs.call("toggle_terminate_on_success", False)
-        obs, _ = zip(*eval_envs.call("sample_tasks"))
-        obs = np.stack(obs)
-        eval_buffer = MultiTaskRolloutBuffer(
-            num_tasks=eval_envs.num_envs,
-            rollouts_per_task=adaptation_episodes,
-            max_episode_steps=max_episode_steps,
-        )
-        has_autoreset = np.full((eval_envs.num_envs,), False)
+        eval_envs.call("sample_tasks")
+
+        agent.init_multitask_policy(eval_envs.num_envs, agent.train_state.params)
 
         for _ in range(adaptation_steps):
+            obs, _ = eval_envs.reset()
+            eval_buffer.reset()
+            has_autoreset = np.full((eval_envs.num_envs,), False)
+
             while not eval_buffer.ready:
                 action, log_probs, means, stds, key = agent.get_action_train(obs, key)
                 next_obs, reward, terminations, truncations, _ = eval_envs.step(action)
@@ -130,7 +128,7 @@ def metalearning_evaluation(
                         obs,
                         action,
                         reward,
-                        has_autoreset.astype(np.float32),
+                        np.logical_or(truncations, terminations).astype(np.float32),
                         log_probs,
                         means,
                         stds,
@@ -142,12 +140,10 @@ def metalearning_evaluation(
                     )
 
                 has_autoreset = np.logical_or(terminations, truncations)
-
                 obs = next_obs
 
             rollouts = eval_buffer.get(**buffer_kwargs)
             agent.adapt(rollouts)
-            eval_buffer.reset()
 
         # Evaluation
         eval_envs.call("toggle_terminate_on_success", True)

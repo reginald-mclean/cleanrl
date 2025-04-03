@@ -239,7 +239,7 @@ class MetaVectorPolicy(nn.Module):
 
     @staticmethod
     def expand_params(params: FrozenDict, axis_size: int) -> FrozenDict:
-        inner_params = jax.tree_map(
+        inner_params = jax.tree.map(
             lambda x: jnp.stack([x for _ in range(axis_size)]), params
         )["params"]
         return FrozenDict({"params": {"VmapGaussianPolicy_0": inner_params}})
@@ -386,7 +386,7 @@ def outer_step(
 
     def _body_fn(val):
         step, loss, kl, _ = val
-        new_params = jax.tree_util.tree_map(
+        new_params = jax.tree.map(
             lambda theta_i, s_i: theta_i - (backtrack_ratio**step) * beta * s_i,
             train_state.params,
             s,
@@ -673,7 +673,6 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    has_autoreset = np.full((envs.num_envs,), False)
 
     # TRY NOT TO MODIFY: start the game
     steps_per_iter = (
@@ -683,6 +682,8 @@ if __name__ == "__main__":
     for _iter in range(n_iters):  # Outer step
         global_step = _iter * steps_per_iter
         print(f"Iteration {_iter}, Global num of steps {global_step}")
+
+        envs.call("sample_tasks")
         agent.init_multitask_policy(envs.num_envs, agent.train_state.params)
         all_rollouts: List[Rollout] = []
 
@@ -690,6 +691,9 @@ if __name__ == "__main__":
         # Collect num_inner_gradient_steps D datasets + collect 1 D' dataset
         for _step in range(args.num_inner_gradient_steps + 1):
             print(f"- Collecting inner step {_step}")
+            obs, _ = envs.reset()
+            buffer.reset()
+            has_autoreset = np.full((envs.num_envs,), False)
             while not buffer.ready:
                 action, log_probs, means, stds, key = agent.get_action_train(obs, key)
                 next_obs, reward, terminations, truncations, _ = envs.step(action)
@@ -715,7 +719,6 @@ if __name__ == "__main__":
 
             rollouts = buffer.get(**buffer_processing_kwargs)
             all_rollouts.append(rollouts)
-            buffer.reset()
 
             # Inner policy update for the sake of sampling close to adapted policy during the
             # computation of the objective.
@@ -732,7 +735,7 @@ if __name__ == "__main__":
         # Outer policy update
         print("- Computing outer step")
         logs = agent.step(all_rollouts)
-        logs = jax.tree_util.tree_map(lambda x: jax.device_get(x).item(), logs)
+        logs = jax.tree.map(lambda x: jax.device_get(x).item(), logs)
 
         # Evaluation
         if global_step % args.evaluation_frequency == 0 and global_step > 0:
@@ -802,8 +805,6 @@ if __name__ == "__main__":
         print("- SPS: ", global_step / (time.time() - start_time))
 
         # Set tasks for next iteration
-        obs, _ = zip(*envs.call("sample_tasks"))
-        obs = np.stack(obs)
 
     envs.close()
     writer.close()
